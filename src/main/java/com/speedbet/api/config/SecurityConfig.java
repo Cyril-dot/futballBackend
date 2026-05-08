@@ -118,6 +118,7 @@ public class SecurityConfig {
                 "http://localhost:8081",
                 "https://speedbet.site",
                 "https://www.speedbet.site",
+                "https://futball-gamma.vercel.app",
                 "https://poikiloblastic-leeanne-gazeless.ngrok-free.dev"
         ));
         
