@@ -43,7 +43,7 @@ public class LiveScorePoller {
     private static final long FOUR_HOURS_MS = 4 * 60 * 60_000L;
 
     private static boolean isGenuinelyLive(Instant kickoffAt) {
-        if (kickoffAt == null) return false; // no kickoff = API hasn't set it yet or match is over
+        if (kickoffAt == null) return false;
         long msSinceKickoff = Instant.now().toEpochMilli() - kickoffAt.toEpochMilli();
         return msSinceKickoff >= 0 && msSinceKickoff <= FOUR_HOURS_MS;
     }
@@ -123,6 +123,14 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 1. LIVE SCORES — every 30 seconds
+    //
+    // FIX #2 + #3: Use uncached *Fresh() methods so the 30s interval actually
+    // hits the API each time (cached variants have a 5-min TTL that defeats
+    // the purpose of a 30s poll).
+    //
+    // FIX #3: Try the single all-competitions endpoint first (one API call).
+    // Only fall back to per-league calls if the general endpoint returns nothing.
+    // This reduces rate-limit pressure significantly.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 30_000L, initialDelay = 5_000L)
@@ -131,33 +139,44 @@ public class LiveScorePoller {
         try {
             List<Map<String, Object>> allLive = new ArrayList<>();
 
-            for (CompetitionIds.Top6League league : CompetitionIds.Top6League.values()) {
-                List<Map<String, Object>> leagueLive = liveScoreApiClient.getLiveScoresByLeague(league);
-                if (!leagueLive.isEmpty()) {
-                    log.debug("Live poll: {} live match(es) for {}", leagueLive.size(), league.displayName());
-                    allLive.addAll(leagueLive);
-                }
-            }
+            // FIX #3: Attempt the single all-competitions live endpoint first.
+            // This is one API call vs N per-league calls — far less rate-limit risk.
+            List<Map<String, Object>> generalLive = liveScoreApiClient.getLiveScores();
+            if (!generalLive.isEmpty()) {
+                log.info("Live poll: {} match(es) from general live endpoint.", generalLive.size());
+                allLive.addAll(generalLive);
+            } else {
+                // General endpoint returned nothing — fall back to per-league fresh calls.
+                // FIX #2: Use *Fresh() variants (no cache) so we actually hit the API.
+                log.debug("Live poll: general endpoint empty — falling back to per-league fresh calls.");
 
-            for (CompetitionIds.CupCompetition cup : CompetitionIds.CupCompetition.top6Related()) {
-                List<Map<String, Object>> cupLive = liveScoreApiClient.getLiveScoresByCup(cup);
-                if (!cupLive.isEmpty()) {
-                    log.debug("Live poll: {} live match(es) for {}", cupLive.size(), cup.displayName());
-                    allLive.addAll(cupLive);
+                for (CompetitionIds.Top6League league : CompetitionIds.Top6League.values()) {
+                    List<Map<String, Object>> leagueLive = liveScoreApiClient.getLiveScoresByLeagueFresh(league);
+                    if (!leagueLive.isEmpty()) {
+                        log.debug("Live poll: {} live match(es) for {}", leagueLive.size(), league.displayName());
+                        allLive.addAll(leagueLive);
+                    }
+                }
+
+                for (CompetitionIds.CupCompetition cup : CompetitionIds.CupCompetition.top6Related()) {
+                    List<Map<String, Object>> cupLive = liveScoreApiClient.getLiveScoresByCupFresh(cup);
+                    if (!cupLive.isEmpty()) {
+                        log.debug("Live poll: {} live match(es) for {}", cupLive.size(), cup.displayName());
+                        allLive.addAll(cupLive);
+                    }
                 }
             }
 
             if (allLive.isEmpty()) {
-                log.info("Live poll: no live matches across top-6 leagues and cups.");
+                log.info("Live poll: no live matches found.");
             } else {
                 teamLogoCache.ingest(allLive);
-                log.info("Live poll: {} total live match(es) received.", allLive.size());
+                log.info("Live poll: {} total live match(es) to process.", allLive.size());
                 int updated = 0, skipped = 0, demoted = 0;
                 for (Map<String, Object> event : allLive) {
                     try {
                         Match m = mapLiveScoreApiMatchToMatch(event, false);
                         if (m != null) {
-                            // FIX: always enrich logos on the live poll, not just upcoming poll
                             enrichLogos(m);
                             matchService.saveOrUpdate(m);
                             if ("LIVE".equals(m.getStatus())) updated++;
@@ -174,8 +193,6 @@ public class LiveScorePoller {
                 log.info("Live poll: done — live={}, demoted-to-finished={}, skipped={}.",
                         updated, demoted, skipped);
 
-                // FIX: evict caches whenever any match was demoted LIVE→FINISHED
-                // so the frontend immediately stops showing them as live.
                 if (demoted > 0) {
                     evictMatchCaches();
                     log.info("Live poll: evicted match caches after {} demotion(s).", demoted);
@@ -391,7 +408,6 @@ public class LiveScorePoller {
             int closed = matchService.finishStaleLiveMatches(cutoff);
             if (closed > 0) {
                 log.info("Stale sweep: force-finished {} LIVE match(es).", closed);
-                // FIX: evict caches so demoted matches disappear from live views immediately
                 evictMatchCaches();
             } else {
                 log.debug("Stale sweep: no stale LIVE matches found.");
@@ -492,11 +508,10 @@ public class LiveScorePoller {
     /**
      * Maps a raw LiveScore API event to a Match entity.
      *
-     * Status resolution priority:
+     * Status resolution priority (unchanged logic — the fix is in isLive()/isFinished()):
      *   1. If the API says it's finished (isFinished) → FINISHED, always.
      *   2. If the API says it's live (isLive) AND the stale guard passes → LIVE.
-     *   3. If the API says it's live BUT the stale guard fails (no kickoff, or
-     *      kickoff >4h ago) → FINISHED, with a warning log.
+     *   3. If the API says it's live BUT the stale guard fails → FINISHED + warning.
      *   4. Otherwise → UPCOMING.
      *
      * The {@code forceStatusLive} parameter is kept for backward-compatibility
@@ -514,11 +529,11 @@ public class LiveScorePoller {
         match.setSource(MatchSource.LIVESCORE);
         match.setSport("football");
 
-        // Build kickoff first — needed for the stale-live guard below
         Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
         match.setKickoffAt(kickoff);
 
         // ── STATUS RESOLUTION ──────────────────────────────────────────────
+        // isFinished() and isLive() are now fixed in LiveScoreApiClient (FIX #1 & #4).
         if (LiveScoreApiClient.isFinished(event)) {
             match.setStatus("FINISHED");
 
@@ -526,8 +541,6 @@ public class LiveScorePoller {
             if (isGenuinelyLive(kickoff)) {
                 match.setStatus("LIVE");
             } else {
-                // Stale: no kickoff time OR kickoff was >4 hours ago.
-                // Provider hasn't updated the status yet — force-finish it.
                 log.warn("mapLiveScoreApiMatchToMatch: demoting stale LIVE to FINISHED " +
                                 "externalId=ls-{} home='{}' away='{}' kickoff={}",
                         externalId,

@@ -99,8 +99,8 @@ public class LiveScoreApiClient {
 
     // ── API key pairs ──────────────────────────────────────────────────────
     private final List<String[]> apiCredentials = List.of(
-            new String[]{"TA16A6HrD4mYThZ8", "6QXYN60QILflOkUHUVOv2vXGzkFtBFCH"},
-            new String[]{"Y7JvzQYJm1c4Vlyh", "aRZDfUJzl1HOfVae3TJCKIl6JyaFUJX4"}
+            new String[]{"045qVcNAO4mk94Uk", "gZBmVHlFYLDUcguckACgMpRAtdUDiPYy"},
+            new String[]{"fxHrdM0AerFzWyjw", "xTzXyrTqNQwKNpX3XFubsvLGWqgTZAqw"}
     );
 
     private final WebClient    client;
@@ -249,20 +249,10 @@ public class LiveScoreApiClient {
 
     // ═════════════════════════════════════════════════════════════════════
     //  PUBLIC API — ENUM-DRIVEN (the "dropdown" interface)
-    //
-    //  Callers pick from the enum constant, NOT a raw string or int.
-    //  Example:
-    //    client.getLiveScoresByLeague(CompetitionIds.Top6League.PREMIER_LEAGUE)
-    //    client.getLiveScoresByCup(CompetitionIds.CupCompetition.FA_CUP)
-    //    client.getFixturesByLeagueComp(CompetitionIds.LeagueCompetition.EREDIVISIE)
     // ═════════════════════════════════════════════════════════════════════
 
-    // ── Live Scores — enum-driven ──────────────────────────────────────────
+    // ── Live Scores — enum-driven (CACHED — for non-live-poll callers) ─────
 
-    /**
-     * Live scores for a Top-6 league.
-     * Pick from: PREMIER_LEAGUE, LA_LIGA, BUNDESLIGA, SERIE_A, LIGUE_1, CHAMPIONS_LEAGUE
-     */
     public List<Map<String, Object>> getLiveScoresByLeague(CompetitionIds.Top6League league) {
         return cached("live:top6league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -274,10 +264,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Live scores for a cup competition.
-     * Pick from: FA_CUP, EFL_CUP, CHAMPIONS_LEAGUE, EUROPA_LEAGUE, COPA_DEL_REY, DFB_CUP, etc.
-     */
     public List<Map<String, Object>> getLiveScoresByCup(CompetitionIds.CupCompetition cup) {
         return cached("live:cup:" + cup.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -289,10 +275,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Live scores for a non-top-6 domestic league.
-     * Pick from: EREDIVISIE, SCOTTISH_PREMIERSHIP, PRIMEIRA_LIGA, SUPER_LIG, etc.
-     */
     public List<Map<String, Object>> getLiveScoresByLeagueComp(CompetitionIds.LeagueCompetition league) {
         return cached("live:league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -304,11 +286,38 @@ public class LiveScoreApiClient {
         });
     }
 
-    // ── Fixtures — enum-driven ─────────────────────────────────────────────
+    // ── Live Scores — FRESH (no cache) — used exclusively by LiveScorePoller ──
+    // FIX #2: Live poll runs every 30s — caching defeats the entire purpose.
+    // These methods always hit the API directly.
 
     /**
-     * Upcoming fixtures for a Top-6 league.
+     * Fresh (uncached) live scores for a Top-6 league.
+     * Use ONLY from LiveScorePoller — every other caller should use the cached variant.
      */
+    public List<Map<String, Object>> getLiveScoresByLeagueFresh(CompetitionIds.Top6League league) {
+        Map<String, Object> result = callWithFallback(
+                "matches/live.json?competition_id=" + league.id());
+        if (result == null) return Collections.emptyList();
+        List<Map<String, Object>> matches = extractByPath(result, "data", "match");
+        log.info("getLiveScoresByLeagueFresh({}): {} live match(es)", league.displayName(), matches.size());
+        return matches;
+    }
+
+    /**
+     * Fresh (uncached) live scores for a cup competition.
+     * Use ONLY from LiveScorePoller — every other caller should use the cached variant.
+     */
+    public List<Map<String, Object>> getLiveScoresByCupFresh(CompetitionIds.CupCompetition cup) {
+        Map<String, Object> result = callWithFallback(
+                "matches/live.json?competition_id=" + cup.id());
+        if (result == null) return Collections.emptyList();
+        List<Map<String, Object>> matches = extractByPath(result, "data", "match");
+        log.info("getLiveScoresByCupFresh({}): {} live match(es)", cup.displayName(), matches.size());
+        return matches;
+    }
+
+    // ── Fixtures — enum-driven ─────────────────────────────────────────────
+
     public List<Map<String, Object>> getFixturesByLeague(CompetitionIds.Top6League league) {
         return cached("fixtures:top6league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -320,9 +329,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Upcoming fixtures for a cup competition.
-     */
     public List<Map<String, Object>> getFixturesByCup(CompetitionIds.CupCompetition cup) {
         return cached("fixtures:cup:" + cup.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -334,9 +340,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Upcoming fixtures for a non-top-6 domestic league.
-     */
     public List<Map<String, Object>> getFixturesByLeagueComp(CompetitionIds.LeagueCompetition league) {
         return cached("fixtures:league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -350,9 +353,6 @@ public class LiveScoreApiClient {
 
     // ── Standings — enum-driven ────────────────────────────────────────────
 
-    /**
-     * Standings for a Top-6 league.
-     */
     public Map<String, Object> getStandingsByLeague(CompetitionIds.Top6League league) {
         return cached("standings:top6league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -363,9 +363,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Standings for any cup or other competition by CupCompetition enum.
-     */
     public Map<String, Object> getStandingsByCup(CompetitionIds.CupCompetition cup) {
         return cached("standings:cup:" + cup.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -374,9 +371,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Standings for a non-top-6 domestic league.
-     */
     public Map<String, Object> getStandingsByLeagueComp(CompetitionIds.LeagueCompetition league) {
         return cached("standings:league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -387,9 +381,6 @@ public class LiveScoreApiClient {
 
     // ── Top Scorers — enum-driven ──────────────────────────────────────────
 
-    /**
-     * Top scorers for a Top-6 league.
-     */
     public Map<String, Object> getTopScorersByLeague(CompetitionIds.Top6League league) {
         return cached("topscorers:top6league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -398,9 +389,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /**
-     * Top scorers for a non-top-6 domestic league.
-     */
     public Map<String, Object> getTopScorersByLeagueComp(CompetitionIds.LeagueCompetition league) {
         return cached("topscorers:league:" + league.name(), () -> {
             Map<String, Object> result = callWithFallback(
@@ -420,7 +408,6 @@ public class LiveScoreApiClient {
         return success != null && !"false".equals(success.toString());
     }
 
-    /** All live scores across every Top-6 league. */
     public List<Map<String, Object>> getTop6LiveScores() {
         return cached("live:top6:all", () -> {
             List<Map<String, Object>> all = new ArrayList<>();
@@ -433,7 +420,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** All live scores across top-6-related cup competitions. */
     public List<Map<String, Object>> getTop6CupsLiveScores() {
         return cached("live:top6cups:all", () -> {
             List<Map<String, Object>> all = new ArrayList<>();
@@ -446,7 +432,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** All upcoming fixtures across every Top-6 league. */
     public List<Map<String, Object>> getTop6Fixtures() {
         return cached("fixtures:top6:all", () -> {
             List<Map<String, Object>> all = new ArrayList<>();
@@ -459,7 +444,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** All upcoming fixtures across top-6-related cup competitions. */
     public List<Map<String, Object>> getTop6CupFixtures() {
         return cached("fixtures:top6cups:all", () -> {
             List<Map<String, Object>> all = new ArrayList<>();
@@ -472,7 +456,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** Combined top-6 leagues + cups fixtures (deduplicated). */
     public List<Map<String, Object>> getTop6AndCupFixtures() {
         return cached("fixtures:top6andcups:all", () -> {
             List<Map<String, Object>> leagues = getTop6Fixtures();
@@ -494,7 +477,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** All Top-6 standings keyed by league display name. */
     public Map<String, Map<String, Object>> getAllTop6Standings() {
         return cached("standings:top6:all", () -> {
             Map<String, Map<String, Object>> all = new LinkedHashMap<>();
@@ -564,6 +546,10 @@ public class LiveScoreApiClient {
     //  GENERAL (ALL COMPETITIONS) ENDPOINTS
     // ═════════════════════════════════════════════════════════════════════
 
+    /**
+     * All live matches across every competition — single API call, no cache.
+     * Used by LiveScorePoller as the primary live-data source (FIX #3).
+     */
     public List<Map<String, Object>> getLiveScores() {
         Map<String, Object> result = callWithFallback("matches/live.json");
         if (result == null) { log.warn("getLiveScores: null response"); return Collections.emptyList(); }
@@ -690,7 +676,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** Standings by raw competition ID (fallback for callers that haven't migrated yet). */
     public Map<String, Object> getStandings(int competitionId) {
         return cached("standings:" + competitionId, () -> {
             Map<String, Object> result = callWithFallback(
@@ -699,7 +684,6 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** Top scorers by raw competition ID (fallback for callers that haven't migrated yet). */
     public Map<String, Object> getTopScorers(int competitionId) {
         return cached("topscorers:" + competitionId, () -> {
             Map<String, Object> result = callWithFallback(
@@ -774,11 +758,6 @@ public class LiveScoreApiClient {
         return "";
     }
 
-    /**
-     * Returns the score string, e.g. "1-0", or an empty string if unavailable.
-     * Returns empty (not "-") so callers can reliably test {@code .contains("-")}
-     * only when a real score separator is present.
-     */
     public static String extractScore(Map<String, Object> match) {
         Object scores = match.get("scores");
         if (scores instanceof Map<?, ?> scoresMap) {
@@ -791,9 +770,6 @@ public class LiveScoreApiClient {
         return "";
     }
 
-    /**
-     * Returns the half-time score string, e.g. "0-0", or an empty string if unavailable.
-     */
     public static String extractHalfTimeScore(Map<String, Object> match) {
         Object scores = match.get("scores");
         if (scores instanceof Map<?, ?> scoresMap) {
@@ -889,17 +865,70 @@ public class LiveScoreApiClient {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════════════
+    //  STATUS DETECTION — FIX #1 & #4
+    //
+    //  isLive() was incorrectly treating any numeric clock value (e.g. "90",
+    //  "45") as a live signal. This caused finished matches to be flagged as
+    //  live, then immediately demoted to FINISHED by the stale-guard, so
+    //  nothing ever surfaced as genuinely LIVE.
+    //
+    //  Fix: only treat numeric clock as live if status is explicitly "LIVE",
+    //  or if status is blank AND the clock is a valid in-play minute (1–130).
+    //
+    //  isFinished() fix: also catches FULL_TIME / ENDED provider status values.
+    // ═════════════════════════════════════════════════════════════════════
+
+    /**
+     * FIX #1: Corrected live detection.
+     *
+     * Priority:
+     *   1. If status is explicitly FINISHED or time is "FT" → NOT live.
+     *   2. If status is explicitly "LIVE" → live.
+     *   3. If status is blank AND time is a numeric minute 1–130 → live.
+     *   4. Otherwise → not live.
+     *
+     * The old logic treated ANY non-FT/HT time string as live, which caused
+     * finished matches with clock="90" to appear as live then get demoted.
+     */
     public static boolean isLive(Map<String, Object> match) {
         String status = extractStatus(match);
         String time   = extractMatchTime(match);
-        return "LIVE".equalsIgnoreCase(status) ||
-                (!time.isEmpty() && !"FT".equals(time) && !"HT".equals(time) && !"POSTP".equals(time));
+
+        // Finished always wins — check this first
+        if ("FINISHED".equalsIgnoreCase(status)
+                || "FULL_TIME".equalsIgnoreCase(status)
+                || "ENDED".equalsIgnoreCase(status)
+                || "FT".equals(time)) {
+            return false;
+        }
+
+        // Explicit live status from the provider
+        if ("LIVE".equalsIgnoreCase(status)) return true;
+
+        // Numeric clock only counts as live if the provider hasn't set a status yet
+        // (some providers omit status and only set the clock during a match)
+        if (status.isBlank() && !time.isBlank() && !"HT".equals(time) && !"POSTP".equals(time)) {
+            try {
+                int minute = Integer.parseInt(time.trim());
+                return minute >= 1 && minute <= 130; // sane in-play range
+            } catch (NumberFormatException ignored) {}
+        }
+
+        return false;
     }
 
+    /**
+     * FIX #4: Corrected finished detection.
+     * Now catches FULL_TIME and ENDED in addition to FINISHED / FT.
+     */
     public static boolean isFinished(Map<String, Object> match) {
         String status = extractStatus(match);
         String time   = extractMatchTime(match);
-        return "FINISHED".equalsIgnoreCase(status) || "FT".equals(time);
+        return "FINISHED".equalsIgnoreCase(status)
+                || "FULL_TIME".equalsIgnoreCase(status)
+                || "ENDED".equalsIgnoreCase(status)
+                || "FT".equals(time);
     }
 
     public static boolean isScheduled(Map<String, Object> match) {
@@ -951,24 +980,8 @@ public class LiveScoreApiClient {
 
     // ═════════════════════════════════════════════════════════════════════
     //  CORE EXTRACTION HELPERS
-    //
-    //  extractByPath(response, "data", "match")
-    //    walks: response → data (Map) → match (List) and returns the list.
-    //    If no list is found at the exact path, falls back to scanning
-    //    the top-level keys.  This correctly handles all three API shapes.
     // ═════════════════════════════════════════════════════════════════════
 
-    /**
-     * Walk a response map using the provided key path and return the first
-     * List found at the final key.  This handles the three known shapes:
-     *
-     *   data → match    (live endpoint)
-     *   data → fixture  (competition fixture endpoint)
-     *   data → fixtures (general fixture endpoint)
-     *
-     * @param response the top-level API response map
-     * @param keys     ordered path segments, e.g. "data", "match"
-     */
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> extractByPath(Map<String, Object> response, String... keys) {
         if (response == null || keys.length == 0) return Collections.emptyList();
@@ -981,20 +994,16 @@ public class LiveScoreApiClient {
 
         String lastKey = keys[keys.length - 1];
         if (current instanceof Map<?, ?> map) {
-            // Exact match at last key
             Object val = map.get(lastKey);
             if (val instanceof List<?> list && !list.isEmpty())
                 return (List<Map<String, Object>>) list;
 
-            // Last key not found — try sibling keys in the same map
-            // (handles data → fixtures vs data → fixture)
             for (Object innerVal : ((Map<?, ?>) map).values()) {
                 if (innerVal instanceof List<?> innerList && !innerList.isEmpty())
                     return (List<Map<String, Object>>) innerList;
             }
         }
 
-        // Top-level fallback: check if the key exists directly on the response
         Object topLevel = response.get(lastKey);
         if (topLevel instanceof List<?> list && !list.isEmpty())
             return (List<Map<String, Object>>) list;
@@ -1002,32 +1011,17 @@ public class LiveScoreApiClient {
         return Collections.emptyList();
     }
 
-    /**
-     * Public alias for {@link #extractByPath(Map, String...)} — used by
-     * {@link com.speedbet.api.livescore.LiveScorePoller} when it constructs
-     * ad-hoc API calls via {@link #callWithFallbackPublic(String)} and needs
-     * to extract the result list with the same path-walking logic.
-     */
     public List<Map<String, Object>> extractByPathPublic(Map<String, Object> response, String... keys) {
         return extractByPath(response, keys);
     }
 
-    /**
-     * Extracts fixtures from the general (no competition_id) fixture endpoint
-     * which uses data → fixtures (plural) instead of data → fixture.
-     */
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> extractGeneralFixtures(Map<String, Object> response) {
         if (response == null) return Collections.emptyList();
-
-        // Try data → fixtures  (general endpoint)
         List<Map<String, Object>> fromFixtures = extractByPath(response, "data", "fixtures");
         if (!fromFixtures.isEmpty()) return fromFixtures;
-
-        // Try data → fixture   (competition-specific endpoint, fallback)
         List<Map<String, Object>> fromFixture  = extractByPath(response, "data", "fixture");
         if (!fromFixture.isEmpty()) return fromFixture;
-
         return Collections.emptyList();
     }
 
@@ -1059,10 +1053,8 @@ public class LiveScoreApiClient {
 
     // ═════════════════════════════════════════════════════════════════════
     //  DEPRECATED — kept for backward compatibility only
-    //  Migrate callers to the enum-typed overloads above.
     // ═════════════════════════════════════════════════════════════════════
 
-    /** @deprecated Use {@link #getLiveScoresByLeague(CompetitionIds.Top6League)} or the other typed overloads. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public List<Map<String, Object>> getLiveScoresByLeagueName(String leagueName) {
         int id = CompetitionIds.resolveId(leagueName);
@@ -1072,7 +1064,6 @@ public class LiveScoreApiClient {
         return extractByPath(result, "data", "match");
     }
 
-    /** @deprecated Use {@link #getFixturesByLeague(CompetitionIds.Top6League)} or the other typed overloads. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public List<Map<String, Object>> getFixturesByLeagueName(String leagueName) {
         int id = CompetitionIds.resolveId(leagueName);
@@ -1082,20 +1073,17 @@ public class LiveScoreApiClient {
         return extractByPath(result, "data", "fixture");
     }
 
-    /** @deprecated Use {@link CompetitionIds#resolveId(String)} directly. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public Integer resolveCompetitionId(String leagueName) {
         int id = CompetitionIds.resolveId(leagueName);
         return id == -1 ? null : id;
     }
 
-    /** @deprecated Iterate the enum types directly. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public Map<String, Integer> getAllKnownCompetitionIds() {
         return ALL_COMPETITION_IDS;
     }
 
-    /** @deprecated Use {@link #getLiveScoresByLeague(CompetitionIds.Top6League)} etc. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public List<Map<String, Object>> getLiveScoresByCompetition(int competitionId) {
         Map<String, Object> result = callWithFallback("matches/live.json?competition_id=" + competitionId);
@@ -1103,7 +1091,6 @@ public class LiveScoreApiClient {
         return extractByPath(result, "data", "match");
     }
 
-    /** @deprecated Use {@link #getFixturesByLeague(CompetitionIds.Top6League)} etc. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public List<Map<String, Object>> getFixturesByCompetition(int competitionId) {
         return cached("fixtures:comp:" + competitionId, () -> {
@@ -1113,14 +1100,12 @@ public class LiveScoreApiClient {
         });
     }
 
-    /** @deprecated Use {@link #getStandings(int)} or the enum-typed overloads. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public Map<String, Object> getLiveStandings(int competitionId) {
         Map<String, Object> result = callWithFallback("standings/live.json?competition_id=" + competitionId);
         return result != null ? result : Map.of();
     }
 
-    /** @deprecated Use {@link #getTopScorers(int)} or the enum-typed overloads. */
     @Deprecated(since = "enum-migration", forRemoval = true)
     public Map<String, Object> getCompetitionsByCountry(int countryId) {
         return cached("competitions:country:" + countryId, () -> {
