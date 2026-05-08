@@ -1,0 +1,50 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: speedbet-db
+    environment:
+      POSTGRES_DB: speedbet
+      POSTGRES_USER: speedbet
+      POSTGRES_PASSWORD: speedbet123
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U speedbet"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    container_name: speedbet-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/speedbet
+      SPRING_DATASOURCE_USERNAME: speedbet
+      SPRING_DATASOURCE_PASSWORD: speedbet123
+      JWT_SECRET: ${JWT_SECRET:-SpeedBetSuperSecretKeyForJWTSigningMustBe512BitsLongAtMinimumPleaseChangeInProduction2026!!}
+      PAYSTACK_SECRET_KEY: ${PAYSTACK_SECRET_KEY:-sk_test_placeholder}
+      PAYSTACK_PUBLIC_KEY: ${PAYSTACK_PUBLIC_KEY:-pk_test_placeholder}
+      PAYSTACK_WEBHOOK_SECRET: ${PAYSTACK_WEBHOOK_SECRET:-webhook_placeholder}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-sk_test_placeholder}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_placeholder}
+      SPORTDB_API_KEY: ${SPORTDB_API_KEY:-demo}
+      SPORTSRC_API_KEY: ${SPORTSRC_API_KEY:-demo}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-placeholder}
+      DEMO_MODE: ${DEMO_MODE:-true}
+      SUPER_ADMIN_DIRECT_PATH: ${SUPER_ADMIN_DIRECT_PATH:-/x-control-9f3a2b}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+    volumes:
+      - uploads:/app/uploads
+
+volumes:
+  pgdata:
+  uploads:

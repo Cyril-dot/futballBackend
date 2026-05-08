@@ -1,0 +1,24 @@
+# Ignore environment files
+.env
+
+# Ignore compiled Java files
+*.class
+*.jar
+
+# Ignore Maven target folder
+/target/
+
+# Ignore logs
+/logs/
+/*.log
+
+# Ignore IDE files (Eclipse/IntelliJ/VSCode)
+*.iml
+*.ipr
+*.iws
+.idea/
+.vscode/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

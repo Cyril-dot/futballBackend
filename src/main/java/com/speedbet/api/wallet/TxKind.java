@@ -1,0 +1,18 @@
+package com.speedbet.api.wallet;
+
+public enum TxKind {
+    DEPOSIT,
+    WITHDRAW,
+    WITHDRAW_HOLD,
+    WITHDRAW_RELEASE,
+    BET_STAKE,
+    BET_WIN,
+    REFERRAL_COMMISSION,
+    PAYOUT,
+    ADJUSTMENT,
+    VIP_CASHBACK,
+    VIP_MEMBERSHIP,
+    WELCOME_BONUS,
+    WITHDRAWAL_REFUND,
+    ADMIN_UPGRADE_FEE
+}
