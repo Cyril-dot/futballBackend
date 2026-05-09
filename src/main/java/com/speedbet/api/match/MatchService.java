@@ -50,6 +50,26 @@ public class MatchService {
         boolean isValid() { return System.currentTimeMillis() <= expiresAt; }
     }
 
+    // ── Status transition guard ───────────────────────────────────────────
+    // A FINISHED match must never be demoted back to LIVE or UPCOMING by a
+    // stale poll event.  This table defines which transitions are permitted:
+    //
+    //   UPCOMING  → LIVE      ✓
+    //   UPCOMING  → FINISHED  ✓
+    //   LIVE      → FINISHED  ✓
+    //   LIVE      → UPCOMING  ✗  (poller mis-classified; ignore)
+    //   FINISHED  → LIVE      ✗  (ghost event from stale API data)
+    //   FINISHED  → UPCOMING  ✗  (ghost event from stale API data)
+    //
+    private static boolean isPermittedTransition(String existing, String incoming) {
+        if (existing == null || existing.equals(incoming)) return true;
+        return switch (existing) {
+            case "FINISHED" -> false;                            // FINISHED is terminal
+            case "LIVE"     -> "FINISHED".equals(incoming);     // LIVE → FINISHED only
+            default         -> true;                             // UPCOMING → anything
+        };
+    }
+
     // ── Pre-built display-name sets for DB filtering (cups only — league
     //    filtering now delegates to Top6LeagueTeams for team validation) ──
     private static final Set<String> CUP_NAMES =
@@ -176,12 +196,15 @@ public class MatchService {
     }
 
     public List<Match> getRecentResultsLimited(int limit) {
-        Instant cutoff = Instant.now().minus(48, ChronoUnit.HOURS);
+        // 72h window (was 48h) — ensures matches finished yesterday evening
+        // are still visible when queried the following morning.
+        Instant cutoff = Instant.now().minus(72, ChronoUnit.HOURS);
         List<Match> matches = matchRepo.findByStatusOrderByKickoffAt("FINISHED").stream()
                 .filter(m -> m.getKickoffAt() != null && m.getKickoffAt().isAfter(cutoff))
                 .limit(limit)
                 .toList();
-        log.info("getRecentResults: returning {} FINISHED match(es) (capped at {})", matches.size(), limit);
+        log.info("getRecentResults: returning {} FINISHED match(es) (72h window, cap={})",
+                matches.size(), limit);
         return matches;
     }
 
@@ -387,7 +410,7 @@ public class MatchService {
     }
 
     public List<Match> getRecentResultsByTeamName(String teamName) {
-        Instant cutoff = Instant.now().minus(48, ChronoUnit.HOURS);
+        Instant cutoff = Instant.now().minus(72, ChronoUnit.HOURS);
         List<Match> matches = matchRepo.findByStatusOrderByKickoffAt("FINISHED").stream()
                 .filter(m -> m.getKickoffAt() != null && m.getKickoffAt().isAfter(cutoff))
                 .filter(m -> teamName.equalsIgnoreCase(m.getHomeTeam())
@@ -399,13 +422,6 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // LIST + ODDS BUNDLES
-    //
-    // FIX: withAllOdds() now includes LIVE matches in the response bundle.
-    // Previously it only returned UPCOMING/SCHEDULED odds and returned an
-    // empty odds list for LIVE matches that had no live cache entry yet.
-    // Now it falls through to generating pre-match odds as a reasonable
-    // placeholder when the live cache is empty — the frontend will poll
-    // again in 30s and get fresh live odds once the cache is populated.
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Map<String, Object>> withOdds(List<Match> matches) {
@@ -422,9 +438,6 @@ public class MatchService {
                 if (cached != null && cached.isValid()) {
                     entry.put("odds", cached.odds());
                 } else {
-                    // FIX: Fall back to pre-match odds rather than returning empty.
-                    // The live cache is populated every 2 min by refreshLiveOddsCache()
-                    // — this prevents a blank odds panel during the first poll cycle.
                     entry.put("odds", oddsGeneratorService.generatePreMatchOdds(
                             match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
                 }
@@ -453,10 +466,6 @@ public class MatchService {
                 OddsCacheEntry oddsEntry     = liveOddsCache.get(match.getId());
                 OddsCacheEntry handicapEntry = liveHandicapCache.get(match.getId());
 
-                // FIX: Use cached live odds when available; fall back to pre-match
-                // odds generator when the cache is cold (first poll cycle after restart
-                // or cache miss). This ensures the frontend always has something to
-                // render rather than three empty "—" buttons on every live match.
                 List<Map<String, Object>> matchResult = (oddsEntry != null && oddsEntry.isValid())
                         ? oddsEntry.odds()
                         : oddsGeneratorService.generatePreMatchOdds(
@@ -720,13 +729,13 @@ public class MatchService {
     // LIVESCORE API PASS-THROUGH HELPERS
     // ══════════════════════════════════════════════════════════════════════
 
-    public List<Map<String, Object>> getLiveScoreApiLive()             { return liveScoreApiClient.getLiveScores(); }
-    public List<Map<String, Object>> getLiveScoreApiToday()            { return liveScoreApiClient.getTodayMatches(); }
-    public List<Map<String, Object>> getLiveScoreApiFixtures()         { return liveScoreApiClient.getUpcomingFixtures(); }
-    public List<Map<String, Object>> getLiveScoreApiTop6Live()         { return liveScoreApiClient.getTop6LiveScores(); }
-    public List<Map<String, Object>> getLiveScoreApiTop6CupsLive()     { return liveScoreApiClient.getTop6CupsLiveScores(); }
-    public List<Map<String, Object>> getLiveScoreApiTop6Fixtures()     { return liveScoreApiClient.getTop6Fixtures(); }
-    public List<Map<String, Object>> getLiveScoreApiTop6CupFixtures()  { return liveScoreApiClient.getTop6CupFixtures(); }
+    public List<Map<String, Object>> getLiveScoreApiLive()               { return liveScoreApiClient.getLiveScores(); }
+    public List<Map<String, Object>> getLiveScoreApiToday()              { return liveScoreApiClient.getTodayMatches(); }
+    public List<Map<String, Object>> getLiveScoreApiFixtures()           { return liveScoreApiClient.getUpcomingFixtures(); }
+    public List<Map<String, Object>> getLiveScoreApiTop6Live()           { return liveScoreApiClient.getTop6LiveScores(); }
+    public List<Map<String, Object>> getLiveScoreApiTop6CupsLive()       { return liveScoreApiClient.getTop6CupsLiveScores(); }
+    public List<Map<String, Object>> getLiveScoreApiTop6Fixtures()       { return liveScoreApiClient.getTop6Fixtures(); }
+    public List<Map<String, Object>> getLiveScoreApiTop6CupFixtures()    { return liveScoreApiClient.getTop6CupFixtures(); }
     public List<Map<String, Object>> getLiveScoreApiTop6AndCupFixtures() { return liveScoreApiClient.getTop6AndCupFixtures(); }
 
     public List<Map<String, Object>> getLiveScoreApiLiveByLeague(CompetitionIds.Top6League league) {
@@ -780,6 +789,22 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // PERSISTENCE
+    //
+    // KEY FIX — status demotion guard:
+    //
+    //   A FINISHED match must never be overwritten with LIVE or UPCOMING by a
+    //   stale poll event.  A LIVE match must never be overwritten with UPCOMING
+    //   (e.g. by a NOT STARTED event that slipped through the poller filter).
+    //
+    //   isPermittedTransition(existing, incoming) encodes the allowed moves:
+    //     UPCOMING  → LIVE      ✓
+    //     UPCOMING  → FINISHED  ✓
+    //     LIVE      → FINISHED  ✓
+    //     LIVE      → UPCOMING  ✗
+    //     FINISHED  → *         ✗  (terminal — never demoted)
+    //
+    //   If a transition is rejected the existing record is returned unchanged.
+    //   A WARN log is emitted so it's visible without noise in normal operation.
     // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
@@ -790,25 +815,48 @@ public class MatchService {
 
         return matchRepo.findByExternalId(match.getExternalId())
                 .map(existing -> {
-                    if (match.getStatus()    != null) existing.setStatus(match.getStatus());
+
+                    // ── Status guard ─────────────────────────────────────
+                    if (match.getStatus() != null) {
+                        if (isPermittedTransition(existing.getStatus(), match.getStatus())) {
+                            existing.setStatus(match.getStatus());
+                        } else {
+                            log.warn("saveOrUpdate: blocked status demotion externalId={} {} → {} (keeping {})",
+                                    existing.getExternalId(),
+                                    existing.getStatus(), match.getStatus(),
+                                    existing.getStatus());
+                            // Return early — nothing else should be written from
+                            // an event whose status has already been rejected.
+                            return matchRepo.save(existing);
+                        }
+                    }
+
+                    // ── Score / metadata — always update when present ─────
                     if (match.getScoreHome() != null) existing.setScoreHome(match.getScoreHome());
                     if (match.getScoreAway() != null) existing.setScoreAway(match.getScoreAway());
                     if (match.getMetadata()  != null) existing.setMetadata(match.getMetadata());
 
+                    // ── League — always overwrite with resolved name ──────
                     if (!isMissing(match.getLeague())) existing.setLeague(match.getLeague());
 
+                    // ── Sparse fields — fill in only when missing ─────────
                     if (isMissing(existing.getHomeTeam())   && !isMissing(match.getHomeTeam()))   existing.setHomeTeam(match.getHomeTeam());
                     if (isMissing(existing.getAwayTeam())   && !isMissing(match.getAwayTeam()))   existing.setAwayTeam(match.getAwayTeam());
                     if (isMissing(existing.getSport())      && !isMissing(match.getSport()))      existing.setSport(match.getSport());
                     if (isMissing(existing.getHomeLogo())   && !isMissing(match.getHomeLogo()))   existing.setHomeLogo(match.getHomeLogo());
                     if (isMissing(existing.getAwayLogo())   && !isMissing(match.getAwayLogo()))   existing.setAwayLogo(match.getAwayLogo());
                     if (isMissing(existing.getLeagueLogo()) && !isMissing(match.getLeagueLogo())) existing.setLeagueLogo(match.getLeagueLogo());
+                    if (existing.getSource() == null && match.getSource() != null) existing.setSource(match.getSource());
 
+                    // ── Kickoff healing — only upgrade to a real timestamp ─
+                    // A "real" kickoff has nanoseconds == 0 (it came from the
+                    // API's date+time fields rather than a synthetic placeholder).
+                    // Never overwrite a good kickoff with a null or fake one.
                     if (match.getKickoffAt() != null) {
-                        boolean existingIsFakeOrNull = existing.getKickoffAt() == null
+                        boolean existingMissing = existing.getKickoffAt() == null
                                 || !isRealKickoff(existing.getKickoffAt());
-                        boolean incomingIsReal = isRealKickoff(match.getKickoffAt());
-                        if (existingIsFakeOrNull && incomingIsReal) {
+                        boolean incomingReal    = isRealKickoff(match.getKickoffAt());
+                        if (existingMissing && incomingReal) {
                             log.debug("saveOrUpdate: healing kickoffAt externalId={} old={} new={}",
                                     existing.getExternalId(), existing.getKickoffAt(), match.getKickoffAt());
                             existing.setKickoffAt(match.getKickoffAt());
@@ -816,9 +864,6 @@ public class MatchService {
                             existing.setKickoffAt(match.getKickoffAt());
                         }
                     }
-
-                    if (existing.getSource() == null && match.getSource() != null)
-                        existing.setSource(match.getSource());
 
                     log.debug("saveOrUpdate: updated externalId={} status='{}' home='{}' away='{}' league='{}' kickoff='{}'",
                             existing.getExternalId(), existing.getStatus(),

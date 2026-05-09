@@ -51,6 +51,7 @@ import java.util.concurrent.*;
  *     home.name / away.name     — nested objects
  *     scores.score              — "1 - 0"
  *     time                      — match clock "45", "HT", "FT"
+ *     status                    — "IN PLAY", "HALF TIME BREAK", "FINISHED", "NOT STARTED", etc.
  *     list key chain: data → match
  *
  *   COMPETITION fixture endpoints (fixtures/matches.json?competition_id=X):
@@ -71,9 +72,10 @@ import java.util.concurrent.*;
  * ── Changelog ───────────────────────────────────────────────────────────
  *
  *   FIX #1  isLive() — expanded to cover all in-play status strings that
- *           providers may send ("1H", "2H", "HT", "ET", "PEN", etc.).
- *           Previously only "LIVE" was matched explicitly, so matches with
- *           alternative status values were never surfaced as live.
+ *           the livescore-api.com provider returns, including multi-word
+ *           statuses with spaces: "IN PLAY", "HALF TIME BREAK", "ADDED TIME".
+ *           Previously only lowercase single-word variants were matched, so
+ *           matches with these exact API status values fell through as not-live.
  *
  *   FIX #2  isLive() stale-guard interaction — null kickoff no longer causes
  *           a live match to be demoted to FINISHED.  The LiveScorePoller
@@ -83,8 +85,11 @@ import java.util.concurrent.*;
  *   FIX #3  getLiveScores() — already hits the API fresh (no cache).
  *           Confirmed intentional; documented clearly.
  *
- *   FIX #4  isFinished() — catches FULL_TIME / ENDED in addition to
- *           FINISHED / FT.  (Was already in place; retained and documented.)
+ *   FIX #4  isFinished() — catches FULL_TIME, ENDED, "FULL TIME" (with space)
+ *           in addition to FINISHED / FT.
+ *
+ *   FIX #5  NOT STARTED — added to a dedicated UNSTARTED_STATUSES set so the
+ *           poller can detect and skip these to avoid overwriting fixture data.
  */
 @Slf4j
 @Component
@@ -102,31 +107,43 @@ public class LiveScoreApiClient {
      * All status strings that unambiguously mean a match is currently in play.
      * Kept as a Set for O(1) lookup and easy extension.
      *
-     * FIX #1: Added the full set of in-play status codes that livescore-api.com
-     * (and compatible providers) may return.  The previous implementation only
-     * checked for "LIVE" explicitly, causing matches with status "1H", "2H",
-     * "HT", etc. to fall through as not-live.
+     * FIX #1: Added the EXACT multi-word status strings that livescore-api.com
+     * returns from its live endpoint, confirmed via API documentation:
+     *   "IN PLAY"          — first half or second half in progress
+     *   "HALF TIME BREAK"  — half-time interval
+     *   "ADDED TIME"       — injury / stoppage time
+     *
+     * Also retained all single-word aliases for compatibility with other
+     * providers or alternative response formats.
+     *
+     * All comparisons are done after .toLowerCase() so casing never matters.
      */
     private static final Set<String> IN_PLAY_STATUSES = Set.of(
+            // ── EXACT strings returned by livescore-api.com (confirmed) ──────
+            "in play",           // API: "IN PLAY" — match in progress
+            "half time break",   // API: "HALF TIME BREAK" — half-time interval
+            "added time",        // API: "ADDED TIME" — injury/stoppage time
+            // ── Single-word variants / other providers ────────────────────────
             "live",
             "in_play",
             "inplay",
-            "1h",        // first half
+            "1h",                // first half
             "first_half",
-            "2h",        // second half
+            "2h",                // second half
             "second_half",
-            "ht",        // half-time break
+            "ht",                // half-time (alternative)
             "halftime",
             "half_time",
-            "et",        // extra time
+            "et",                // extra time
             "extra_time",
-            "et1",       // extra time first half
-            "et2",       // extra time second half
-            "pen",       // penalty shoot-out
+            "et1",               // extra time first half
+            "et2",               // extra time second half
+            "pen",               // penalty shoot-out
+            "ps",                // penalty shoot-out (alternative)
             "penalties",
             "shootout",
-            "break",     // short break between periods
-            "suspended", // temporarily suspended (rain, VAR delay, etc.)
+            "break",             // short break between periods
+            "suspended",         // temporarily suspended (rain, VAR delay, etc.)
             "interrupted"
     );
 
@@ -134,16 +151,38 @@ public class LiveScoreApiClient {
      * All status strings (and time values) that mean a match has ended.
      * Checked BEFORE in-play statuses so finished always wins.
      *
-     * FIX #4: Catches FULL_TIME and ENDED in addition to FINISHED / FT.
+     * FIX #4: Added "full time" (with space) to catch the API's exact string.
+     * Also catches FULL_TIME, ENDED, ABANDONED, CANCELLED, WALKOVER, AWARDED.
+     *
+     * All comparisons are done after .toLowerCase() so casing never matters.
      */
     private static final Set<String> FINISHED_STATUSES = Set.of(
             "finished",
+            "full time",         // API: "FULL TIME" — exact string from livescore-api.com
             "full_time",
+            "ft",                // also checked via time field in isFinished()
             "ended",
-            "abandoned",  // abandoned matches are over for betting purposes
+            "abandoned",         // abandoned matches are over for betting purposes
             "cancelled",
             "walkover",
             "awarded"
+    );
+
+    /**
+     * Status strings that mean the match has not yet started.
+     * Used by LiveScorePoller to skip NOT STARTED events from the live endpoint
+     * so they do not overwrite fixture data saved by the fixtures poller.
+     *
+     * FIX #5: "NOT STARTED" is the exact string returned by livescore-api.com
+     * for upcoming matches that appear in the live endpoint response.
+     */
+    public static final Set<String> UNSTARTED_STATUSES = Set.of(
+            "not started",       // API: "NOT STARTED" — exact string
+            "scheduled",
+            "postponed",
+            "postp",
+            "tba",
+            "tbd"
     );
 
     // ── Derived convenience maps (built from CompetitionIds enums) ─────────
@@ -935,64 +974,64 @@ public class LiveScoreApiClient {
     //  STATUS DETECTION
     //
     //  FIX #1  isLive() — now uses IN_PLAY_STATUSES set (defined at the top
-    //          of the class) which covers all in-play status strings that
-    //          livescore-api.com and compatible providers may return:
-    //            "LIVE", "1H", "2H", "HT", "ET", "ET1", "ET2",
-    //            "PEN", "PENALTIES", "SHOOTOUT", "BREAK", "SUSPENDED", etc.
+    //          of the class) which covers the EXACT multi-word status strings
+    //          returned by livescore-api.com:
+    //            "IN PLAY"         → matched as "in play"
+    //            "HALF TIME BREAK" → matched as "half time break"
+    //            "ADDED TIME"      → matched as "added time"
+    //          Plus all single-word aliases for other providers.
+    //          All comparisons are .toLowerCase() so casing never matters.
     //
-    //          The old implementation only matched "LIVE" explicitly.
-    //          Matches with status "1H" / "2H" / "HT" were therefore never
-    //          detected as live, so they fell through to the numeric-clock
-    //          branch which treated a blank clock as "not live", causing them
-    //          to be demoted to FINISHED by the stale-guard in LiveScorePoller.
+    //  FIX #4  isFinished() — catches "FULL TIME" (with space), "FULL_TIME",
+    //          "ENDED", "ABANDONED", "CANCELLED", "WALKOVER", "AWARDED" in
+    //          addition to "FINISHED" / "FT" (via time field).
     //
-    //  FIX #2  Null-kickoff tolerance — documented here; the corresponding
-    //          guard change is in LiveScorePoller.mapLiveScoreApiMatchToMatch:
-    //
-    //            // Before (broken):
-    //            if (isGenuinelyLive(kickoff)) { ... } else { match.setStatus("FINISHED"); }
-    //
-    //            // After (fixed):
-    //            if (kickoff == null || isGenuinelyLive(kickoff)) {
-    //                match.setStatus("LIVE");
-    //            } else {
-    //                log.warn("demoting stale LIVE ...");
-    //                match.setStatus("FINISHED");
-    //            }
-    //
-    //  FIX #4  isFinished() — catches FULL_TIME, ENDED, ABANDONED,
-    //          CANCELLED, WALKOVER, AWARDED in addition to FINISHED / FT.
-    //          Uses FINISHED_STATUSES set defined at the top of the class.
+    //  FIX #5  isNotStarted() — new helper; returns true for "NOT STARTED"
+    //          (exact API string) and related pre-match statuses.
+    //          Used by LiveScorePoller to skip these events from the live
+    //          endpoint so they cannot overwrite scheduled fixture data.
     // ═════════════════════════════════════════════════════════════════════
 
     /**
      * FIX #1: Corrected live detection using the full IN_PLAY_STATUSES set.
      *
      * Decision priority:
-     *   1. If status or time indicates finished   → NOT live (finished always wins).
+     *   1. If status or time indicates finished    → NOT live (finished always wins).
      *   2. If status is in IN_PLAY_STATUSES        → live.
      *   3. If status is blank AND clock is a valid
      *      in-play minute (1–130)                  → live (provider omitted status).
      *   4. Otherwise                               → not live.
      *
+     * The key fix: IN_PLAY_STATUSES now contains "in play", "half time break",
+     * and "added time" — the exact mixed-case strings the API returns.
+     * All comparisons use .toLowerCase() so casing is irrelevant.
+     *
      * @param match raw event map from the API
      * @return true if the match is currently in play
      */
     public static boolean isLive(Map<String, Object> match) {
-        String status = extractStatus(match).trim();
-        String time   = extractMatchTime(match).trim();
+        String status    = extractStatus(match).trim();
+        String statusLow = status.toLowerCase();
+        String time      = extractMatchTime(match).trim();
 
         // ── Step 1: finished always wins ──────────────────────────────────
-        if (FINISHED_STATUSES.contains(status.toLowerCase()) || "FT".equals(time)) {
+        if (FINISHED_STATUSES.contains(statusLow) || "ft".equalsIgnoreCase(time)) {
             return false;
         }
 
-        // ── Step 2: explicit in-play status ───────────────────────────────
-        if (!status.isBlank() && IN_PLAY_STATUSES.contains(status.toLowerCase())) {
+        // ── Step 2: unstarted statuses are never live ─────────────────────
+        if (UNSTARTED_STATUSES.contains(statusLow)) {
+            return false;
+        }
+
+        // ── Step 3: explicit in-play status ───────────────────────────────
+        // Covers "IN PLAY" → "in play", "HALF TIME BREAK" → "half time break",
+        // "ADDED TIME" → "added time", plus all single-word aliases.
+        if (!status.isBlank() && IN_PLAY_STATUSES.contains(statusLow)) {
             return true;
         }
 
-        // ── Step 3: no status set — fall back to numeric clock ────────────
+        // ── Step 4: no status set — fall back to numeric clock ────────────
         // Some providers omit the status field entirely during a match and
         // only set the match clock (e.g. "45", "67", "90+2").
         // Only treat a numeric clock as live when status is absent; if status
@@ -1011,16 +1050,32 @@ public class LiveScoreApiClient {
 
     /**
      * FIX #4: Corrected finished detection using the full FINISHED_STATUSES set.
-     * Catches FULL_TIME, ENDED, ABANDONED, CANCELLED etc. in addition to
-     * FINISHED / FT.
+     * Catches "FULL TIME" (with space), FULL_TIME, ENDED, ABANDONED,
+     * CANCELLED, WALKOVER, AWARDED in addition to FINISHED.
+     * Also catches "FT" via the time field.
      *
      * @param match raw event map from the API
      * @return true if the match has ended
      */
     public static boolean isFinished(Map<String, Object> match) {
-        String status = extractStatus(match).trim();
-        String time   = extractMatchTime(match).trim();
-        return FINISHED_STATUSES.contains(status.toLowerCase()) || "FT".equals(time);
+        String statusLow = extractStatus(match).trim().toLowerCase();
+        String time      = extractMatchTime(match).trim();
+        return FINISHED_STATUSES.contains(statusLow) || "ft".equalsIgnoreCase(time);
+    }
+
+    /**
+     * FIX #5: New helper — returns true for "NOT STARTED" and related
+     * pre-match status strings.
+     *
+     * Used by LiveScorePoller to skip NOT STARTED events that appear in the
+     * live endpoint response, preventing them from overwriting fixture data.
+     *
+     * @param match raw event map from the API
+     * @return true if the match has not yet kicked off
+     */
+    public static boolean isNotStarted(Map<String, Object> match) {
+        String statusLow = extractStatus(match).trim().toLowerCase();
+        return UNSTARTED_STATUSES.contains(statusLow);
     }
 
     public static boolean isScheduled(Map<String, Object> match) {

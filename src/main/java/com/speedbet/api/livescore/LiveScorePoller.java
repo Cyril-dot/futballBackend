@@ -134,6 +134,10 @@ public class LiveScorePoller {
     // FIX #3: Try the single all-competitions endpoint first (one API call).
     // Only fall back to per-league calls if the general endpoint returns nothing.
     // This reduces rate-limit pressure significantly.
+    //
+    // FIX #5: Events with status "NOT STARTED" are now skipped inside
+    // mapLiveScoreApiMatchToMatch — they appear in the live endpoint response
+    // but must not overwrite scheduled fixture data.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 30_000L, initialDelay = 5_000L)
@@ -174,7 +178,7 @@ public class LiveScorePoller {
                 log.info("Live poll: no live matches found.");
             } else {
                 teamLogoCache.ingest(allLive);
-                log.info("Live poll: {} total live match(es) to process.", allLive.size());
+                log.info("Live poll: {} total match(es) from API to classify.", allLive.size());
 
                 // ── DIAGNOSTIC: log raw status/time from provider for every event ──────
                 // Remove or lower to DEBUG once the live-status issue is confirmed fixed.
@@ -188,16 +192,18 @@ public class LiveScorePoller {
                 }
                 // ────────────────────────────────────────────────────────────────────────
 
-                int updated = 0, skipped = 0, demoted = 0;
+                int updated = 0, skipped = 0, demoted = 0, notStarted = 0;
                 for (Map<String, Object> event : allLive) {
                     try {
                         Match m = mapLiveScoreApiMatchToMatch(event, false);
                         if (m != null) {
                             enrichLogos(m);
                             matchService.saveOrUpdate(m);
-                            if ("LIVE".equals(m.getStatus())) updated++;
-                            else demoted++;
+                            if ("LIVE".equals(m.getStatus()))     updated++;
+                            else if ("FINISHED".equals(m.getStatus())) demoted++;
                         } else {
+                            // null return means either NOT STARTED (counted separately
+                            // via the notStarted log in the mapper) or a parse error.
                             skipped++;
                         }
                     } catch (Exception e) {
@@ -206,7 +212,7 @@ public class LiveScorePoller {
                                 LiveScoreApiClient.extractMatchId(event), e.getMessage());
                     }
                 }
-                log.info("Live poll: done — live={}, demoted-to-finished={}, skipped={}.",
+                log.info("Live poll: done — live={}, demoted-to-finished={}, skipped={} (includes not-started).",
                         updated, demoted, skipped);
 
                 if (demoted > 0) {
@@ -524,40 +530,43 @@ public class LiveScorePoller {
     /**
      * Maps a raw LiveScore API event to a Match entity.
      *
-     * ── Status resolution (FIX #2 applied here) ───────────────────────────
-     *
-     *   BEFORE (broken):
-     *     } else if (LiveScoreApiClient.isLive(event)) {
-     *         if (isGenuinelyLive(kickoff)) {        // kickoff==null → false → FINISHED!
-     *             match.setStatus("LIVE");
-     *         } else {
-     *             match.setStatus("FINISHED");        // silently demoted every null-kickoff live match
-     *         }
-     *     }
-     *
-     *   AFTER (fixed):
-     *     } else if (LiveScoreApiClient.isLive(event)) {
-     *         if (kickoff == null || isGenuinelyLive(kickoff)) {
-     *             // Trust the provider when we cannot parse a kickoff time.
-     *             // The 10-min stale sweep (sweepStaleLiveMatches) is the
-     *             // safety net that will eventually clean these up.
-     *             match.setStatus("LIVE");
-     *         } else {
-     *             log.warn("demoting stale LIVE ...");
-     *             match.setStatus("FINISHED");
-     *         }
-     *     }
+     * ── Status resolution ──────────────────────────────────────────────────
      *
      * Full priority order:
-     *   1. isFinished()               → FINISHED  (finished always wins)
-     *   2. isLive() + null kickoff    → LIVE       (trust provider; stale sweep is safety net)
+     *
+     *   0. isNotStarted()             → return null  (skip; do not overwrite fixture data)
+     *   1. isFinished()               → FINISHED     (finished always wins)
+     *   2. isLive() + null kickoff    → LIVE          (trust provider; stale sweep is safety net)
      *   3. isLive() + valid kickoff within 4h → LIVE
-     *   4. isLive() + kickoff > 4h ago → FINISHED  (stale demotion, with warning)
+     *   4. isLive() + kickoff > 4h ago → FINISHED    (stale demotion, with warning)
      *   5. Otherwise                  → UPCOMING
      *
-     * isFinished() and isLive() are defined in LiveScoreApiClient (FIX #1 & #4):
-     * they now recognise the full range of provider status strings
-     * ("1H", "2H", "HT", "ET", "PEN", "FULL_TIME", "ENDED", …).
+     * ── FIX #5: NOT STARTED skip ──────────────────────────────────────────
+     *
+     *   The live endpoint returns ALL today's matches, including those that
+     *   have not yet kicked off (status "NOT STARTED").  Previously these
+     *   fell through to the UPCOMING branch and were saved, potentially
+     *   overwriting cleaner data from the fixtures poller.
+     *
+     *   Now: isNotStarted() returns true for "NOT STARTED" and related
+     *   pre-match statuses.  The mapper returns null immediately, causing the
+     *   event to be counted as skipped without any DB write.
+     *
+     * ── FIX #2: null-kickoff LIVE tolerance ───────────────────────────────
+     *
+     *   Previously: if (isGenuinelyLive(kickoff)) { LIVE } else { FINISHED }
+     *   → kickoff==null caused isGenuinelyLive() to return false → FINISHED.
+     *
+     *   Now: if (kickoff == null || isGenuinelyLive(kickoff)) { LIVE }
+     *   → null kickoff trusts the provider.  The 10-min stale sweep
+     *   (sweepStaleLiveMatches) is the safety net for any truly stuck matches.
+     *
+     * ── FIX #1 / #4 note ─────────────────────────────────────────────────
+     *
+     *   isFinished() and isLive() are defined in LiveScoreApiClient.
+     *   They now recognise the full range of provider status strings including
+     *   multi-word variants: "IN PLAY", "HALF TIME BREAK", "ADDED TIME",
+     *   "FULL TIME", "NOT STARTED", etc.
      *
      * The {@code forceStatusLive} parameter is kept for backward-compatibility
      * but is IGNORED — callers should always pass {@code false}.
@@ -569,6 +578,20 @@ public class LiveScorePoller {
         String externalId = LiveScoreApiClient.extractMatchId(event);
         if (externalId == null || externalId.isBlank()) return null;
 
+        // ── STATUS RESOLUTION ──────────────────────────────────────────────
+
+        // FIX #5: Skip NOT STARTED events from the live endpoint entirely.
+        // They must not overwrite scheduled fixture data with a stale UPCOMING
+        // record that lacks kickoff time, scores, or other enriched fields.
+        if (LiveScoreApiClient.isNotStarted(event)) {
+            log.debug("mapLiveScoreApiMatchToMatch: skipping NOT STARTED " +
+                            "externalId=ls-{} home='{}' away='{}'",
+                    externalId,
+                    LiveScoreApiClient.extractHomeName(event),
+                    LiveScoreApiClient.extractAwayName(event));
+            return null;
+        }
+
         Match match = new Match();
         match.setExternalId("ls-" + externalId);
         match.setSource(MatchSource.LIVESCORE);
@@ -577,7 +600,6 @@ public class LiveScorePoller {
         Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
         match.setKickoffAt(kickoff);
 
-        // ── STATUS RESOLUTION ──────────────────────────────────────────────
         if (LiveScoreApiClient.isFinished(event)) {
             // Rule 1: finished always wins — regardless of kickoff parse result.
             match.setStatus("FINISHED");
@@ -593,10 +615,11 @@ public class LiveScorePoller {
             if (kickoff == null || isGenuinelyLive(kickoff)) {
                 if (kickoff == null) {
                     log.warn("mapLiveScoreApiMatchToMatch: accepting LIVE with null kickoff " +
-                                    "externalId=ls-{} home='{}' away='{}' — stale sweep is safety net",
+                                    "externalId=ls-{} home='{}' away='{}' status='{}' — stale sweep is safety net",
                             externalId,
                             LiveScoreApiClient.extractHomeName(event),
-                            LiveScoreApiClient.extractAwayName(event));
+                            LiveScoreApiClient.extractAwayName(event),
+                            LiveScoreApiClient.extractStatus(event));
                 }
                 match.setStatus("LIVE");
             } else {
@@ -623,6 +646,7 @@ public class LiveScorePoller {
         match.setLeagueLogo(LiveScoreApiClient.extractLeagueLogo(event));
         enrichLogos(match);
 
+        // Score: extractScore() already strips spaces so "1 - 0" → "1-0"
         String scoreStr = LiveScoreApiClient.extractScore(event);
         if (scoreStr.contains("-")) {
             String[] parts = scoreStr.split("-");
