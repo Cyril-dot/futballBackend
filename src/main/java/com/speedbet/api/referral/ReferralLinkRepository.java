@@ -13,6 +13,9 @@ public interface ReferralLinkRepository extends JpaRepository<ReferralLink, UUID
     List<ReferralLink> findByAdminId(UUID adminId);
     Optional<ReferralLink> findByCode(String code);
     Optional<ReferralLink> findByCodeAndActiveTrue(String code);
+
+
+
     // Add to ReferralLinkRepository
     List<ReferralLink> findByAdminIdAndIdNot(UUID adminId, UUID excludeLinkId);
     @Query("""
