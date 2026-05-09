@@ -67,6 +67,24 @@ import java.util.concurrent.*;
  *     list key chain: data → fixtures
  *
  *   All extractor methods handle ALL shapes via fallback chains.
+ *
+ * ── Changelog ───────────────────────────────────────────────────────────
+ *
+ *   FIX #1  isLive() — expanded to cover all in-play status strings that
+ *           providers may send ("1H", "2H", "HT", "ET", "PEN", etc.).
+ *           Previously only "LIVE" was matched explicitly, so matches with
+ *           alternative status values were never surfaced as live.
+ *
+ *   FIX #2  isLive() stale-guard interaction — null kickoff no longer causes
+ *           a live match to be demoted to FINISHED.  The LiveScorePoller
+ *           should trust the provider status when kickoff cannot be parsed.
+ *           (Corresponding guard change lives in LiveScorePoller.)
+ *
+ *   FIX #3  getLiveScores() — already hits the API fresh (no cache).
+ *           Confirmed intentional; documented clearly.
+ *
+ *   FIX #4  isFinished() — catches FULL_TIME / ENDED in addition to
+ *           FINISHED / FT.  (Was already in place; retained and documented.)
  */
 @Slf4j
 @Component
@@ -79,6 +97,54 @@ public class LiveScoreApiClient {
     private static final int    TRANSIENT_RETRIES   = 1;
     private static final long   KEY_COOLDOWN_MS     = 5 * 60_000L;
     private static final long   CACHE_TTL_MINUTES   = 5;
+
+    /**
+     * All status strings that unambiguously mean a match is currently in play.
+     * Kept as a Set for O(1) lookup and easy extension.
+     *
+     * FIX #1: Added the full set of in-play status codes that livescore-api.com
+     * (and compatible providers) may return.  The previous implementation only
+     * checked for "LIVE" explicitly, causing matches with status "1H", "2H",
+     * "HT", etc. to fall through as not-live.
+     */
+    private static final Set<String> IN_PLAY_STATUSES = Set.of(
+            "live",
+            "in_play",
+            "inplay",
+            "1h",        // first half
+            "first_half",
+            "2h",        // second half
+            "second_half",
+            "ht",        // half-time break
+            "halftime",
+            "half_time",
+            "et",        // extra time
+            "extra_time",
+            "et1",       // extra time first half
+            "et2",       // extra time second half
+            "pen",       // penalty shoot-out
+            "penalties",
+            "shootout",
+            "break",     // short break between periods
+            "suspended", // temporarily suspended (rain, VAR delay, etc.)
+            "interrupted"
+    );
+
+    /**
+     * All status strings (and time values) that mean a match has ended.
+     * Checked BEFORE in-play statuses so finished always wins.
+     *
+     * FIX #4: Catches FULL_TIME and ENDED in addition to FINISHED / FT.
+     */
+    private static final Set<String> FINISHED_STATUSES = Set.of(
+            "finished",
+            "full_time",
+            "ended",
+            "abandoned",  // abandoned matches are over for betting purposes
+            "cancelled",
+            "walkover",
+            "awarded"
+    );
 
     // ── Derived convenience maps (built from CompetitionIds enums) ─────────
     public static final Map<String, Integer> TOP_6_COMPETITION_IDS =
@@ -866,52 +932,77 @@ public class LiveScoreApiClient {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    //  STATUS DETECTION — FIX #1 & #4
+    //  STATUS DETECTION
     //
-    //  isLive() was incorrectly treating any numeric clock value (e.g. "90",
-    //  "45") as a live signal. This caused finished matches to be flagged as
-    //  live, then immediately demoted to FINISHED by the stale-guard, so
-    //  nothing ever surfaced as genuinely LIVE.
+    //  FIX #1  isLive() — now uses IN_PLAY_STATUSES set (defined at the top
+    //          of the class) which covers all in-play status strings that
+    //          livescore-api.com and compatible providers may return:
+    //            "LIVE", "1H", "2H", "HT", "ET", "ET1", "ET2",
+    //            "PEN", "PENALTIES", "SHOOTOUT", "BREAK", "SUSPENDED", etc.
     //
-    //  Fix: only treat numeric clock as live if status is explicitly "LIVE",
-    //  or if status is blank AND the clock is a valid in-play minute (1–130).
+    //          The old implementation only matched "LIVE" explicitly.
+    //          Matches with status "1H" / "2H" / "HT" were therefore never
+    //          detected as live, so they fell through to the numeric-clock
+    //          branch which treated a blank clock as "not live", causing them
+    //          to be demoted to FINISHED by the stale-guard in LiveScorePoller.
     //
-    //  isFinished() fix: also catches FULL_TIME / ENDED provider status values.
+    //  FIX #2  Null-kickoff tolerance — documented here; the corresponding
+    //          guard change is in LiveScorePoller.mapLiveScoreApiMatchToMatch:
+    //
+    //            // Before (broken):
+    //            if (isGenuinelyLive(kickoff)) { ... } else { match.setStatus("FINISHED"); }
+    //
+    //            // After (fixed):
+    //            if (kickoff == null || isGenuinelyLive(kickoff)) {
+    //                match.setStatus("LIVE");
+    //            } else {
+    //                log.warn("demoting stale LIVE ...");
+    //                match.setStatus("FINISHED");
+    //            }
+    //
+    //  FIX #4  isFinished() — catches FULL_TIME, ENDED, ABANDONED,
+    //          CANCELLED, WALKOVER, AWARDED in addition to FINISHED / FT.
+    //          Uses FINISHED_STATUSES set defined at the top of the class.
     // ═════════════════════════════════════════════════════════════════════
 
     /**
-     * FIX #1: Corrected live detection.
+     * FIX #1: Corrected live detection using the full IN_PLAY_STATUSES set.
      *
-     * Priority:
-     *   1. If status is explicitly FINISHED or time is "FT" → NOT live.
-     *   2. If status is explicitly "LIVE" → live.
-     *   3. If status is blank AND time is a numeric minute 1–130 → live.
-     *   4. Otherwise → not live.
+     * Decision priority:
+     *   1. If status or time indicates finished   → NOT live (finished always wins).
+     *   2. If status is in IN_PLAY_STATUSES        → live.
+     *   3. If status is blank AND clock is a valid
+     *      in-play minute (1–130)                  → live (provider omitted status).
+     *   4. Otherwise                               → not live.
      *
-     * The old logic treated ANY non-FT/HT time string as live, which caused
-     * finished matches with clock="90" to appear as live then get demoted.
+     * @param match raw event map from the API
+     * @return true if the match is currently in play
      */
     public static boolean isLive(Map<String, Object> match) {
-        String status = extractStatus(match);
-        String time   = extractMatchTime(match);
+        String status = extractStatus(match).trim();
+        String time   = extractMatchTime(match).trim();
 
-        // Finished always wins — check this first
-        if ("FINISHED".equalsIgnoreCase(status)
-                || "FULL_TIME".equalsIgnoreCase(status)
-                || "ENDED".equalsIgnoreCase(status)
-                || "FT".equals(time)) {
+        // ── Step 1: finished always wins ──────────────────────────────────
+        if (FINISHED_STATUSES.contains(status.toLowerCase()) || "FT".equals(time)) {
             return false;
         }
 
-        // Explicit live status from the provider
-        if ("LIVE".equalsIgnoreCase(status)) return true;
+        // ── Step 2: explicit in-play status ───────────────────────────────
+        if (!status.isBlank() && IN_PLAY_STATUSES.contains(status.toLowerCase())) {
+            return true;
+        }
 
-        // Numeric clock only counts as live if the provider hasn't set a status yet
-        // (some providers omit status and only set the clock during a match)
+        // ── Step 3: no status set — fall back to numeric clock ────────────
+        // Some providers omit the status field entirely during a match and
+        // only set the match clock (e.g. "45", "67", "90+2").
+        // Only treat a numeric clock as live when status is absent; if status
+        // is non-blank and wasn't matched above it is not a live status.
         if (status.isBlank() && !time.isBlank() && !"HT".equals(time) && !"POSTP".equals(time)) {
             try {
-                int minute = Integer.parseInt(time.trim());
-                return minute >= 1 && minute <= 130; // sane in-play range
+                // Strip "+X" injury-time suffix before parsing (e.g. "90+3" → 90)
+                String minuteStr = time.contains("+") ? time.substring(0, time.indexOf('+')).trim() : time;
+                int minute = Integer.parseInt(minuteStr);
+                return minute >= 1 && minute <= 130;
             } catch (NumberFormatException ignored) {}
         }
 
@@ -919,20 +1010,21 @@ public class LiveScoreApiClient {
     }
 
     /**
-     * FIX #4: Corrected finished detection.
-     * Now catches FULL_TIME and ENDED in addition to FINISHED / FT.
+     * FIX #4: Corrected finished detection using the full FINISHED_STATUSES set.
+     * Catches FULL_TIME, ENDED, ABANDONED, CANCELLED etc. in addition to
+     * FINISHED / FT.
+     *
+     * @param match raw event map from the API
+     * @return true if the match has ended
      */
     public static boolean isFinished(Map<String, Object> match) {
-        String status = extractStatus(match);
-        String time   = extractMatchTime(match);
-        return "FINISHED".equalsIgnoreCase(status)
-                || "FULL_TIME".equalsIgnoreCase(status)
-                || "ENDED".equalsIgnoreCase(status)
-                || "FT".equals(time);
+        String status = extractStatus(match).trim();
+        String time   = extractMatchTime(match).trim();
+        return FINISHED_STATUSES.contains(status.toLowerCase()) || "FT".equals(time);
     }
 
     public static boolean isScheduled(Map<String, Object> match) {
-        String status = extractStatus(match);
+        String status = extractStatus(match).trim();
         return "SCHEDULED".equalsIgnoreCase(status) || status.isEmpty();
     }
 

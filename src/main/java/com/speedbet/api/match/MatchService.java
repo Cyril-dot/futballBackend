@@ -199,17 +199,11 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // TOP-6 LEAGUES — validated via Top6LeagueTeams whitelist
-    //
-    // All three methods now use Top6LeagueTeams.isKnownTop6Match() instead
-    // of the old leagueIn(m, TOP6_LEAGUE_NAMES) check.  This means a match
-    // labelled "Premier League" is only included when BOTH teams are
-    // registered Premier League members — foreign matches mislabelled by
-    // the upstream API are silently dropped.
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getTop6LiveMatches() {
         List<Match> matches = matchRepo.findByStatusOrderByKickoffAt("LIVE").stream()
-                .filter(Top6LeagueTeams::isKnownTop6Match)   // ← team-validated
+                .filter(Top6LeagueTeams::isKnownTop6Match)
                 .toList();
         log.info("getTop6LiveMatches: {} LIVE match(es) in top-6 leagues (team-validated)", matches.size());
         return matches;
@@ -218,7 +212,7 @@ public class MatchService {
     public List<Match> getTop6UpcomingMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduled(now, now.plus(7, ChronoUnit.DAYS)).stream()
-                .filter(Top6LeagueTeams::isKnownTop6Match)   // ← team-validated
+                .filter(Top6LeagueTeams::isKnownTop6Match)
                 .sorted(LOGO_THEN_KICKOFF)
                 .toList();
         log.info("getTop6UpcomingMatches: {} upcoming match(es) in top-6 leagues (team-validated)", matches.size());
@@ -229,15 +223,14 @@ public class MatchService {
         Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
         Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
         List<Match> matches = matchRepo.findByKickoffBetween(startOfDay, endOfDay).stream()
-                .filter(Top6LeagueTeams::isKnownTop6Match)   // ← team-validated
+                .filter(Top6LeagueTeams::isKnownTop6Match)
                 .toList();
         log.info("getTop6TodayMatches: {} match(es) today in top-6 leagues (team-validated)", matches.size());
         return matches;
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // TOP-6 CUPS — DB-backed (cup competitions don't have a fixed team
-    // roster so we keep the simple name-based leagueIn() check here)
+    // TOP-6 CUPS
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getTop6CupsLiveMatches() {
@@ -269,7 +262,7 @@ public class MatchService {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ALL CUPS — DB-backed
+    // ALL CUPS
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getAllCupsLiveMatches() {
@@ -330,10 +323,6 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // BY-LEAGUE QUERIES — free-text, case-insensitive
-    //
-    // These are used by specific-league endpoints (e.g. /matches/premier-league/live).
-    // We apply Top6LeagueTeams validation only when the requested league is one
-    // of the five top-6 leagues; otherwise we fall back to plain name matching.
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getLiveMatchesByLeague(String leagueName) {
@@ -367,23 +356,14 @@ public class MatchService {
         return matches;
     }
 
-    /**
-     * For a specific-league query: if the league name resolves to a Top6LeagueTeams
-     * entry, validate both teams are registered members.  For cup competitions or
-     * other leagues, always pass through (return true).
-     *
-     * This means that e.g. getLiveMatchesByLeague("Premier League") will silently
-     * drop any match where one of the teams is not a known Premier League club,
-     * while getLiveMatchesByLeague("FA Cup") is unaffected.
-     */
     private boolean isTop6LeagueValidatedOrPassThrough(Match m, String leagueName) {
         return Top6LeagueTeams.fromLeagueName(leagueName)
                 .map(t -> t.isValidMatch(m))
-                .orElse(true);   // not a top-6 league — no team validation needed
+                .orElse(true);
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // BY-TEAM QUERIES — DB-backed
+    // BY-TEAM QUERIES
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getLiveMatchesByTeamName(String teamName) {
@@ -419,6 +399,13 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // LIST + ODDS BUNDLES
+    //
+    // FIX: withAllOdds() now includes LIVE matches in the response bundle.
+    // Previously it only returned UPCOMING/SCHEDULED odds and returned an
+    // empty odds list for LIVE matches that had no live cache entry yet.
+    // Now it falls through to generating pre-match odds as a reasonable
+    // placeholder when the live cache is empty — the frontend will poll
+    // again in 30s and get fresh live odds once the cache is populated.
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Map<String, Object>> withOdds(List<Match> matches) {
@@ -432,7 +419,15 @@ public class MatchService {
             String status = match.getStatus();
             if ("LIVE".equals(status)) {
                 OddsCacheEntry cached = liveOddsCache.get(match.getId());
-                entry.put("odds", (cached != null && cached.isValid()) ? cached.odds() : List.of());
+                if (cached != null && cached.isValid()) {
+                    entry.put("odds", cached.odds());
+                } else {
+                    // FIX: Fall back to pre-match odds rather than returning empty.
+                    // The live cache is populated every 2 min by refreshLiveOddsCache()
+                    // — this prevents a blank odds panel during the first poll cycle.
+                    entry.put("odds", oddsGeneratorService.generatePreMatchOdds(
+                            match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
+                }
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
                 entry.put("odds", oddsGeneratorService.generatePreMatchOdds(
                         match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
@@ -457,8 +452,24 @@ public class MatchService {
             if ("LIVE".equals(status)) {
                 OddsCacheEntry oddsEntry     = liveOddsCache.get(match.getId());
                 OddsCacheEntry handicapEntry = liveHandicapCache.get(match.getId());
-                entry.put("match_result",   (oddsEntry     != null && oddsEntry.isValid())     ? oddsEntry.odds()     : List.of());
-                entry.put("asian_handicap", (handicapEntry != null && handicapEntry.isValid()) ? handicapEntry.odds() : List.of());
+
+                // FIX: Use cached live odds when available; fall back to pre-match
+                // odds generator when the cache is cold (first poll cycle after restart
+                // or cache miss). This ensures the frontend always has something to
+                // render rather than three empty "—" buttons on every live match.
+                List<Map<String, Object>> matchResult = (oddsEntry != null && oddsEntry.isValid())
+                        ? oddsEntry.odds()
+                        : oddsGeneratorService.generatePreMatchOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+
+                List<Map<String, Object>> asianHandicap = (handicapEntry != null && handicapEntry.isValid())
+                        ? handicapEntry.odds()
+                        : handicapOddsService.generateHandicapOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+
+                entry.put("match_result",   matchResult);
+                entry.put("asian_handicap", asianHandicap);
+
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
                 entry.put("match_result", oddsGeneratorService.generatePreMatchOdds(
                         match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
@@ -697,8 +708,6 @@ public class MatchService {
         return liveScoreApiClient.getTopScorersByLeagueComp(league);
     }
 
-    // ── Raw competition-ID pass-through (used by controller numeric endpoints) ──
-
     public Map<String, Object> getLiveScoreApiStandings(int competitionId) {
         return liveScoreApiClient.getStandings(competitionId);
     }
@@ -781,18 +790,13 @@ public class MatchService {
 
         return matchRepo.findByExternalId(match.getExternalId())
                 .map(existing -> {
-                    // Always-overwrite fields — status, scores, metadata
                     if (match.getStatus()    != null) existing.setStatus(match.getStatus());
                     if (match.getScoreHome() != null) existing.setScoreHome(match.getScoreHome());
                     if (match.getScoreAway() != null) existing.setScoreAway(match.getScoreAway());
                     if (match.getMetadata()  != null) existing.setMetadata(match.getMetadata());
 
-                    // ── Always overwrite league so bad names get corrected ──
-                    // Using isMissing() previously meant a wrongly-saved league
-                    // name would never be corrected on subsequent syncs.
                     if (!isMissing(match.getLeague())) existing.setLeague(match.getLeague());
 
-                    // Fill-in-only fields (only set when currently missing)
                     if (isMissing(existing.getHomeTeam())   && !isMissing(match.getHomeTeam()))   existing.setHomeTeam(match.getHomeTeam());
                     if (isMissing(existing.getAwayTeam())   && !isMissing(match.getAwayTeam()))   existing.setAwayTeam(match.getAwayTeam());
                     if (isMissing(existing.getSport())      && !isMissing(match.getSport()))      existing.setSport(match.getSport());
@@ -800,7 +804,6 @@ public class MatchService {
                     if (isMissing(existing.getAwayLogo())   && !isMissing(match.getAwayLogo()))   existing.setAwayLogo(match.getAwayLogo());
                     if (isMissing(existing.getLeagueLogo()) && !isMissing(match.getLeagueLogo())) existing.setLeagueLogo(match.getLeagueLogo());
 
-                    // Kickoff — only heal from fake/null to a real kickoff time
                     if (match.getKickoffAt() != null) {
                         boolean existingIsFakeOrNull = existing.getKickoffAt() == null
                                 || !isRealKickoff(existing.getKickoffAt());
@@ -817,8 +820,9 @@ public class MatchService {
                     if (existing.getSource() == null && match.getSource() != null)
                         existing.setSource(match.getSource());
 
-                    log.debug("saveOrUpdate: updated externalId={} home='{}' away='{}' league='{}' kickoff='{}'",
-                            existing.getExternalId(), existing.getHomeTeam(), existing.getAwayTeam(),
+                    log.debug("saveOrUpdate: updated externalId={} status='{}' home='{}' away='{}' league='{}' kickoff='{}'",
+                            existing.getExternalId(), existing.getStatus(),
+                            existing.getHomeTeam(), existing.getAwayTeam(),
                             existing.getLeague(), existing.getKickoffAt());
                     return matchRepo.save(existing);
                 })

@@ -37,8 +37,11 @@ public class LiveScorePoller {
      *   1. It has a kickoff time (no kickoffAt = API stuck on stale LIVE status)
      *   2. The kickoff was less than 4 hours ago (no match runs longer than ~4h)
      *
-     * This is the single source of truth for the stale-live guard — used both
-     * when mapping events from the provider AND in the periodic stale sweep.
+     * FIX #2: When kickoff is null we can no longer use time-based staleness
+     * detection.  The call site (mapLiveScoreApiMatchToMatch) now trusts the
+     * provider's live status when kickoff is null rather than demoting to
+     * FINISHED.  isGenuinelyLive() itself is unchanged — it still returns false
+     * for null, and the call site handles that case explicitly.
      */
     private static final long FOUR_HOURS_MS = 4 * 60 * 60_000L;
 
@@ -172,6 +175,19 @@ public class LiveScorePoller {
             } else {
                 teamLogoCache.ingest(allLive);
                 log.info("Live poll: {} total live match(es) to process.", allLive.size());
+
+                // ── DIAGNOSTIC: log raw status/time from provider for every event ──────
+                // Remove or lower to DEBUG once the live-status issue is confirmed fixed.
+                for (Map<String, Object> event : allLive) {
+                    log.info("LIVE EVENT raw: id='{}' status='{}' time='{}' home='{}' away='{}'",
+                            LiveScoreApiClient.extractMatchId(event),
+                            LiveScoreApiClient.extractStatus(event),
+                            LiveScoreApiClient.extractMatchTime(event),
+                            LiveScoreApiClient.extractHomeName(event),
+                            LiveScoreApiClient.extractAwayName(event));
+                }
+                // ────────────────────────────────────────────────────────────────────────
+
                 int updated = 0, skipped = 0, demoted = 0;
                 for (Map<String, Object> event : allLive) {
                     try {
@@ -508,11 +524,40 @@ public class LiveScorePoller {
     /**
      * Maps a raw LiveScore API event to a Match entity.
      *
-     * Status resolution priority (unchanged logic — the fix is in isLive()/isFinished()):
-     *   1. If the API says it's finished (isFinished) → FINISHED, always.
-     *   2. If the API says it's live (isLive) AND the stale guard passes → LIVE.
-     *   3. If the API says it's live BUT the stale guard fails → FINISHED + warning.
-     *   4. Otherwise → UPCOMING.
+     * ── Status resolution (FIX #2 applied here) ───────────────────────────
+     *
+     *   BEFORE (broken):
+     *     } else if (LiveScoreApiClient.isLive(event)) {
+     *         if (isGenuinelyLive(kickoff)) {        // kickoff==null → false → FINISHED!
+     *             match.setStatus("LIVE");
+     *         } else {
+     *             match.setStatus("FINISHED");        // silently demoted every null-kickoff live match
+     *         }
+     *     }
+     *
+     *   AFTER (fixed):
+     *     } else if (LiveScoreApiClient.isLive(event)) {
+     *         if (kickoff == null || isGenuinelyLive(kickoff)) {
+     *             // Trust the provider when we cannot parse a kickoff time.
+     *             // The 10-min stale sweep (sweepStaleLiveMatches) is the
+     *             // safety net that will eventually clean these up.
+     *             match.setStatus("LIVE");
+     *         } else {
+     *             log.warn("demoting stale LIVE ...");
+     *             match.setStatus("FINISHED");
+     *         }
+     *     }
+     *
+     * Full priority order:
+     *   1. isFinished()               → FINISHED  (finished always wins)
+     *   2. isLive() + null kickoff    → LIVE       (trust provider; stale sweep is safety net)
+     *   3. isLive() + valid kickoff within 4h → LIVE
+     *   4. isLive() + kickoff > 4h ago → FINISHED  (stale demotion, with warning)
+     *   5. Otherwise                  → UPCOMING
+     *
+     * isFinished() and isLive() are defined in LiveScoreApiClient (FIX #1 & #4):
+     * they now recognise the full range of provider status strings
+     * ("1H", "2H", "HT", "ET", "PEN", "FULL_TIME", "ENDED", …).
      *
      * The {@code forceStatusLive} parameter is kept for backward-compatibility
      * but is IGNORED — callers should always pass {@code false}.
@@ -533,14 +578,29 @@ public class LiveScorePoller {
         match.setKickoffAt(kickoff);
 
         // ── STATUS RESOLUTION ──────────────────────────────────────────────
-        // isFinished() and isLive() are now fixed in LiveScoreApiClient (FIX #1 & #4).
         if (LiveScoreApiClient.isFinished(event)) {
+            // Rule 1: finished always wins — regardless of kickoff parse result.
             match.setStatus("FINISHED");
 
         } else if (LiveScoreApiClient.isLive(event)) {
-            if (isGenuinelyLive(kickoff)) {
+            // FIX #2: null kickoff no longer causes a live match to be demoted.
+            // Previously this branch did: if (isGenuinelyLive(kickoff)) { LIVE } else { FINISHED }
+            // which silently demoted every match whose kickoff could not be parsed.
+            //
+            // Now: trust the provider when kickoff is null.
+            // The periodic stale sweep (sweepStaleLiveMatches, every 10 min) acts
+            // as the safety net — it will force-finish matches stuck in LIVE after 4h.
+            if (kickoff == null || isGenuinelyLive(kickoff)) {
+                if (kickoff == null) {
+                    log.warn("mapLiveScoreApiMatchToMatch: accepting LIVE with null kickoff " +
+                                    "externalId=ls-{} home='{}' away='{}' — stale sweep is safety net",
+                            externalId,
+                            LiveScoreApiClient.extractHomeName(event),
+                            LiveScoreApiClient.extractAwayName(event));
+                }
                 match.setStatus("LIVE");
             } else {
+                // Kickoff was parsed and is more than 4 hours ago — demote to FINISHED.
                 log.warn("mapLiveScoreApiMatchToMatch: demoting stale LIVE to FINISHED " +
                                 "externalId=ls-{} home='{}' away='{}' kickoff={}",
                         externalId,
