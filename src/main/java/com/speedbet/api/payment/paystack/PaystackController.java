@@ -20,6 +20,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -41,7 +42,7 @@ public class PaystackController {
     private final WalletService           walletService;
     private final UserService             userService;
     private final AdminUpgradeChatService adminUpgradeChatService;
-    private final ReferralService         referralService; // ← NEW
+    private final ReferralService         referralService;
     private final WebClient.Builder       webClientBuilder;
     private final ObjectMapper            objectMapper;
 
@@ -65,12 +66,20 @@ public class PaystackController {
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
                 .intValue();
 
+        log.info("initDeposit: userId='{}' amount={} pesewas={}", user.getId(), amount, amountPesewas);
+
+        // FIX: paystackInit now throws on error instead of silently swallowing it.
+        // The full Paystack response { status, data: { authorization_url, reference } }
+        // is returned directly so the frontend can unwrap it.
         var response = paystackInit(
                 user.getEmail(),
                 amountPesewas,
                 frontendUrl + "/app/wallet?payment=success",
                 Map.of("userId", user.getId().toString())
         );
+
+        log.info("initDeposit: Paystack responded status='{}' for userId='{}'",
+                response.get("status"), user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
@@ -246,11 +255,24 @@ public class PaystackController {
 
     // ─── Paystack API helper ──────────────────────────────────────────────────
 
+    /**
+     * Calls Paystack /transaction/initialize and returns the FULL response map:
+     *   { "status": true, "message": "...", "data": { "authorization_url": "...", "reference": "..." } }
+     *
+     * FIX: replaced .onErrorReturn(...) with .onErrorMap(...) so real Paystack errors
+     * (4xx/5xx, network timeouts, bad secret key) are surfaced as exceptions instead
+     * of being silently swallowed and returned as a 200 with status=false.
+     *
+     * The frontend unwraps the nested `data` object itself:
+     *   const inner = raw?.data ?? raw;
+     *   const authUrl = inner.authorization_url;
+     */
     @SuppressWarnings("unchecked")
     private Map<String, Object> paystackInit(String email, int amountPesewas,
                                              String callbackUrl,
                                              Map<String, Object> metadata) {
-        return (Map<String, Object>) webClientBuilder.build()
+
+        var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + "/transaction/initialize")
                 .header("Authorization", "Bearer " + secretKey)
                 .header("Content-Type", "application/json")
@@ -262,9 +284,45 @@ public class PaystackController {
                         "metadata",     metadata
                 ))
                 .retrieve()
+                // FIX: surface HTTP error responses (e.g. 401 bad secret key, 422 validation)
+                // as a proper exception with the response body included in the message.
+                .onStatus(
+                        status -> status.isError(),
+                        clientResponse -> clientResponse.bodyToMono(String.class)
+                                .map(body -> {
+                                    log.error("Paystack API error: status={} body={}",
+                                            clientResponse.statusCode(), body);
+                                    return new RuntimeException(
+                                            "Paystack returned " + clientResponse.statusCode() + ": " + body);
+                                })
+                )
                 .bodyToMono(Map.class)
-                .onErrorReturn(Map.of("status", false, "message", "Paystack unavailable"))
+                // FIX: surface network/timeout errors instead of swallowing them
+                .onErrorMap(
+                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> {
+                            log.error("Paystack API unreachable", ex);
+                            return new RuntimeException("Paystack is currently unavailable. Please try again.");
+                        }
+                )
                 .block();
+
+        if (result == null) {
+            throw new RuntimeException("Paystack returned an empty response.");
+        }
+
+        // Log the status Paystack gave us (true = success, false = their own error)
+        log.info("paystackInit: Paystack status='{}' message='{}'",
+                result.get("status"), result.get("message"));
+
+        // If Paystack itself says status=false, surface that as an error
+        if (Boolean.FALSE.equals(result.get("status"))) {
+            var message = result.getOrDefault("message", "Paystack declined the request").toString();
+            log.error("paystackInit: Paystack status=false — {}", message);
+            throw new RuntimeException("Paystack error: " + message);
+        }
+
+        return result;
     }
 
     // ─── Signature verification ───────────────────────────────────────────────
