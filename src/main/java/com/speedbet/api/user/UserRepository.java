@@ -12,9 +12,11 @@ import java.util.UUID;
 
 public interface UserRepository extends JpaRepository<User, UUID> {
 
-    // ── Existing (keep as-is) ─────────────────────────────────────────────────
+    // ── Existing ──────────────────────────────────────────────────────────────
 
     Optional<User> findByEmail(String email);
+
+    boolean existsByEmail(String email); // ← ADDED — fixes the build error
 
     // ── Super Admin additions ─────────────────────────────────────────────────
 
