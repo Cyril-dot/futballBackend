@@ -184,9 +184,9 @@ public class SuperAdminQueryService {
         Pageable p = pageable.getSort().isSorted()
                 ? pageable
                 : org.springframework.data.domain.PageRequest.of(
-                        pageable.getPageNumber(),
-                        pageable.getPageSize(),
-                        Sort.by(Sort.Direction.DESC, "createdAt"));
+                pageable.getPageNumber(),
+                pageable.getPageSize(),
+                Sort.by(Sort.Direction.DESC, "createdAt"));
 
         return txRepo.findAll(TransactionSpecs.filtered(kind, status, walletId, from, to), p)
                 .map(tx -> {
@@ -201,13 +201,25 @@ public class SuperAdminQueryService {
 
     // ─── Affiliate Withdrawal History (all statuses) ──────────────────────────
 
+    /**
+     * Always rebuilds the Pageable with a sort on `requestedAt` —
+     * AffiliateWithdrawalRequest has no `createdAt` field, so any inbound
+     * pageable carrying that sort would blow up with a PropertyReferenceException.
+     */
     public Page<com.speedbet.api.affiliate.AffiliateWithdrawalRequest> listWithdrawals(
             AffiliateWithdrawalStatus status, Pageable pageable) {
         log.info("listWithdrawals: status={}", status);
+
+        // Strip any caller-supplied sort and replace with the correct field name.
+        Pageable p = org.springframework.data.domain.PageRequest.of(
+                pageable.getPageNumber(),
+                pageable.getPageSize(),
+                Sort.by(Sort.Direction.DESC, "requestedAt"));
+
         if (status != null) {
-            return withdrawalRepo.findByStatusOrderByRequestedAtDesc(status, pageable);
+            return withdrawalRepo.findByStatusOrderByRequestedAtDesc(status, p);
         }
-        return withdrawalRepo.findAll(pageable);
+        return withdrawalRepo.findAll(p);
     }
 
     // ─── Mappers ──────────────────────────────────────────────────────────────
