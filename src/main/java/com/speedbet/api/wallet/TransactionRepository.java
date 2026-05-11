@@ -28,19 +28,33 @@ public interface TransactionRepository extends JpaRepository<Transaction, UUID> 
 
     /**
      * All transactions across the platform with optional filters.
-     * Pass null for any param to skip that filter.
+     * Uses a native query with explicit PostgreSQL CASTs so that PostgreSQL
+     * can resolve parameter types even when values are null — fixing the
+     * "could not determine data type of parameter $N" error.
+     *
+     * kind and status are passed as Strings (not enums) because native queries
+     * cannot bind Java enums directly.
      */
-    @Query("""
-            SELECT t FROM Transaction t
-            WHERE (:kind     IS NULL OR t.kind     = :kind)
-              AND (:status   IS NULL OR t.status   = :status)
-              AND (:walletId IS NULL OR t.walletId = :walletId)
-              AND (:from     IS NULL OR t.createdAt >= :from)
-              AND (:to       IS NULL OR t.createdAt <= :to)
-            ORDER BY t.createdAt DESC
-            """)
+    @Query(value = """
+            SELECT * FROM transactions t
+            WHERE (:kind     IS NULL OR t.kind      = :kind)
+              AND (:status   IS NULL OR t.status    = :status)
+              AND (:walletId IS NULL OR t.wallet_id = CAST(:walletId AS uuid))
+              AND (:from     IS NULL OR t.created_at >= CAST(:from AS timestamptz))
+              AND (:to       IS NULL OR t.created_at <= CAST(:to   AS timestamptz))
+            ORDER BY t.created_at DESC
+            """,
+            countQuery = """
+            SELECT COUNT(*) FROM transactions t
+            WHERE (:kind     IS NULL OR t.kind      = :kind)
+              AND (:status   IS NULL OR t.status    = :status)
+              AND (:walletId IS NULL OR t.wallet_id = CAST(:walletId AS uuid))
+              AND (:from     IS NULL OR t.created_at >= CAST(:from AS timestamptz))
+              AND (:to       IS NULL OR t.created_at <= CAST(:to   AS timestamptz))
+            """,
+            nativeQuery = true)
     Page<Transaction> findAllFiltered(
-            @Param("kind")     TxKind kind,
+            @Param("kind")     String kind,
             @Param("status")   String status,
             @Param("walletId") UUID walletId,
             @Param("from")     Instant from,

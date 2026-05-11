@@ -30,7 +30,7 @@ public class SuperAdminQueryService {
     private final WalletRepository walletRepo;
     private final TransactionRepository txRepo;
     private final AffiliateWithdrawalRepository withdrawalRepo;
-    private final ReferralLinkRepository referralLinkRepo;     // add this repo if not already present
+    private final ReferralLinkRepository referralLinkRepo;
 
     // ─── Revenue / Deposit Overview ───────────────────────────────────────────
 
@@ -45,7 +45,6 @@ public class SuperAdminQueryService {
         BigDecimal depositsAllTime    = txRepo.sumAllByKind(TxKind.DEPOSIT);
         BigDecimal depositsThisMonth  = txRepo.sumAllByKindSince(TxKind.DEPOSIT, startOfMonth);
         BigDecimal depositsToday      = txRepo.sumAllByKindSince(TxKind.DEPOSIT, startOfToday);
-        // WITHDRAW = user-initiated withdrawal; WITHDRAW_HOLD = funds reserved; WITHDRAW_RELEASE = funds released back
         BigDecimal withdrawalsAllTime = txRepo.sumAllByKind(TxKind.WITHDRAW);
         BigDecimal withdrawalsMonth   = txRepo.sumAllByKindSince(TxKind.WITHDRAW, startOfMonth);
         long depositCount             = txRepo.countByKind(TxKind.DEPOSIT);
@@ -135,7 +134,6 @@ public class SuperAdminQueryService {
                 txCount, deposited, withdrawn
         );
 
-        // findByAdminId returns a List — prefer the active link, fall back to first in list
         List<ReferralLink> links = referralLinkRepo.findByAdminId(adminId);
         SuperAdminDtos.ReferralSummaryDto referralDto = links.stream()
                 .filter(ReferralLink::isActive)
@@ -145,8 +143,8 @@ public class SuperAdminQueryService {
                         link.getId(),
                         link.getCode(),
                         link.getCommissionPercent(),
-                        null,   // ReferralLink has no totalReferrals field
-                        null    // ReferralLink has no totalEarnings field
+                        null,
+                        null
                 ))
                 .orElse(null);
 
@@ -174,9 +172,12 @@ public class SuperAdminQueryService {
             Instant from, Instant to, Pageable pageable) {
         log.info("listTransactions: kind={} status={} walletId={}", kind, status, walletId);
 
-        return txRepo.findAllFiltered(kind, status, walletId, from, to, pageable)
+        // Convert enum to String (or null) — required because findAllFiltered is a
+        // native query and cannot bind Java enums directly.
+        String kindStr = kind != null ? kind.name() : null;
+
+        return txRepo.findAllFiltered(kindStr, status, walletId, from, to, pageable)
                 .map(tx -> {
-                    // Resolve userId from walletId
                     UUID userId = walletRepo.findById(tx.getWalletId())
                             .map(Wallet::getUserId).orElse(null);
                     String email = userId != null
