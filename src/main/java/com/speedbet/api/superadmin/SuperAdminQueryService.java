@@ -13,6 +13,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -167,16 +168,27 @@ public class SuperAdminQueryService {
 
     // ─── Platform-wide Transactions (paginated + filtered) ───────────────────
 
+    /**
+     * Uses JPA Specifications (TransactionSpecs.filtered) instead of a native
+     * query, so null parameters are simply omitted from the WHERE clause rather
+     * than sent to PostgreSQL as untyped NULLs — this is the definitive fix for
+     * the "could not determine data type of parameter $N" error.
+     */
     public Page<SuperAdminDtos.TransactionDto> listTransactions(
             TxKind kind, String status, UUID walletId,
             Instant from, Instant to, Pageable pageable) {
         log.info("listTransactions: kind={} status={} walletId={}", kind, status, walletId);
 
-        // Convert enum to String (or null) — required because findAllFiltered is a
-        // native query and cannot bind Java enums directly.
-        String kindStr = kind != null ? kind.name() : null;
+        // Pageable from the controller already carries sort; if not, default to
+        // createdAt desc so the frontend always sees newest first.
+        Pageable p = pageable.getSort().isSorted()
+                ? pageable
+                : org.springframework.data.domain.PageRequest.of(
+                        pageable.getPageNumber(),
+                        pageable.getPageSize(),
+                        Sort.by(Sort.Direction.DESC, "createdAt"));
 
-        return txRepo.findAllFiltered(kindStr, status, walletId, from, to, pageable)
+        return txRepo.findAll(TransactionSpecs.filtered(kind, status, walletId, from, to), p)
                 .map(tx -> {
                     UUID userId = walletRepo.findById(tx.getWalletId())
                             .map(Wallet::getUserId).orElse(null);
