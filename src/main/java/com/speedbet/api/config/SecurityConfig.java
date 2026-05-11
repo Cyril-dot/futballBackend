@@ -120,9 +120,10 @@ public class SecurityConfig {
                 "https://speedbet.site",
                 "https://www.speedbet.site",
                 "https://futball-gamma.vercel.app",
+                "https://futballadmin.vercel.app",
                 "https://poikiloblastic-leeanne-gazeless.ngrok-free.dev"
         ));
-        
+
         // Also include whatever is set in the env var (avoids duplicates gracefully)
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
             origins.add(frontendUrl);
