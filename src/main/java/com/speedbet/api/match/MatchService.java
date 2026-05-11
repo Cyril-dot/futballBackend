@@ -70,6 +70,17 @@ public class MatchService {
         };
     }
 
+    // ── Demotion warn-once guard ──────────────────────────────────────────
+    // Emits a WARN on the first blocked demotion for a given externalId, then
+    // silently DEBUGs on every subsequent attempt.  Prevents log flooding when
+    // the upstream API is stuck reporting a finished match as IN PLAY across
+    // many consecutive poll cycles.
+    //
+    // The set is intentionally never cleared — once a transition has been
+    // warned about, further WARNs for the same ID add no diagnostic value.
+    // Memory impact is negligible (only external IDs of blocked matches).
+    private final Set<String> warnedDemotions = ConcurrentHashMap.newKeySet();
+
     // ── Pre-built display-name sets for DB filtering (cups only — league
     //    filtering now delegates to Top6LeagueTeams for team validation) ──
     private static final Set<String> CUP_NAMES =
@@ -804,7 +815,10 @@ public class MatchService {
     //     FINISHED  → *         ✗  (terminal — never demoted)
     //
     //   If a transition is rejected the existing record is returned unchanged.
-    //   A WARN log is emitted so it's visible without noise in normal operation.
+    //
+    //   warnedDemotions ensures only the first rejection per externalId emits
+    //   a WARN — subsequent rejections are logged at DEBUG to avoid flooding
+    //   logs when the upstream API is stuck on stale data across many cycles.
     // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
@@ -821,10 +835,20 @@ public class MatchService {
                         if (isPermittedTransition(existing.getStatus(), match.getStatus())) {
                             existing.setStatus(match.getStatus());
                         } else {
-                            log.warn("saveOrUpdate: blocked status demotion externalId={} {} → {} (keeping {})",
-                                    existing.getExternalId(),
-                                    existing.getStatus(), match.getStatus(),
-                                    existing.getStatus());
+                            // Warn only on the first blocked demotion for this externalId.
+                            // Subsequent attempts (e.g. upstream API stuck in a stale LIVE
+                            // loop) are demoted to DEBUG to keep logs clean.
+                            if (warnedDemotions.add(existing.getExternalId())) {
+                                log.warn("saveOrUpdate: blocked status demotion externalId={} {} → {} (keeping {})",
+                                        existing.getExternalId(),
+                                        existing.getStatus(), match.getStatus(),
+                                        existing.getStatus());
+                            } else {
+                                log.debug("saveOrUpdate: repeated demotion blocked externalId={} {} → {} (keeping {})",
+                                        existing.getExternalId(),
+                                        existing.getStatus(), match.getStatus(),
+                                        existing.getStatus());
+                            }
                             // Return early — nothing else should be written from
                             // an event whose status has already been rejected.
                             return matchRepo.save(existing);

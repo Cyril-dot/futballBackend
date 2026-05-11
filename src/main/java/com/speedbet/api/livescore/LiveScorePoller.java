@@ -20,6 +20,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Component
@@ -44,6 +46,16 @@ public class LiveScorePoller {
      * for null, and the call site handles that case explicitly.
      */
     private static final long FOUR_HOURS_MS = 4 * 60 * 60_000L;
+
+    /**
+     * External IDs that our DB has confirmed FINISHED but the upstream API
+     * keeps reporting as IN PLAY (stale feed).  We skip these early in each
+     * poll cycle to avoid repeated WARN log noise and unnecessary DB round-trips.
+     *
+     * The set is cleared by sweepStaleLiveMatches() every 10 minutes so that
+     * any genuinely replayed / rescheduled fixture is picked up again.
+     */
+    private final Set<String> confirmedFinishedIds = ConcurrentHashMap.newKeySet();
 
     private static boolean isGenuinelyLive(Instant kickoffAt) {
         if (kickoffAt == null) return false;
@@ -138,6 +150,11 @@ public class LiveScorePoller {
     // FIX #5: Events with status "NOT STARTED" are now skipped inside
     // mapLiveScoreApiMatchToMatch — they appear in the live endpoint response
     // but must not overwrite scheduled fixture data.
+    //
+    // FIX #6: Events whose externalId is in confirmedFinishedIds are skipped
+    // immediately — the upstream API is stuck reporting them as IN PLAY after
+    // our DB has already marked them FINISHED.  This prevents repeated WARN
+    // log spam and unnecessary DB round-trips every 30 seconds.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 30_000L, initialDelay = 5_000L)
@@ -147,14 +164,12 @@ public class LiveScorePoller {
             List<Map<String, Object>> allLive = new ArrayList<>();
 
             // FIX #3: Attempt the single all-competitions live endpoint first.
-            // This is one API call vs N per-league calls — far less rate-limit risk.
             List<Map<String, Object>> generalLive = liveScoreApiClient.getLiveScores();
             if (!generalLive.isEmpty()) {
                 log.info("Live poll: {} match(es) from general live endpoint.", generalLive.size());
                 allLive.addAll(generalLive);
             } else {
                 // General endpoint returned nothing — fall back to per-league fresh calls.
-                // FIX #2: Use *Fresh() variants (no cache) so we actually hit the API.
                 log.debug("Live poll: general endpoint empty — falling back to per-league fresh calls.");
 
                 for (CompetitionIds.Top6League league : CompetitionIds.Top6League.values()) {
@@ -192,18 +207,39 @@ public class LiveScorePoller {
                 }
                 // ────────────────────────────────────────────────────────────────────────
 
-                int updated = 0, skipped = 0, demoted = 0, notStarted = 0;
+                int updated = 0, skipped = 0, demoted = 0;
                 for (Map<String, Object> event : allLive) {
+                    String rawId = "ls-" + LiveScoreApiClient.extractMatchId(event);
+
+                    // FIX #6: Skip IDs we already know are FINISHED in our DB.
+                    // The upstream feed is stuck — no point hitting the DB again.
+                    if (confirmedFinishedIds.contains(rawId)) {
+                        log.debug("Live poll: skipping confirmed-finished externalId={}", rawId);
+                        skipped++;
+                        continue;
+                    }
+
                     try {
                         Match m = mapLiveScoreApiMatchToMatch(event, false);
                         if (m != null) {
                             enrichLogos(m);
-                            matchService.saveOrUpdate(m);
-                            if ("LIVE".equals(m.getStatus()))     updated++;
-                            else if ("FINISHED".equals(m.getStatus())) demoted++;
+                            Match persisted = matchService.saveOrUpdate(m);
+
+                            // Detect when our LIVE mapping was rejected by the DB guard
+                            // (i.e. the match was already FINISHED and the transition was blocked).
+                            if ("LIVE".equals(m.getStatus()) && "FINISHED".equals(persisted.getStatus())) {
+                                confirmedFinishedIds.add(m.getExternalId());
+                                log.info("Live poll: confirmed-finished suppression added for externalId={} " +
+                                                "— upstream API is stuck; will skip until next stale sweep.",
+                                        m.getExternalId());
+                                skipped++;
+                            } else if ("LIVE".equals(persisted.getStatus())) {
+                                updated++;
+                            } else if ("FINISHED".equals(persisted.getStatus())) {
+                                demoted++;
+                            }
                         } else {
-                            // null return means either NOT STARTED (counted separately
-                            // via the notStarted log in the mapper) or a parse error.
+                            // null return means NOT STARTED or a parse error.
                             skipped++;
                         }
                     } catch (Exception e) {
@@ -420,6 +456,10 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 4. STALE LIVE SWEEP — every 10 minutes
+    //
+    // FIX #6: Also clears confirmedFinishedIds so that any fixture the
+    // upstream API eventually corrects (or a rescheduled match) is picked up
+    // again on the next poll cycle rather than suppressed indefinitely.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 10 * 60_000L, initialDelay = 5 * 60_000L)
@@ -433,6 +473,14 @@ public class LiveScorePoller {
                 evictMatchCaches();
             } else {
                 log.debug("Stale sweep: no stale LIVE matches found.");
+            }
+
+            // Clear the suppression set every sweep cycle so that matches the
+            // upstream API eventually corrects are not suppressed indefinitely.
+            if (!confirmedFinishedIds.isEmpty()) {
+                log.info("Stale sweep: clearing {} confirmed-finished suppression id(s).",
+                        confirmedFinishedIds.size());
+                confirmedFinishedIds.clear();
             }
         } catch (Exception e) {
             log.error("Stale sweep: error — {}", e.getMessage(), e);
@@ -581,8 +629,6 @@ public class LiveScorePoller {
         // ── STATUS RESOLUTION ──────────────────────────────────────────────
 
         // FIX #5: Skip NOT STARTED events from the live endpoint entirely.
-        // They must not overwrite scheduled fixture data with a stale UPCOMING
-        // record that lacks kickoff time, scores, or other enriched fields.
         if (LiveScoreApiClient.isNotStarted(event)) {
             log.debug("mapLiveScoreApiMatchToMatch: skipping NOT STARTED " +
                             "externalId=ls-{} home='{}' away='{}'",
@@ -601,17 +647,9 @@ public class LiveScorePoller {
         match.setKickoffAt(kickoff);
 
         if (LiveScoreApiClient.isFinished(event)) {
-            // Rule 1: finished always wins — regardless of kickoff parse result.
             match.setStatus("FINISHED");
 
         } else if (LiveScoreApiClient.isLive(event)) {
-            // FIX #2: null kickoff no longer causes a live match to be demoted.
-            // Previously this branch did: if (isGenuinelyLive(kickoff)) { LIVE } else { FINISHED }
-            // which silently demoted every match whose kickoff could not be parsed.
-            //
-            // Now: trust the provider when kickoff is null.
-            // The periodic stale sweep (sweepStaleLiveMatches, every 10 min) acts
-            // as the safety net — it will force-finish matches stuck in LIVE after 4h.
             if (kickoff == null || isGenuinelyLive(kickoff)) {
                 if (kickoff == null) {
                     log.warn("mapLiveScoreApiMatchToMatch: accepting LIVE with null kickoff " +
@@ -623,7 +661,6 @@ public class LiveScorePoller {
                 }
                 match.setStatus("LIVE");
             } else {
-                // Kickoff was parsed and is more than 4 hours ago — demote to FINISHED.
                 log.warn("mapLiveScoreApiMatchToMatch: demoting stale LIVE to FINISHED " +
                                 "externalId=ls-{} home='{}' away='{}' kickoff={}",
                         externalId,
@@ -646,7 +683,6 @@ public class LiveScorePoller {
         match.setLeagueLogo(LiveScoreApiClient.extractLeagueLogo(event));
         enrichLogos(match);
 
-        // Score: extractScore() already strips spaces so "1 - 0" → "1-0"
         String scoreStr = LiveScoreApiClient.extractScore(event);
         if (scoreStr.contains("-")) {
             String[] parts = scoreStr.split("-");
