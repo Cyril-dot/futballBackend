@@ -121,7 +121,8 @@ public class SecurityConfig {
                 "https://www.speedbet.site",
                 "https://futball-gamma.vercel.app",
                 "https://futballadmin.vercel.app",
-                "https://poikiloblastic-leeanne-gazeless.ngrok-free.dev"
+                "https://poikiloblastic-leeanne-gazeless.ngrok-free.dev",
+                "https://www.futball.site"
         ));
 
         // Also include whatever is set in the env var (avoids duplicates gracefully)
