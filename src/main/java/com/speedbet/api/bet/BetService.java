@@ -36,7 +36,6 @@ public class BetService {
     private final MatchService    matchService;
     private final WalletService   walletService;
     private final UserRepository  userRepo;
-    // ReferralService removed — commission is attributed on deposit in PaystackController
 
     public record PlaceRequest(
             UUID userId, BigDecimal stake, String currency,
@@ -164,10 +163,14 @@ public class BetService {
     }
 
     /**
-     * Resolve odds using the already-fetched Match to avoid a redundant DB query.
-     * Checks the odds table first, then falls back to the live cache for LIVE matches.
+     * Resolve odds for a selection using the following priority:
+     *  1. DB odds table (fastest, most reliable)
+     *  2. Live cache (for LIVE matches whose odds aren't yet persisted)
+     *  3. submittedOdds from the client (fallback for external-feed matches
+     *     whose odds are displayed on the frontend but not yet saved to DB)
      */
     private BigDecimal resolveOdds(SelectionRequest s, Match match) {
+        // 1. DB lookup
         var dbOdds = oddsRepo.findFirstByMatchIdAndMarketAndSelection(
                 s.matchId(), s.market(), s.selection());
         if (dbOdds.isPresent()) {
@@ -179,6 +182,7 @@ public class BetService {
         log.warn("  resolveOdds: DB miss — matchId={} market={} selection={} — checking live cache",
                 s.matchId(), s.market(), s.selection());
 
+        // 2. Live cache (only for LIVE matches)
         if ("LIVE".equals(match.getStatus())) {
             BigDecimal cached = resolveFromLiveCache(match, s.market(), s.selection());
             if (cached != null) {
@@ -190,7 +194,19 @@ public class BetService {
                     s.matchId(), s.market(), s.selection());
         }
 
-        log.warn("  resolveOdds: NOT FOUND anywhere — matchId={} market={} selection={}",
+        // 3. Fall back to submittedOdds — match exists in DB but odds came from an
+        //    external feed (ApiFootball, SportDB, etc.) that hasn't been persisted
+        //    to the odds table yet. The drift check above still applies, so a client
+        //    cannot inflate odds — it will always lock at exactly what was submitted,
+        //    and any future DB record that disagrees by >2% will reject the bet.
+        if (s.submittedOdds() != null && s.submittedOdds().compareTo(BigDecimal.ZERO) > 0) {
+            log.info("  resolveOdds: falling back to submittedOdds={} for matchId={} market={} selection={}",
+                    s.submittedOdds(), s.matchId(), s.market(), s.selection());
+            return s.submittedOdds();
+        }
+
+        // Nothing found at all — reject
+        log.warn("  resolveOdds: NOT FOUND anywhere and no valid submittedOdds — matchId={} market={} selection={}",
                 s.matchId(), s.market(), s.selection());
         throw ApiException.badRequest("Odds not found for: " + s.selection()
                 + " (matchId=" + s.matchId() + " market=" + s.market() + ")");
