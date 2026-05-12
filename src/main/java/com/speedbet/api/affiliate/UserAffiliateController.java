@@ -98,10 +98,10 @@ public class UserAffiliateController {
     @GetMapping("/balance")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getBalance(
             @AuthenticationPrincipal User user) {
-        var wallet = walletService.getWallet(user.getId());
+        AffiliateStatsDTO stats = userAffiliateService.getStats(user.getId());
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "balance", wallet.getBalance(),
-                "currency", wallet.getCurrency()
+                "balance", stats.availableBalance(),
+                "currency", stats.currency()
         )));
     }
 
