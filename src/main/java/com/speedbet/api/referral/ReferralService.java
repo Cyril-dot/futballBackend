@@ -31,7 +31,7 @@ public class ReferralService {
 
     /** Commission rate applied immediately after an admin upgrade, before the
      *  Super Admin finalises it via the onboarding chat. */
-    private static final BigDecimal DEFAULT_ADMIN_COMMISSION   = BigDecimal.valueOf(60);
+    private static final BigDecimal DEFAULT_ADMIN_COMMISSION   = BigDecimal.valueOf(65);
 
     private final ReferralLinkRepository linkRepo;
     private final ReferralRepository     referralRepo;
