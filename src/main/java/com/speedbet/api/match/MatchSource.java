@@ -35,5 +35,6 @@ public enum MatchSource {
 
     /** Manually created via the admin panel. */
     ADMIN_CREATED,
-    LIVESCORE
+    LIVESCORE,
+    ESPN
 }

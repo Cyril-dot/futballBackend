@@ -42,7 +42,7 @@ public class CorrectScoreOddsService {
     private static final List<String> BOOKMAKERS = List.of("SpeedBet", "BetKing", "SportyBet");
 
     /**
-     * Generate correct score odds for a fixture.
+     * Genaerate correct score odds for a fixture.
      *
      * @param homeTeam home team name
      * @param awayTeam away team name

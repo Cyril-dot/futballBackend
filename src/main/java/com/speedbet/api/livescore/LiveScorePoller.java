@@ -3,9 +3,10 @@ package com.speedbet.api.livescore;
 import com.speedbet.api.match.Match;
 import com.speedbet.api.match.MatchService;
 import com.speedbet.api.match.MatchSource;
-import com.speedbet.api.sportsdata.CompetitionIds;
-import com.speedbet.api.sportsdata.LiveScoreApiClient;
-import com.speedbet.api.sportsdata.TeamLogoCache;
+import com.speedbet.api.match.Sport;
+import com.speedbet.api.sportsdata.EspnFootballDataService;
+import com.speedbet.api.sportsdata.EspnFootballDataService.EspnLeague;
+import com.speedbet.api.sportsdata.EspnFootballDataService.EspnCup;
 import com.speedbet.api.sportsdata.odds.OddsPersistenceService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -15,12 +16,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -28,29 +27,22 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class LiveScorePoller {
 
-    private final LiveScoreApiClient     liveScoreApiClient;
-    private final MatchService           matchService;
-    private final OddsPersistenceService oddsPersistenceService;
-    private final CacheManager           cacheManager;
-    private final TeamLogoCache          teamLogoCache;
+    private final EspnFootballDataService espnService;
+    private final MatchService            matchService;
+    private final OddsPersistenceService  oddsPersistenceService;
+    private final CacheManager            cacheManager;
 
     /**
      * A match claiming to be LIVE is only genuinely live if:
-     *   1. It has a kickoff time (no kickoffAt = API stuck on stale LIVE status)
+     *   1. It has a kickoff time
      *   2. The kickoff was less than 4 hours ago (no match runs longer than ~4h)
-     *
-     * FIX #2: When kickoff is null we can no longer use time-based staleness
-     * detection.  The call site (mapLiveScoreApiMatchToMatch) now trusts the
-     * provider's live status when kickoff is null rather than demoting to
-     * FINISHED.  isGenuinelyLive() itself is unchanged — it still returns false
-     * for null, and the call site handles that case explicitly.
      */
     private static final long FOUR_HOURS_MS = 4 * 60 * 60_000L;
 
     /**
-     * External IDs that our DB has confirmed FINISHED but the upstream API
-     * keeps reporting as IN PLAY (stale feed).  We skip these early in each
-     * poll cycle to avoid repeated WARN log noise and unnecessary DB round-trips.
+     * External IDs that our DB has confirmed FINISHED but ESPN keeps reporting
+     * as IN PLAY (stale feed). We skip these early in each poll cycle to avoid
+     * repeated WARN log noise and unnecessary DB round-trips.
      *
      * The set is cleared by sweepStaleLiveMatches() every 10 minutes so that
      * any genuinely replayed / rescheduled fixture is picked up again.
@@ -64,97 +56,46 @@ public class LiveScorePoller {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // LEAGUE NAME RESOLVER
+    // LEAGUE / CUP NAME RESOLVER
+    // Matches ESPN competition name against known EspnLeague / EspnCup display
+    // names.  Falls back to the raw competition name extracted from the event.
     // ═══════════════════════════════════════════════════════════════════════
 
     private static String resolveLeagueName(Map<String, Object> event) {
-        Object compIdObj = event.get("competition_id");
+        String rawName = EspnFootballDataService.extractCompetitionName(event);
 
-        if (compIdObj == null) {
-            Object comp = event.get("competition");
-            if (comp instanceof Map) {
-                compIdObj = ((Map<?, ?>) comp).get("id");
+        for (EspnLeague league : EspnLeague.values()) {
+            if (league.displayName().equalsIgnoreCase(rawName)) {
+                log.debug("resolveLeagueName: matched EspnLeague '{}' → '{}'", rawName, league.displayName());
+                return league.displayName();
             }
         }
 
-        if (compIdObj != null) {
-            try {
-                int compId = Integer.parseInt(compIdObj.toString());
-                String resolved = CompetitionIds.displayNameForId(compId).orElse(null);
-                if (resolved != null) {
-                    log.debug("resolveLeagueName: compId={} → '{}'", compId, resolved);
-                    return resolved;
-                }
-                log.debug("resolveLeagueName: compId={} not in registry — using raw API name", compId);
-            } catch (NumberFormatException e) {
-                log.debug("resolveLeagueName: could not parse competition_id='{}' — using raw API name", compIdObj);
+        for (EspnCup cup : EspnCup.values()) {
+            if (cup.displayName().equalsIgnoreCase(rawName)) {
+                log.debug("resolveLeagueName: matched EspnCup '{}' → '{}'", rawName, cup.displayName());
+                return cup.displayName();
             }
-        } else {
-            log.debug("resolveLeagueName: no competition_id in event — using raw API name");
         }
 
-        return LiveScoreApiClient.extractCompetitionName(event);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // 0. LOGO CACHE WARM — runs at startup (delay=2s) then every 6 hours
-    // ═══════════════════════════════════════════════════════════════════════
-
-    @Scheduled(fixedRate = 6 * 60 * 60_000L, initialDelay = 2_000L)
-    public void warmLogoCache() {
-        log.info("=== Logo cache warm starting ===");
-        try {
-            List<Map<String, Object>> allTop6 = new ArrayList<>();
-            for (CompetitionIds.Top6League league : CompetitionIds.Top6League.values()) {
-                List<Map<String, Object>> fixtures = liveScoreApiClient.getFixturesByLeague(league);
-                allTop6.addAll(fixtures);
-                log.debug("Logo warm: {} fixture(s) for {}", fixtures.size(), league.displayName());
-            }
-            teamLogoCache.ingest(allTop6);
-            log.info("Logo warm: ingested {} top-6 fixtures", allTop6.size());
-
-            List<Map<String, Object>> allCups = new ArrayList<>();
-            for (CompetitionIds.CupCompetition cup : CompetitionIds.CupCompetition.top6Related()) {
-                List<Map<String, Object>> fixtures = liveScoreApiClient.getFixturesByCup(cup);
-                allCups.addAll(fixtures);
-                log.debug("Logo warm: {} fixture(s) for {}", fixtures.size(), cup.displayName());
-            }
-            teamLogoCache.ingest(allCups);
-            log.info("Logo warm: ingested {} cup fixtures", allCups.size());
-
-            List<Map<String, Object>> live = liveScoreApiClient.getLiveScores();
-            teamLogoCache.ingest(live);
-
-            String today = java.time.LocalDate.now().toString();
-            List<Map<String, Object>> todayMatches = liveScoreApiClient.getMatchesByDate(today);
-            teamLogoCache.ingest(todayMatches);
-
-            log.info("Logo warm complete — cache size={}", teamLogoCache.size());
-        } catch (Exception e) {
-            log.warn("Logo warm: error — {}", e.getMessage());
-        }
-        log.info("=== Logo cache warm complete ===");
+        log.debug("resolveLeagueName: no registry match for '{}' — using raw name", rawName);
+        return rawName;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     // 1. LIVE SCORES — every 30 seconds
     //
-    // FIX #2 + #3: Use uncached *Fresh() methods so the 30s interval actually
-    // hits the API each time (cached variants have a 5-min TTL that defeats
-    // the purpose of a 30s poll).
+    // Primary:  getTop6LiveMatches() + getTop6CupsLiveMatches() + getUefaLiveMatches()
+    //           (merged, deduplicated by ESPN event ID)
+    // Fallback: per-league getLiveMatches(league) for each EspnLeague.top6()
+    //           and per-cup getCupLiveMatches(cup) for each EspnCup.top6Related()
+    //           when the aggregate methods return empty.
     //
-    // FIX #3: Try the single all-competitions endpoint first (one API call).
-    // Only fall back to per-league calls if the general endpoint returns nothing.
-    // This reduces rate-limit pressure significantly.
+    // Events with ESPN state "pre" (not started) are skipped — mapEspnEventToMatch
+    // returns null for upcoming events to avoid overwriting fixture data.
     //
-    // FIX #5: Events with status "NOT STARTED" are now skipped inside
-    // mapLiveScoreApiMatchToMatch — they appear in the live endpoint response
-    // but must not overwrite scheduled fixture data.
-    //
-    // FIX #6: Events whose externalId is in confirmedFinishedIds are skipped
-    // immediately — the upstream API is stuck reporting them as IN PLAY after
-    // our DB has already marked them FINISHED.  This prevents repeated WARN
-    // log spam and unnecessary DB round-trips every 30 seconds.
+    // Confirmed-finished suppression: IDs in confirmedFinishedIds are skipped
+    // immediately to prevent repeated WARN spam when ESPN is stuck on stale LIVE.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 30_000L, initialDelay = 5_000L)
@@ -163,56 +104,63 @@ public class LiveScorePoller {
         try {
             List<Map<String, Object>> allLive = new ArrayList<>();
 
-            // FIX #3: Attempt the single all-competitions live endpoint first.
-            List<Map<String, Object>> generalLive = liveScoreApiClient.getLiveScores();
-            if (!generalLive.isEmpty()) {
-                log.info("Live poll: {} match(es) from general live endpoint.", generalLive.size());
-                allLive.addAll(generalLive);
-            } else {
-                // General endpoint returned nothing — fall back to per-league fresh calls.
-                log.debug("Live poll: general endpoint empty — falling back to per-league fresh calls.");
+            // ── Primary: aggregate live endpoints ─────────────────────────
+            List<Map<String, Object>> top6Live     = espnService.getTop6LiveMatches();
+            List<Map<String, Object>> top6CupsLive = espnService.getTop6CupsLiveMatches();
+            List<Map<String, Object>> uefaLive     = espnService.getUefaLiveMatches();
 
-                for (CompetitionIds.Top6League league : CompetitionIds.Top6League.values()) {
-                    List<Map<String, Object>> leagueLive = liveScoreApiClient.getLiveScoresByLeagueFresh(league);
+            allLive.addAll(top6Live);
+            allLive.addAll(top6CupsLive);
+            allLive.addAll(uefaLive);
+
+            log.info("Live poll: primary — top6={}, cups={}, uefa={} event(s)",
+                    top6Live.size(), top6CupsLive.size(), uefaLive.size());
+
+            // ── Fallback: per-league / per-cup if primary returned nothing ─
+            if (allLive.isEmpty()) {
+                log.debug("Live poll: primary empty — falling back to per-league/cup calls.");
+
+                for (EspnLeague league : EspnLeague.top6()) {
+                    List<Map<String, Object>> leagueLive = espnService.getLiveMatches(league);
                     if (!leagueLive.isEmpty()) {
-                        log.debug("Live poll: {} live match(es) for {}", leagueLive.size(), league.displayName());
+                        log.debug("Live poll [fallback]: {} live event(s) for {}",
+                                leagueLive.size(), league.displayName());
                         allLive.addAll(leagueLive);
                     }
                 }
 
-                for (CompetitionIds.CupCompetition cup : CompetitionIds.CupCompetition.top6Related()) {
-                    List<Map<String, Object>> cupLive = liveScoreApiClient.getLiveScoresByCupFresh(cup);
+                for (EspnCup cup : EspnCup.top6Related()) {
+                    List<Map<String, Object>> cupLive = espnService.getCupLiveMatches(cup);
                     if (!cupLive.isEmpty()) {
-                        log.debug("Live poll: {} live match(es) for {}", cupLive.size(), cup.displayName());
+                        log.debug("Live poll [fallback]: {} live event(s) for {}",
+                                cupLive.size(), cup.displayName());
                         allLive.addAll(cupLive);
                     }
                 }
             }
 
+            // ── Deduplication by ESPN event ID ────────────────────────────
+            allLive = deduplicateByEventId(allLive);
+
             if (allLive.isEmpty()) {
                 log.info("Live poll: no live matches found.");
             } else {
-                teamLogoCache.ingest(allLive);
-                log.info("Live poll: {} total match(es) from API to classify.", allLive.size());
+                log.info("Live poll: {} deduplicated event(s) to classify.", allLive.size());
 
-                // ── DIAGNOSTIC: log raw status/time from provider for every event ──────
-                // Remove or lower to DEBUG once the live-status issue is confirmed fixed.
+                // ── DIAGNOSTIC: log raw status for every event ────────────
                 for (Map<String, Object> event : allLive) {
-                    log.info("LIVE EVENT raw: id='{}' status='{}' time='{}' home='{}' away='{}'",
-                            LiveScoreApiClient.extractMatchId(event),
-                            LiveScoreApiClient.extractStatus(event),
-                            LiveScoreApiClient.extractMatchTime(event),
-                            LiveScoreApiClient.extractHomeName(event),
-                            LiveScoreApiClient.extractAwayName(event));
+                    log.info("LIVE EVENT raw: id='{}' status='{}' home='{}' away='{}'",
+                            EspnFootballDataService.extractEventId(event),
+                            EspnFootballDataService.extractStatus(event),
+                            EspnFootballDataService.extractHomeName(event),
+                            EspnFootballDataService.extractAwayName(event));
                 }
-                // ────────────────────────────────────────────────────────────────────────
 
                 int updated = 0, skipped = 0, demoted = 0;
                 for (Map<String, Object> event : allLive) {
-                    String rawId = "ls-" + LiveScoreApiClient.extractMatchId(event);
+                    String rawId = "espn-" + EspnFootballDataService.extractEventId(event);
 
-                    // FIX #6: Skip IDs we already know are FINISHED in our DB.
-                    // The upstream feed is stuck — no point hitting the DB again.
+                    // Skip IDs already confirmed FINISHED in our DB
                     if (confirmedFinishedIds.contains(rawId)) {
                         log.debug("Live poll: skipping confirmed-finished externalId={}", rawId);
                         skipped++;
@@ -220,17 +168,15 @@ public class LiveScorePoller {
                     }
 
                     try {
-                        Match m = mapLiveScoreApiMatchToMatch(event, false);
+                        Match m = mapEspnEventToMatch(event);
                         if (m != null) {
-                            enrichLogos(m);
                             Match persisted = matchService.saveOrUpdate(m);
 
                             // Detect when our LIVE mapping was rejected by the DB guard
-                            // (i.e. the match was already FINISHED and the transition was blocked).
                             if ("LIVE".equals(m.getStatus()) && "FINISHED".equals(persisted.getStatus())) {
                                 confirmedFinishedIds.add(m.getExternalId());
                                 log.info("Live poll: confirmed-finished suppression added for externalId={} " +
-                                                "— upstream API is stuck; will skip until next stale sweep.",
+                                                "— ESPN feed is stuck; will skip until next stale sweep.",
                                         m.getExternalId());
                                 skipped++;
                             } else if ("LIVE".equals(persisted.getStatus())) {
@@ -239,16 +185,16 @@ public class LiveScorePoller {
                                 demoted++;
                             }
                         } else {
-                            // null return means NOT STARTED or a parse error.
                             skipped++;
                         }
                     } catch (Exception e) {
                         skipped++;
                         log.warn("Live poll: failed event id={} — {}",
-                                LiveScoreApiClient.extractMatchId(event), e.getMessage());
+                                EspnFootballDataService.extractEventId(event), e.getMessage());
                     }
                 }
-                log.info("Live poll: done — live={}, demoted-to-finished={}, skipped={} (includes not-started).",
+
+                log.info("Live poll: done — live={}, demoted-to-finished={}, skipped={}.",
                         updated, demoted, skipped);
 
                 if (demoted > 0) {
@@ -264,57 +210,40 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 2. TODAY'S FIXTURES — every 15 minutes
+    //
+    // Fetches today's matches for Top 6 leagues, Top 6 domestic cups, and
+    // UEFA club competitions (UCL + UEL + UECL), then merges and deduplicates.
+    // Odds are generated and persisted for any UPCOMING/SCHEDULED matches found.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 15 * 60_000L, initialDelay = 10_000L)
     public void pollTodaysFixtures() {
-        String today = java.time.LocalDate.now().toString();
-        log.info("=== Today's fixtures poll starting for date={} ===", today);
+        log.info("=== Today's fixtures poll starting for date={} ===", LocalDate.now());
         try {
             List<Map<String, Object>> allToday = new ArrayList<>();
 
-            for (CompetitionIds.Top6League league : CompetitionIds.Top6League.values()) {
-                Map<String, Object> raw = liveScoreApiClient.callWithFallbackPublic(
-                        "matches/history.json?from=" + today + "&to=" + today
-                                + "&competition_id=" + league.id());
-                if (raw != null) {
-                    List<Map<String, Object>> matches =
-                            liveScoreApiClient.extractByPathPublic(raw, "data", "match");
-                    if (!matches.isEmpty()) {
-                        log.debug("Today poll: {} match(es) for {}", matches.size(), league.displayName());
-                        allToday.addAll(matches);
-                    }
-                }
-            }
+            List<Map<String, Object>> top6Today     = espnService.getTop6TodayMatches();
+            List<Map<String, Object>> top6CupsToday = espnService.getTop6CupsTodayMatches();
+            List<Map<String, Object>> uefaToday     = espnService.getUefaCompetitionsTodayMatches();
 
-            for (CompetitionIds.CupCompetition cup : CompetitionIds.CupCompetition.top6Related()) {
-                Map<String, Object> raw = liveScoreApiClient.callWithFallbackPublic(
-                        "matches/history.json?from=" + today + "&to=" + today
-                                + "&competition_id=" + cup.id());
-                if (raw != null) {
-                    List<Map<String, Object>> matches =
-                            liveScoreApiClient.extractByPathPublic(raw, "data", "match");
-                    if (!matches.isEmpty()) {
-                        log.debug("Today poll: {} match(es) for {}", matches.size(), cup.displayName());
-                        allToday.addAll(matches);
-                    }
-                }
-            }
+            allToday.addAll(top6Today);
+            allToday.addAll(top6CupsToday);
+            allToday.addAll(uefaToday);
 
-            List<Map<String, Object>> generalToday = liveScoreApiClient.getTodayMatches();
-            if (!generalToday.isEmpty()) {
-                log.debug("Today poll: {} match(es) from general today endpoint", generalToday.size());
-                allToday.addAll(generalToday);
-            }
+            log.info("Today poll: top6={}, cups={}, uefa={} event(s) before dedup",
+                    top6Today.size(), top6CupsToday.size(), uefaToday.size());
+
+            allToday = deduplicateByEventId(allToday);
 
             if (allToday.isEmpty()) {
-                log.info("Today poll: no matches returned for date={}.", today);
+                log.info("Today poll: no matches returned.");
             } else {
-                teamLogoCache.ingest(allToday);
+                log.info("Today poll: {} deduplicated event(s) to process.", allToday.size());
+
                 int saved = 0, skipped = 0;
                 for (Map<String, Object> event : allToday) {
                     try {
-                        Match m = mapLiveScoreApiMatchToMatch(event, false);
+                        Match m = mapEspnEventToMatch(event);
                         if (m != null) {
                             Match persisted = matchService.saveOrUpdate(m);
                             if ("UPCOMING".equals(persisted.getStatus()) ||
@@ -327,13 +256,16 @@ public class LiveScorePoller {
                                 }
                             }
                             saved++;
-                        } else skipped++;
+                        } else {
+                            skipped++;
+                        }
                     } catch (Exception e) {
                         skipped++;
                         log.warn("Today poll: failed event id={} — {}",
-                                LiveScoreApiClient.extractMatchId(event), e.getMessage());
+                                EspnFootballDataService.extractEventId(event), e.getMessage());
                     }
                 }
+
                 log.info("Today poll: done — saved={}, skipped={}.", saved, skipped);
                 evictMatchCaches();
             }
@@ -345,63 +277,87 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 3. UPCOMING FIXTURES (next 7 days) — every hour
+    //
+    // [A] Per-league: iterates EspnLeague.top6() and EspnCup.top6Related(),
+    //     fetching scoreboard for each of the next 7 days via
+    //     getUpcomingFixturesByDate() / getCupUpcomingFixturesByDate().
+    //     Only future kickoffs are persisted; odds are generated immediately.
+    //
+    // [B] General upcoming: getTop6UpcomingMatches() + getTop6CupsUpcomingMatches()
+    //     as a broad sweep to catch anything missed by [A].
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
     public void pollUpcomingFixtures() {
         log.info("=== Upcoming fixtures poll starting ===");
         try {
-            log.info("Upcoming poll [A]: fetching per-league fixtures via enum...");
+
+            // ── [A] Per-league, per-day for next 7 days ───────────────────
+            log.info("Upcoming poll [A]: fetching per-league fixtures for next 7 days...");
             int top6Saved = 0, top6Skipped = 0;
 
-            for (CompetitionIds.Top6League league : CompetitionIds.Top6League.values()) {
-                List<Map<String, Object>> fixtures = liveScoreApiClient.getFixturesByLeague(league);
-                log.debug("Upcoming poll [A]: {} fixture(s) for {}", fixtures.size(), league.displayName());
-                teamLogoCache.ingest(fixtures);
-                for (Map<String, Object> event : fixtures) {
-                    try {
-                        Match m = mapLiveScoreApiFixtureToMatch(event);
-                        if (m != null && m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
-                            Match persisted = matchService.saveOrUpdate(m);
-                            try { oddsPersistenceService.generateAndSaveAllOdds(persisted); }
-                            catch (Exception oe) {
-                                log.warn("Upcoming poll [A]: odds failed matchId={} — {}",
-                                        persisted.getId(), oe.getMessage());
+            List<String> next7Days = buildNext7DayStrings();
+
+            for (EspnLeague league : EspnLeague.top6()) {
+                for (String yyyymmdd : next7Days) {
+                    List<Map<String, Object>> fixtures =
+                            espnService.getUpcomingFixturesByDate(league, yyyymmdd);
+                    log.debug("Upcoming poll [A]: {} fixture(s) for {} on {}",
+                            fixtures.size(), league.displayName(), yyyymmdd);
+
+                    for (Map<String, Object> event : fixtures) {
+                        try {
+                            Match m = mapEspnFixtureToMatch(event);
+                            if (m != null && m.getKickoffAt() != null
+                                    && m.getKickoffAt().isAfter(Instant.now())) {
+                                Match persisted = matchService.saveOrUpdate(m);
+                                try {
+                                    oddsPersistenceService.generateAndSaveAllOdds(persisted);
+                                } catch (Exception oe) {
+                                    log.warn("Upcoming poll [A]: odds failed matchId={} — {}",
+                                            persisted.getId(), oe.getMessage());
+                                }
+                                top6Saved++;
+                            } else {
+                                top6Skipped++;
                             }
-                            top6Saved++;
-                        } else {
+                        } catch (Exception e) {
                             top6Skipped++;
+                            log.warn("Upcoming poll [A]: failed fixture id={} — {}",
+                                    EspnFootballDataService.extractEventId(event), e.getMessage());
                         }
-                    } catch (Exception e) {
-                        top6Skipped++;
-                        log.warn("Upcoming poll [A]: failed fixture id={} — {}",
-                                LiveScoreApiClient.extractFixtureId(event), e.getMessage());
                     }
                 }
             }
 
-            for (CompetitionIds.CupCompetition cup : CompetitionIds.CupCompetition.top6Related()) {
-                List<Map<String, Object>> fixtures = liveScoreApiClient.getFixturesByCup(cup);
-                log.debug("Upcoming poll [A]: {} fixture(s) for {}", fixtures.size(), cup.displayName());
-                teamLogoCache.ingest(fixtures);
-                for (Map<String, Object> event : fixtures) {
-                    try {
-                        Match m = mapLiveScoreApiFixtureToMatch(event);
-                        if (m != null && m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
-                            Match persisted = matchService.saveOrUpdate(m);
-                            try { oddsPersistenceService.generateAndSaveAllOdds(persisted); }
-                            catch (Exception oe) {
-                                log.warn("Upcoming poll [A]: odds failed matchId={} — {}",
-                                        persisted.getId(), oe.getMessage());
+            for (EspnCup cup : EspnCup.top6Related()) {
+                for (String yyyymmdd : next7Days) {
+                    List<Map<String, Object>> fixtures =
+                            espnService.getCupUpcomingFixturesByDate(cup, yyyymmdd);
+                    log.debug("Upcoming poll [A]: {} fixture(s) for {} on {}",
+                            fixtures.size(), cup.displayName(), yyyymmdd);
+
+                    for (Map<String, Object> event : fixtures) {
+                        try {
+                            Match m = mapEspnFixtureToMatch(event);
+                            if (m != null && m.getKickoffAt() != null
+                                    && m.getKickoffAt().isAfter(Instant.now())) {
+                                Match persisted = matchService.saveOrUpdate(m);
+                                try {
+                                    oddsPersistenceService.generateAndSaveAllOdds(persisted);
+                                } catch (Exception oe) {
+                                    log.warn("Upcoming poll [A]: odds failed matchId={} — {}",
+                                            persisted.getId(), oe.getMessage());
+                                }
+                                top6Saved++;
+                            } else {
+                                top6Skipped++;
                             }
-                            top6Saved++;
-                        } else {
+                        } catch (Exception e) {
                             top6Skipped++;
+                            log.warn("Upcoming poll [A]: failed fixture id={} — {}",
+                                    EspnFootballDataService.extractEventId(event), e.getMessage());
                         }
-                    } catch (Exception e) {
-                        top6Skipped++;
-                        log.warn("Upcoming poll [A]: failed fixture id={} — {}",
-                                LiveScoreApiClient.extractFixtureId(event), e.getMessage());
                     }
                 }
             }
@@ -409,41 +365,46 @@ public class LiveScorePoller {
             log.info("Upcoming poll [A]: done — saved={}, skipped={}", top6Saved, top6Skipped);
             evictUpcomingCaches();
 
-            log.info("Upcoming poll [B]: fetching general upcoming fixtures — logo cache size={}",
-                    teamLogoCache.size());
-            List<Map<String, Object>> fixtures = liveScoreApiClient.getUpcomingFixtures();
-            if (fixtures == null || fixtures.isEmpty()) {
-                log.info("Upcoming poll [B]: no fixtures returned from general endpoint.");
+            // ── [B] General upcoming sweep ────────────────────────────────
+            log.info("Upcoming poll [B]: fetching general upcoming fixtures...");
+
+            List<Map<String, Object>> generalUpcoming = new ArrayList<>();
+            generalUpcoming.addAll(espnService.getTop6UpcomingMatches());
+            generalUpcoming.addAll(espnService.getTop6CupsUpcomingMatches());
+            generalUpcoming = deduplicateByEventId(generalUpcoming);
+
+            if (generalUpcoming.isEmpty()) {
+                log.info("Upcoming poll [B]: no upcoming fixtures from general endpoint.");
             } else {
-                log.info("Upcoming poll [B]: {} fixtures to process.", fixtures.size());
-                int saved = 0, skipped = 0, logoHits = 0;
-                for (Map<String, Object> event : fixtures) {
+                log.info("Upcoming poll [B]: {} deduplicated fixture(s) to process.",
+                        generalUpcoming.size());
+
+                int saved = 0, skipped = 0;
+                for (Map<String, Object> event : generalUpcoming) {
                     try {
-                        Match m = mapLiveScoreApiFixtureToMatch(event);
-                        if (m != null) {
-                            if (m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
-                                logoHits += enrichLogos(m);
-                                Match persisted = matchService.saveOrUpdate(m);
-                                try { oddsPersistenceService.generateAndSaveAllOdds(persisted); }
-                                catch (Exception oe) {
-                                    log.warn("Upcoming poll [B]: odds failed matchId={} — {}",
-                                            persisted.getId(), oe.getMessage());
-                                }
-                                saved++;
-                            } else {
-                                log.debug("Upcoming poll [B]: skipping past/null kickoff externalId={}",
-                                        m.getExternalId());
-                                skipped++;
+                        Match m = mapEspnFixtureToMatch(event);
+                        if (m != null && m.getKickoffAt() != null
+                                && m.getKickoffAt().isAfter(Instant.now())) {
+                            Match persisted = matchService.saveOrUpdate(m);
+                            try {
+                                oddsPersistenceService.generateAndSaveAllOdds(persisted);
+                            } catch (Exception oe) {
+                                log.warn("Upcoming poll [B]: odds failed matchId={} — {}",
+                                        persisted.getId(), oe.getMessage());
                             }
-                        } else skipped++;
+                            saved++;
+                        } else {
+                            log.debug("Upcoming poll [B]: skipping past/null kickoff externalId={}",
+                                    m != null ? m.getExternalId() : "null");
+                            skipped++;
+                        }
                     } catch (Exception e) {
                         skipped++;
                         log.warn("Upcoming poll [B]: failed fixture id={} — {}",
-                                LiveScoreApiClient.extractMatchId(event), e.getMessage());
+                                EspnFootballDataService.extractEventId(event), e.getMessage());
                     }
                 }
-                log.info("Upcoming poll [B]: done — saved={}, skipped={}, logoHits={}.",
-                        saved, skipped, logoHits);
+                log.info("Upcoming poll [B]: done — saved={}, skipped={}.", saved, skipped);
             }
 
             evictMatchCaches();
@@ -457,9 +418,9 @@ public class LiveScorePoller {
     // ═══════════════════════════════════════════════════════════════════════
     // 4. STALE LIVE SWEEP — every 10 minutes
     //
-    // FIX #6: Also clears confirmedFinishedIds so that any fixture the
-    // upstream API eventually corrects (or a rescheduled match) is picked up
-    // again on the next poll cycle rather than suppressed indefinitely.
+    // Force-finishes any LIVE match whose kickoff was more than 4 hours ago.
+    // Also clears confirmedFinishedIds so that any fixture ESPN eventually
+    // corrects is picked up again on the next poll cycle.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 10 * 60_000L, initialDelay = 5 * 60_000L)
@@ -475,8 +436,8 @@ public class LiveScorePoller {
                 log.debug("Stale sweep: no stale LIVE matches found.");
             }
 
-            // Clear the suppression set every sweep cycle so that matches the
-            // upstream API eventually corrects are not suppressed indefinitely.
+            // Clear the suppression set every sweep so that matches ESPN eventually
+            // corrects are not suppressed indefinitely.
             if (!confirmedFinishedIds.isEmpty()) {
                 log.info("Stale sweep: clearing {} confirmed-finished suppression id(s).",
                         confirmedFinishedIds.size());
@@ -524,29 +485,6 @@ public class LiveScorePoller {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // LOGO ENRICHMENT
-    // ═══════════════════════════════════════════════════════════════════════
-
-    private int enrichLogos(Match match) {
-        int hits = 0;
-        if (isBlank(match.getHomeLogo())) {
-            String logo = teamLogoCache.getTeamLogo(match.getHomeTeam());
-            if (!logo.isBlank()) { match.setHomeLogo(logo); hits++; }
-        }
-        if (isBlank(match.getAwayLogo())) {
-            String logo = teamLogoCache.getTeamLogo(match.getAwayTeam());
-            if (!logo.isBlank()) { match.setAwayLogo(logo); hits++; }
-        }
-        if (isBlank(match.getLeagueLogo())) {
-            String logo = teamLogoCache.getLeagueLogo(match.getLeague());
-            if (!logo.isBlank()) { match.setLeagueLogo(logo); hits++; }
-        }
-        return hits;
-    }
-
-    private static boolean isBlank(String s) { return s == null || s.isBlank(); }
-
-    // ═══════════════════════════════════════════════════════════════════════
     // CACHE HELPERS
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -572,100 +510,107 @@ public class LiveScorePoller {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // UTILITY
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Builds a list of the next 7 days (including today) formatted as
+     * "yyyyMMdd" for ESPN's scoreboard date query parameter.
+     */
+    private static List<String> buildNext7DayStrings() {
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyyMMdd");
+        List<String> dates = new ArrayList<>(7);
+        LocalDate today = LocalDate.now();
+        for (int i = 0; i < 7; i++) {
+            dates.add(today.plusDays(i).format(fmt));
+        }
+        return dates;
+    }
+
+    /**
+     * Deduplicates a list of ESPN events by their event ID.
+     * Preserves insertion order; first occurrence wins.
+     */
+    private static List<Map<String, Object>> deduplicateByEventId(List<Map<String, Object>> events) {
+        Set<String> seen = new LinkedHashSet<>();
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> event : events) {
+            String id = EspnFootballDataService.extractEventId(event);
+            if (!id.isBlank() && seen.add(id)) {
+                result.add(event);
+            }
+        }
+        return result;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // MAPPERS
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * Maps a raw LiveScore API event to a Match entity.
+     * Maps a raw ESPN event to a Match entity for live/today polling.
      *
-     * ── Status resolution ──────────────────────────────────────────────────
+     * ── Status resolution priority ─────────────────────────────────────────
      *
-     * Full priority order:
+     *   0. isUpcoming() (state == "pre")  → return null   (skip; do not
+     *                                        overwrite fixture data)
+     *   1. isFinished() (state == "post") → FINISHED      (terminal; always wins)
+     *   2. isLive()     (state == "in")
+     *        + null kickoff               → LIVE           (trust ESPN; stale sweep
+     *                                                        is the safety net)
+     *        + kickoff within 4 hours     → LIVE
+     *        + kickoff > 4 hours ago      → FINISHED       (stale demotion + WARN)
+     *   3. Otherwise                      → UPCOMING
      *
-     *   0. isNotStarted()             → return null  (skip; do not overwrite fixture data)
-     *   1. isFinished()               → FINISHED     (finished always wins)
-     *   2. isLive() + null kickoff    → LIVE          (trust provider; stale sweep is safety net)
-     *   3. isLive() + valid kickoff within 4h → LIVE
-     *   4. isLive() + kickoff > 4h ago → FINISHED    (stale demotion, with warning)
-     *   5. Otherwise                  → UPCOMING
-     *
-     * ── FIX #5: NOT STARTED skip ──────────────────────────────────────────
-     *
-     *   The live endpoint returns ALL today's matches, including those that
-     *   have not yet kicked off (status "NOT STARTED").  Previously these
-     *   fell through to the UPCOMING branch and were saved, potentially
-     *   overwriting cleaner data from the fixtures poller.
-     *
-     *   Now: isNotStarted() returns true for "NOT STARTED" and related
-     *   pre-match statuses.  The mapper returns null immediately, causing the
-     *   event to be counted as skipped without any DB write.
-     *
-     * ── FIX #2: null-kickoff LIVE tolerance ───────────────────────────────
-     *
-     *   Previously: if (isGenuinelyLive(kickoff)) { LIVE } else { FINISHED }
-     *   → kickoff==null caused isGenuinelyLive() to return false → FINISHED.
-     *
-     *   Now: if (kickoff == null || isGenuinelyLive(kickoff)) { LIVE }
-     *   → null kickoff trusts the provider.  The 10-min stale sweep
-     *   (sweepStaleLiveMatches) is the safety net for any truly stuck matches.
-     *
-     * ── FIX #1 / #4 note ─────────────────────────────────────────────────
-     *
-     *   isFinished() and isLive() are defined in LiveScoreApiClient.
-     *   They now recognise the full range of provider status strings including
-     *   multi-word variants: "IN PLAY", "HALF TIME BREAK", "ADDED TIME",
-     *   "FULL TIME", "NOT STARTED", etc.
-     *
-     * The {@code forceStatusLive} parameter is kept for backward-compatibility
-     * but is IGNORED — callers should always pass {@code false}.
+     * Score is extracted from ESPN competitor score fields.
+     * Kickoff is parsed from the ISO-8601 "date" field on the event.
      */
-    private Match mapLiveScoreApiMatchToMatch(Map<String, Object> event,
-                                              @SuppressWarnings("unused") boolean forceStatusLive) {
+    private Match mapEspnEventToMatch(Map<String, Object> event) {
         if (event == null) return null;
 
-        String externalId = LiveScoreApiClient.extractMatchId(event);
+        String externalId = EspnFootballDataService.extractEventId(event);
         if (externalId == null || externalId.isBlank()) return null;
 
-        // ── STATUS RESOLUTION ──────────────────────────────────────────────
-
-        // FIX #5: Skip NOT STARTED events from the live endpoint entirely.
-        if (LiveScoreApiClient.isNotStarted(event)) {
-            log.debug("mapLiveScoreApiMatchToMatch: skipping NOT STARTED " +
-                            "externalId=ls-{} home='{}' away='{}'",
+        // ── Skip NOT STARTED (pre) events from the live endpoint ──────────
+        if (EspnFootballDataService.isUpcoming(event)) {
+            log.debug("mapEspnEventToMatch: skipping PRE (not started) espn-{} home='{}' away='{}'",
                     externalId,
-                    LiveScoreApiClient.extractHomeName(event),
-                    LiveScoreApiClient.extractAwayName(event));
+                    EspnFootballDataService.extractHomeName(event),
+                    EspnFootballDataService.extractAwayName(event));
             return null;
         }
 
         Match match = new Match();
-        match.setExternalId("ls-" + externalId);
-        match.setSource(MatchSource.LIVESCORE);
+        match.setExternalId("espn-" + externalId);
+        match.setSource(MatchSource.ESPN);
+        match.setSportEnum(Sport.FOOTBALL);
         match.setSport("football");
 
-        Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
+        // ── Kickoff ───────────────────────────────────────────────────────
+        Instant kickoff = parseKickoff(event);
         match.setKickoffAt(kickoff);
 
-        if (LiveScoreApiClient.isFinished(event)) {
+        // ── Status resolution ─────────────────────────────────────────────
+        if (EspnFootballDataService.isFinished(event)) {
             match.setStatus("FINISHED");
 
-        } else if (LiveScoreApiClient.isLive(event)) {
+        } else if (EspnFootballDataService.isLive(event)) {
             if (kickoff == null || isGenuinelyLive(kickoff)) {
                 if (kickoff == null) {
-                    log.warn("mapLiveScoreApiMatchToMatch: accepting LIVE with null kickoff " +
-                                    "externalId=ls-{} home='{}' away='{}' status='{}' — stale sweep is safety net",
+                    log.warn("mapEspnEventToMatch: accepting LIVE with null kickoff " +
+                                    "espn-{} home='{}' away='{}' status='{}' — stale sweep is safety net",
                             externalId,
-                            LiveScoreApiClient.extractHomeName(event),
-                            LiveScoreApiClient.extractAwayName(event),
-                            LiveScoreApiClient.extractStatus(event));
+                            EspnFootballDataService.extractHomeName(event),
+                            EspnFootballDataService.extractAwayName(event),
+                            EspnFootballDataService.extractStatus(event));
                 }
                 match.setStatus("LIVE");
             } else {
-                log.warn("mapLiveScoreApiMatchToMatch: demoting stale LIVE to FINISHED " +
-                                "externalId=ls-{} home='{}' away='{}' kickoff={}",
+                log.warn("mapEspnEventToMatch: demoting stale LIVE to FINISHED " +
+                                "espn-{} home='{}' away='{}' kickoff={}",
                         externalId,
-                        LiveScoreApiClient.extractHomeName(event),
-                        LiveScoreApiClient.extractAwayName(event),
+                        EspnFootballDataService.extractHomeName(event),
+                        EspnFootballDataService.extractAwayName(event),
                         kickoff);
                 match.setStatus("FINISHED");
             }
@@ -674,81 +619,91 @@ public class LiveScorePoller {
             match.setStatus("UPCOMING");
         }
 
-        match.setHomeTeam(LiveScoreApiClient.extractHomeName(event));
-        match.setAwayTeam(LiveScoreApiClient.extractAwayName(event));
-        match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));
-        match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
+        // ── Teams ─────────────────────────────────────────────────────────
+        match.setHomeTeam(EspnFootballDataService.extractHomeName(event));
+        match.setAwayTeam(EspnFootballDataService.extractAwayName(event));
+        match.setHomeLogo(EspnFootballDataService.extractHomeLogo(event));
+        match.setAwayLogo(EspnFootballDataService.extractAwayLogo(event));
 
+        // ── League ────────────────────────────────────────────────────────
         match.setLeague(resolveLeagueName(event));
-        match.setLeagueLogo(LiveScoreApiClient.extractLeagueLogo(event));
-        enrichLogos(match);
 
-        String scoreStr = LiveScoreApiClient.extractScore(event);
+        // ── Score ─────────────────────────────────────────────────────────
+        String scoreStr = EspnFootballDataService.extractScore(event);
         if (scoreStr.contains("-")) {
             String[] parts = scoreStr.split("-");
             if (parts.length == 2) {
-                try { match.setScoreHome(Integer.parseInt(parts[0].trim())); } catch (NumberFormatException ignored) {}
-                try { match.setScoreAway(Integer.parseInt(parts[1].trim())); } catch (NumberFormatException ignored) {}
-            }
-        }
-
-        String htScore = LiveScoreApiClient.extractHalfTimeScore(event);
-        if (htScore.contains("-")) {
-            String[] htParts = htScore.split("-");
-            if (htParts.length == 2) {
-                try {
-                    int htHome = Integer.parseInt(htParts[0].trim());
-                    int htAway = Integer.parseInt(htParts[1].trim());
-                    Map<String, Object> meta = match.getMetadata() != null
-                            ? new HashMap<>(match.getMetadata()) : new HashMap<>();
-                    meta.put("score_home_ht", htHome);
-                    meta.put("score_away_ht", htAway);
-                    match.setMetadata(meta);
-                } catch (NumberFormatException ignored) {}
+                try { match.setScoreHome(Integer.parseInt(parts[0].trim())); }
+                catch (NumberFormatException ignored) {}
+                try { match.setScoreAway(Integer.parseInt(parts[1].trim())); }
+                catch (NumberFormatException ignored) {}
             }
         }
 
         return match;
     }
 
-    private Match mapLiveScoreApiFixtureToMatch(Map<String, Object> event) {
+    /**
+     * Maps a raw ESPN event to a Match entity for the upcoming fixtures poller.
+     *
+     * Only events with a non-blank home and away team name are persisted.
+     * Status is always set to UPCOMING since this mapper is only called from
+     * the fixtures poll path where events have ESPN state "pre".
+     * Kickoff is parsed from the ISO-8601 "date" field on the event.
+     */
+    private Match mapEspnFixtureToMatch(Map<String, Object> event) {
         if (event == null) return null;
 
-        String externalId = LiveScoreApiClient.extractFixtureId(event);
+        String externalId = EspnFootballDataService.extractEventId(event);
         if (externalId == null || externalId.isBlank()) return null;
 
-        String homeName = LiveScoreApiClient.extractHomeName(event);
-        String awayName = LiveScoreApiClient.extractAwayName(event);
+        String homeName = EspnFootballDataService.extractHomeName(event);
+        String awayName = EspnFootballDataService.extractAwayName(event);
 
         if (homeName.isBlank() || awayName.isBlank()) {
-            log.debug("mapFixtureToMatch: blank team names for id={}, skipping", externalId);
+            log.debug("mapEspnFixtureToMatch: blank team names for espn-{}, skipping", externalId);
             return null;
         }
 
         Match match = new Match();
-        match.setExternalId("ls-" + externalId);
-        match.setSource(MatchSource.LIVESCORE);
+        match.setExternalId("espn-" + externalId);
+        match.setSource(MatchSource.ESPN);
         match.setSport("football");
         match.setStatus("UPCOMING");
+        match.setSportEnum(Sport.FOOTBALL);
         match.setHomeTeam(homeName);
         match.setAwayTeam(awayName);
-        match.setHomeLogo(LiveScoreApiClient.extractHomeLogo(event));
-        match.setAwayLogo(LiveScoreApiClient.extractAwayLogo(event));
-
+        match.setHomeLogo(EspnFootballDataService.extractHomeLogo(event));
+        match.setAwayLogo(EspnFootballDataService.extractAwayLogo(event));
         match.setLeague(resolveLeagueName(event));
-        match.setLeagueLogo(LiveScoreApiClient.extractLeagueLogo(event));
 
-        Instant kickoff = LiveScoreApiClient.buildKickoffInstant(event);
+        Instant kickoff = parseKickoff(event);
         match.setKickoffAt(kickoff);
 
         if (kickoff != null) {
-            log.debug("mapFixtureToMatch: id={} {} vs {} kickoff={}",
+            log.debug("mapEspnFixtureToMatch: espn-{} {} vs {} kickoff={}",
                     externalId, homeName, awayName, kickoff);
         } else {
-            log.warn("mapFixtureToMatch: id={} {} vs {} — could not parse kickoff",
+            log.warn("mapEspnFixtureToMatch: espn-{} {} vs {} — could not parse kickoff",
                     externalId, homeName, awayName);
         }
 
         return match;
+    }
+
+    /**
+     * Parses the kickoff Instant from the ESPN event's "date" field.
+     * ESPN returns ISO-8601 UTC strings e.g. "2025-05-14T19:45:00Z".
+     * Returns null if the field is absent or unparseable.
+     */
+    private static Instant parseKickoff(Map<String, Object> event) {
+        String dateStr = EspnFootballDataService.extractKickoffTime(event);
+        if (dateStr == null || dateStr.isBlank()) return null;
+        try {
+            return Instant.parse(dateStr);
+        } catch (Exception e) {
+            log.debug("parseKickoff: could not parse '{}' — {}", dateStr, e.getMessage());
+            return null;
+        }
     }
 }

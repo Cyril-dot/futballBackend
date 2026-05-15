@@ -28,7 +28,12 @@ public class Match {
     @Column(name = "minute_played")
     private Integer minutePlayed;
 
+    @Column(name = "sport")
     private String sport;
+
+    @Transient
+    private Sport sportEnum;
+
     private String league;
 
     @Column(name = "home_team")
@@ -75,4 +80,21 @@ public class Match {
     @Builder.Default
     @Column(name = "created_at", updatable = false)
     private Instant createdAt = Instant.now();
+
+    // ── Keep sport string and sportEnum in sync ───────────────────────────
+
+    public void setSport(String sport) {
+        this.sport = sport;
+        this.sportEnum = Sport.fromKey(sport);
+    }
+
+    public void setSportEnum(Sport sportEnum) {
+        this.sportEnum = sportEnum;
+        this.sport = sportEnum != null ? sportEnum.key() : null;
+    }
+
+    @PostLoad
+    private void hydrateSportEnum() {
+        this.sportEnum = Sport.fromKey(this.sport);
+    }
 }
