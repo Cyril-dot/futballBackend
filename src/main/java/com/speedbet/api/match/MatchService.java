@@ -1261,7 +1261,8 @@ public class MatchService {
                                 ? match.getSportEnum()
                                 : Sport.fromKey(match.getSport());
                         existing.setSportEnum(sportEnum);
-                        System.out.println("Updated sport enum: " + sportEnum);
+                        existing.setSport(sportEnum.key()); // ← ADD THIS LINE
+                        log.debug("saveOrUpdate: updated sportEnum={} for externalId={}", sportEnum, existing.getExternalId());
                     }
                     if (isMissing(existing.getHomeLogo())   && !isMissing(match.getHomeLogo()))   existing.setHomeLogo(match.getHomeLogo());
                     if (isMissing(existing.getAwayLogo())   && !isMissing(match.getAwayLogo()))   existing.setAwayLogo(match.getAwayLogo());
