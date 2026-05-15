@@ -503,7 +503,7 @@ public class MmaDataService {
     /** ISO-8601 event date/time string, e.g. "2026-05-10T02:00Z". */
     public static String extractEventDate(Map<String, Object> event) {
         Object dateObj = event.get("date");
-
+        log.info("extractKickoffTime: root date={}", dateObj);
         // Fallback: competitions[0].date
         if (dateObj == null) {
             try {

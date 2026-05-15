@@ -779,6 +779,7 @@ public class EspnFootballDataService {
     public static String extractKickoffTime(Map<String, Object> event) {
         // Try root level first
         Object dateObj = event.get("date");
+        log.info("extractKickoffTime: root date={}", dateObj);
 
         // Fallback: competitions[0].date
         if (dateObj == null) {

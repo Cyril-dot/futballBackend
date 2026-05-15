@@ -122,7 +122,7 @@ public class BaseballDataService {
 
     public static String extractGameDate(Map<String, Object> game) {
         Object dateObj = game.get("date");
-
+        log.info("extractKickoffTime: root date={}", dateObj);
         // Fallback: competitions[0].date
         if (dateObj == null) {
             try {
