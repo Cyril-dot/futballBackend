@@ -43,8 +43,13 @@ public class MatchService {
     // ── Live odds caches ──────────────────────────────────────────────────
     private static final long LIVE_ODDS_TTL_MS = 2 * 60_000L;
 
-    private final ConcurrentHashMap<UUID, OddsCacheEntry> liveOddsCache     = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, OddsCacheEntry> liveHandicapCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, OddsCacheEntry>            liveOddsCache         = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, OddsCacheEntry>            liveHandicapCache     = new ConcurrentHashMap<>();
+
+    // ── Pre-match odds caches (deterministic — no TTL needed) ─────────────
+    // Prevents re-computing 18 handicap lines × 5 bookmakers per match on every request.
+    private final ConcurrentHashMap<UUID, List<Map<String, Object>>> preMatchHandicapCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<UUID, List<Map<String, Object>>> preMatchOddsCache     = new ConcurrentHashMap<>();
 
     private record OddsCacheEntry(List<Map<String, Object>> odds, long expiresAt) {
         boolean isValid() { return System.currentTimeMillis() <= expiresAt; }
@@ -141,6 +146,19 @@ public class MatchService {
                 yield null;
             }
         };
+    }
+
+    // ── Pre-match cache helpers ───────────────────────────────────────────
+
+    /**
+     * Evicts a match from both pre-match caches. Call this after a match
+     * transitions away from UPCOMING/SCHEDULED (e.g. goes LIVE or FINISHED)
+     * so stale odds aren't served.
+     */
+    public void evictPreMatchCache(UUID matchId) {
+        preMatchOddsCache.remove(matchId);
+        preMatchHandicapCache.remove(matchId);
+        log.debug("evictPreMatchCache: evicted matchId={}", matchId);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -470,8 +488,9 @@ public class MatchService {
                             match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
                 }
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-                entry.put("odds", oddsGeneratorService.generatePreMatchOdds(
-                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
+                entry.put("odds", preMatchOddsCache.computeIfAbsent(match.getId(), id ->
+                        oddsGeneratorService.generatePreMatchOdds(
+                                match.getHomeTeam(), match.getAwayTeam(), match.getLeague())));
             } else {
                 entry.put("odds", List.of());
             }
@@ -504,10 +523,17 @@ public class MatchService {
                 entry.put("match_result",   matchResult);
                 entry.put("asian_handicap", asianHandicap);
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-                entry.put("match_result", oddsGeneratorService.generatePreMatchOdds(
-                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-                entry.put("asian_handicap", handicapOddsService.generateHandicapOdds(
-                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
+                // Use pre-match caches: odds are seeded/deterministic so no TTL needed.
+                // computeIfAbsent is thread-safe and prevents redundant generation
+                // across concurrent requests for the same match.
+                List<Map<String, Object>> matchResult = preMatchOddsCache.computeIfAbsent(
+                        match.getId(), id -> oddsGeneratorService.generatePreMatchOdds(
+                                match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
+                List<Map<String, Object>> asianHandicap = preMatchHandicapCache.computeIfAbsent(
+                        match.getId(), id -> handicapOddsService.generateHandicapOdds(
+                                match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
+                entry.put("match_result",   matchResult);
+                entry.put("asian_handicap", asianHandicap);
             } else {
                 entry.put("match_result",   List.of());
                 entry.put("asian_handicap", List.of());
@@ -583,8 +609,9 @@ public class MatchService {
             return generated;
         }
         if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-            return oddsGeneratorService.generatePreMatchOdds(
-                    match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+            return preMatchOddsCache.computeIfAbsent(match.getId(), id2 ->
+                    oddsGeneratorService.generatePreMatchOdds(
+                            match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
         }
         return List.of();
     }
@@ -624,8 +651,9 @@ public class MatchService {
             return generated;
         }
         if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-            return handicapOddsService.generateHandicapOdds(
-                    match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+            return preMatchHandicapCache.computeIfAbsent(match.getId(), id2 ->
+                    handicapOddsService.generateHandicapOdds(
+                            match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
         }
         return List.of();
     }
@@ -1199,6 +1227,11 @@ public class MatchService {
                 .map(existing -> {
                     if (match.getStatus() != null) {
                         if (isPermittedTransition(existing.getStatus(), match.getStatus())) {
+                            // If transitioning out of UPCOMING/SCHEDULED, evict pre-match odds caches
+                            if (("UPCOMING".equals(existing.getStatus()) || "SCHEDULED".equals(existing.getStatus()))
+                                    && !match.getStatus().equals(existing.getStatus())) {
+                                evictPreMatchCache(existing.getId());
+                            }
                             existing.setStatus(match.getStatus());
                         } else {
                             if (warnedDemotions.add(existing.getExternalId())) {
