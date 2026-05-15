@@ -567,6 +567,19 @@ public class NflLiveScorePoller {
      */
     private static Instant parseKickoff(Map<String, Object> game) {
         Object dateObj = game.get("date");
+
+        // Fallback: competitions[0].date
+        if (dateObj == null) {
+            try {
+                List<?> competitions = (List<?>) game.get("competitions");
+                if (competitions != null && !competitions.isEmpty()) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> comp = (Map<String, Object>) competitions.get(0);
+                    dateObj = comp.get("date");
+                }
+            } catch (ClassCastException ignored) {}
+        }
+
         if (dateObj == null) return null;
         try {
             return Instant.parse(dateObj.toString());
@@ -575,7 +588,6 @@ public class NflLiveScorePoller {
             return null;
         }
     }
-
     // ── Diagnostic helpers ────────────────────────────────────────────────
 
     private static String safeTeamName(Optional<Map<String, Object>> competitorOpt) {

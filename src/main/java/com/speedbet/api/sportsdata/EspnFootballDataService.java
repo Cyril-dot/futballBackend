@@ -775,9 +775,23 @@ public class EspnFootballDataService {
         return "";
     }
 
+    @SuppressWarnings("unchecked")
     public static String extractKickoffTime(Map<String, Object> event) {
-        Object date = event.get("date");
-        return date != null ? date.toString() : "";
+        // Try root level first
+        Object dateObj = event.get("date");
+
+        // Fallback: competitions[0].date
+        if (dateObj == null) {
+            try {
+                List<?> competitions = (List<?>) event.get("competitions");
+                if (competitions != null && !competitions.isEmpty()) {
+                    Map<String, Object> comp = (Map<String, Object>) competitions.get(0);
+                    dateObj = comp.get("date");
+                }
+            } catch (ClassCastException ignored) {}
+        }
+
+        return dateObj != null ? dateObj.toString() : null;
     }
 
     @SuppressWarnings("unchecked")

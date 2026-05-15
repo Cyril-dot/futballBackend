@@ -588,8 +588,22 @@ public class BasketballLiveScorePoller {
      * ESPN returns ISO-8601 UTC strings, e.g. "2026-05-14T00:30:00Z".
      * Returns null if the field is absent or cannot be parsed.
      */
+    @SuppressWarnings("unchecked")
     private static Instant parseKickoff(Map<String, Object> game) {
+        // Try root level first
         Object dateObj = game.get("date");
+
+        // Fallback: competitions[0].date
+        if (dateObj == null) {
+            try {
+                List<?> competitions = (List<?>) game.get("competitions");
+                if (competitions != null && !competitions.isEmpty()) {
+                    Map<String, Object> comp = (Map<String, Object>) competitions.get(0);
+                    dateObj = comp.get("date");
+                }
+            } catch (ClassCastException ignored) {}
+        }
+
         if (dateObj == null) return null;
         String dateStr = dateObj.toString().trim();
         if (dateStr.isBlank()) return null;

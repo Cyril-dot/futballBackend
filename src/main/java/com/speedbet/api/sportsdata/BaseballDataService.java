@@ -120,6 +120,24 @@ public class BaseballDataService {
         this.liveScoreApiClient = liveScoreApiClient;
     }
 
+    public static String extractGameDate(Map<String, Object> game) {
+        Object dateObj = game.get("date");
+
+        // Fallback: competitions[0].date
+        if (dateObj == null) {
+            try {
+                List<?> competitions = (List<?>) game.get("competitions");
+                if (competitions != null && !competitions.isEmpty()) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> comp = (Map<String, Object>) competitions.get(0);
+                    dateObj = comp.get("date");
+                }
+            } catch (ClassCastException ignored) {}
+        }
+
+        return dateObj != null ? dateObj.toString() : null;
+    }
+
     // ═════════════════════════════════════════════════════════════════════
     //  SCOREBOARD — TODAY & BY DATE
     // ═════════════════════════════════════════════════════════════════════
@@ -510,11 +528,6 @@ public class BaseballDataService {
         return name != null ? name.toString() : "";
     }
 
-    /** ISO-8601 game date/time string (e.g. "2026-08-15T17:10Z"). */
-    public static String extractGameDate(Map<String, Object> game) {
-        Object date = game.get("date");
-        return date != null ? date.toString() : "";
-    }
 
     /** Raw status.type.state: "pre", "in", or "post". */
     @SuppressWarnings("unchecked")

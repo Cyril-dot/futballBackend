@@ -502,8 +502,21 @@ public class MmaDataService {
 
     /** ISO-8601 event date/time string, e.g. "2026-05-10T02:00Z". */
     public static String extractEventDate(Map<String, Object> event) {
-        Object date = event.get("date");
-        return date != null ? date.toString() : "";
+        Object dateObj = event.get("date");
+
+        // Fallback: competitions[0].date
+        if (dateObj == null) {
+            try {
+                List<?> competitions = (List<?>) event.get("competitions");
+                if (competitions != null && !competitions.isEmpty()) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> comp = (Map<String, Object>) competitions.get(0);
+                    dateObj = comp.get("date");
+                }
+            } catch (ClassCastException ignored) {}
+        }
+
+        return dateObj != null ? dateObj.toString() : null;
     }
 
     /** Raw status.type.state: "pre", "in", or "post". */
