@@ -291,6 +291,190 @@ public class EspnFootballDataService {
         });
     }
 
+    // ── SECTION 1B: ALL-LEAGUES TODAY — LIVE / UPCOMING / FINISHED ────────
+
+    /**
+     * Today's LIVE matches across every league and every cup competition.
+     * Fetches all leagues + all cups, filters to state == "in", deduplicates.
+     */
+    public List<Map<String, Object>> getAllLiveMatchesToday() {
+        return cachedLive("today:all:live", () -> {
+            log.info("ESPN getAllLiveMatchesToday: scanning all leagues + cups for live matches");
+
+            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
+                    .flatMap(l -> getScoreboard(l).stream())
+                    .filter(EspnFootballDataService::isLive)
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
+                    .flatMap(c -> getCupScoreboard(c).stream())
+                    .filter(EspnFootballDataService::isLive)
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> merged = mergeByEventId(
+                    concat(leagueEvents, cupEvents));
+
+            log.info("ESPN getAllLiveMatchesToday: {} live event(s) across all competitions", merged.size());
+            return merged;
+        });
+    }
+
+    /**
+     * Today's UPCOMING (pre-kick-off) matches across every league and every cup competition.
+     * Date = today (current server date). Filters to state == "pre".
+     */
+    public List<Map<String, Object>> getAllUpcomingMatchesToday() {
+        return cachedStd("today:all:upcoming", () -> {
+            log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues + cups");
+
+            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
+                    .flatMap(l -> getScoreboard(l).stream())
+                    .filter(EspnFootballDataService::isUpcoming)
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
+                    .flatMap(c -> getCupScoreboard(c).stream())
+                    .filter(EspnFootballDataService::isUpcoming)
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> merged = mergeByEventId(
+                    concat(leagueEvents, cupEvents));
+
+            log.info("ESPN getAllUpcomingMatchesToday: {} upcoming event(s) across all competitions", merged.size());
+            return merged;
+        });
+    }
+
+    /**
+     * Today's FINISHED matches across every league and every cup competition.
+     * Filters to state == "post".
+     */
+    public List<Map<String, Object>> getAllFinishedMatchesToday() {
+        return cachedStd("today:all:finished", () -> {
+            log.info("ESPN getAllFinishedMatchesToday: scanning all leagues + cups");
+
+            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
+                    .flatMap(l -> getScoreboard(l).stream())
+                    .filter(EspnFootballDataService::isFinished)
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
+                    .flatMap(c -> getCupScoreboard(c).stream())
+                    .filter(EspnFootballDataService::isFinished)
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> merged = mergeByEventId(
+                    concat(leagueEvents, cupEvents));
+
+            log.info("ESPN getAllFinishedMatchesToday: {} finished event(s) across all competitions", merged.size());
+            return merged;
+        });
+    }
+
+    /**
+     * ALL of today's matches (live + upcoming + finished) across every league and cup.
+     * Convenience wrapper that combines the three status buckets without re-fetching
+     * (each bucket is individually cached so this is cheap to call).
+     *
+     * Returns a map with three keys: "live", "upcoming", "finished".
+     */
+    public Map<String, List<Map<String, Object>>> getAllMatchesTodayByStatus() {
+        log.info("ESPN getAllMatchesTodayByStatus: assembling live/upcoming/finished buckets");
+        Map<String, List<Map<String, Object>>> result = new LinkedHashMap<>();
+        result.put("live",     getAllLiveMatchesToday());
+        result.put("upcoming", getAllUpcomingMatchesToday());
+        result.put("finished", getAllFinishedMatchesToday());
+        log.info("ESPN getAllMatchesTodayByStatus: live={}, upcoming={}, finished={}",
+                result.get("live").size(),
+                result.get("upcoming").size(),
+                result.get("finished").size());
+        return result;
+    }
+
+    // ── SECTION 1C: UPCOMING FIXTURES — NEXT 7 DAYS (ALL LEAGUES + CUPS) ──
+
+    /**
+     * All upcoming fixtures across every league and cup for a single future date.
+     * yyyymmdd must be today or later; results are cached with standard TTL.
+     */
+    public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
+        String cacheKey = "upcoming:all:" + yyyymmdd;
+        return cachedStd(cacheKey, () -> {
+            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups", yyyymmdd);
+
+            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
+                    .flatMap(l -> getScoreboardByDate(l, yyyymmdd).stream())
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
+                    .flatMap(c -> getCupScoreboardByDate(c, yyyymmdd).stream())
+                    .collect(Collectors.toList());
+
+            List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
+            log.info("ESPN getAllUpcomingFixturesByDate({}): {} event(s)", yyyymmdd, merged.size());
+            return merged;
+        });
+    }
+
+    /**
+     * All upcoming fixtures across every league and cup for the next {@code days} days,
+     * starting from tomorrow (today is handled by getAllMatchesTodayByStatus / getAllUpcomingMatchesToday).
+     *
+     * Results are grouped by date string (yyyyMMdd) so callers can render a day-by-day schedule.
+     *
+     * @param days number of future days to look ahead (1 = tomorrow only, 7 = next week)
+     * @return LinkedHashMap keyed by date string in chronological order
+     */
+    public Map<String, List<Map<String, Object>>> getUpcomingFixturesNextDays(int days) {
+        String cacheKey = "upcoming:next-" + days + "days";
+        return cachedStd(cacheKey, () -> {
+            log.info("ESPN getUpcomingFixturesNextDays({}): building {}-day fixture list", days, days);
+            Map<String, List<Map<String, Object>>> byDate = new LinkedHashMap<>();
+
+            LocalDate startDate = LocalDate.now();
+            for (int i = 1; i <= days; i++) {
+                String dateStr = formatDate(startDate.plusDays(i));
+                List<Map<String, Object>> fixtures = getAllUpcomingFixturesByDate(dateStr);
+                if (!fixtures.isEmpty()) {
+                    byDate.put(dateStr, fixtures);
+                    log.debug("ESPN getUpcomingFixturesNextDays: date={} → {} fixture(s)", dateStr, fixtures.size());
+                } else {
+                    log.debug("ESPN getUpcomingFixturesNextDays: date={} → no fixtures", dateStr);
+                }
+            }
+
+            int total = byDate.values().stream().mapToInt(List::size).sum();
+            log.info("ESPN getUpcomingFixturesNextDays({}): {} date(s) with fixtures, {} total event(s)",
+                    days, byDate.size(), total);
+            return byDate;
+        });
+    }
+
+    /**
+     * Convenience method — upcoming fixtures for the next 7 days across all leagues and cups,
+     * grouped by date.
+     */
+    public Map<String, List<Map<String, Object>>> getUpcomingFixturesNext7Days() {
+        return getUpcomingFixturesNextDays(7);
+    }
+
+    /**
+     * Flat list of all upcoming fixtures in the next 7 days (all leagues + cups), sorted by date.
+     * Useful when you just want a single ordered list rather than a date-grouped map.
+     */
+    public List<Map<String, Object>> getUpcomingFixturesNext7DaysFlatList() {
+        return cachedStd("upcoming:next7days:flat", () -> {
+            log.info("ESPN getUpcomingFixturesNext7DaysFlatList: building flat list");
+            List<Map<String, Object>> flat = getUpcomingFixturesNext7Days()
+                    .values()
+                    .stream()
+                    .flatMap(Collection::stream)
+                    .collect(Collectors.toList());
+            log.info("ESPN getUpcomingFixturesNext7DaysFlatList: {} total upcoming fixture(s)", flat.size());
+            return flat;
+        });
+    }
+
     // ── SECTION 2: SCOREBOARD — CUP ───────────────────────────────────────
 
     public List<Map<String, Object>> getCupScoreboard(EspnCup cup) {
@@ -372,13 +556,6 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── ADDED: mirrors getTop6UpcomingMatches() but for top6Related cups ──
-
-    /**
-     * Returns upcoming (state == "pre") events across all top6-related cups
-     * (domestic cups + UEFA club competitions).
-     * Used by LiveScorePoller.pollUpcomingFixtures() general sweep [B].
-     */
     public List<Map<String, Object>> getTop6CupsUpcomingMatches() {
         return cachedStd("upcoming:top6cups:all", () -> {
             log.info("ESPN getTop6CupsUpcomingMatches: scanning {} top6-related cups",
@@ -391,8 +568,6 @@ public class EspnFootballDataService {
             return upcoming;
         });
     }
-
-    // ─────────────────────────────────────────────────────────────────────
 
     public List<Map<String, Object>> getUefaCompetitionsTodayMatches() {
         return cachedStd("today:uefa-clubs:all", () -> {
@@ -777,11 +952,9 @@ public class EspnFootballDataService {
 
     @SuppressWarnings("unchecked")
     public static String extractKickoffTime(Map<String, Object> event) {
-        // Try root level first
         Object dateObj = event.get("date");
         log.info("extractKickoffTime: root date={}", dateObj);
 
-        // Fallback: competitions[0].date
         if (dateObj == null) {
             try {
                 List<?> competitions = (List<?>) event.get("competitions");
@@ -1007,6 +1180,14 @@ public class EspnFootballDataService {
             String id = extractEventId(e);
             if (!id.isBlank() && seen.add(id)) result.add(e);
         }
+        return result;
+    }
+
+    /** Null-safe concatenation of two lists into a new ArrayList. */
+    private static <T> List<T> concat(List<T> a, List<T> b) {
+        List<T> result = new ArrayList<>(a.size() + b.size());
+        result.addAll(a);
+        result.addAll(b);
         return result;
     }
 }
