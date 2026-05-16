@@ -9,4 +9,4 @@ WORKDIR /app
 COPY --from=build /app/target/speedbet-api-1.0.0.jar app.jar
 RUN mkdir -p /app/uploads/crash-cards
 EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-Xms512m", "-Xmx1g", "-XX:+ExitOnOutOfMemoryError", "-jar", "app.jar"]
