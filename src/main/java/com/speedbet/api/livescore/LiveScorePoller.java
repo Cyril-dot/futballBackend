@@ -653,8 +653,13 @@ public class LiveScorePoller {
         try {
             return Instant.parse(dateStr);
         } catch (Exception e) {
-            log.debug("parseKickoff: could not parse '{}' — {}", dateStr, e.getMessage());
-            return null;
+            // Handle truncated ISO-8601 missing seconds e.g. "2026-05-17T11:30Z"
+            try {
+                return Instant.parse(dateStr.replace("Z", ":00Z"));
+            } catch (Exception e2) {
+                log.debug("parseKickoff: could not parse '{}' — {}", dateStr, e2.getMessage());
+                return null;
+            }
         }
     }
 }
