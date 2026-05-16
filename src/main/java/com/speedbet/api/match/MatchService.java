@@ -12,8 +12,9 @@ import com.speedbet.api.sportsdata.Top6LeagueTeams;
 import com.speedbet.api.sportsdata.odds.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -22,7 +23,6 @@ import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -35,6 +35,7 @@ public class MatchService {
     private final OddsRepository              oddsRepo;
     private final MistralClient               mistralClient;
     private final EspnFootballDataService     espnFootballDataService;
+    private final CacheManager                cacheManager;
 
     // ── Odds generators ───────────────────────────────────────────────────
     private final OddsGeneratorService        oddsGeneratorService;
@@ -45,13 +46,14 @@ public class MatchService {
 
     // ── Live odds TTL ─────────────────────────────────────────────────────
     private static final long LIVE_ODDS_TTL_MS      = 2 * 60_000L;
-    private static final int  LIVE_ODDS_MAX_ENTRIES  = 100;   // at most 100 concurrent live matches
-    private static final int  PRE_MATCH_MAX_ENTRIES  = 500;   // upcoming matches over 7 days
-    private static final int  PRE_MATCH_TTL_MINUTES  = 60;    // regenerate pre-match odds after 1h
+    private static final int  LIVE_ODDS_MAX_ENTRIES  = 100;
+    private static final int  PRE_MATCH_MAX_ENTRIES  = 500;
+    private static final int  PRE_MATCH_TTL_MINUTES  = 60;
+
+    // ── Max matches to process in withOdds/withAllOdds ────────────────────
+    private static final int  MAX_ODDS_BUNDLE_SIZE   = 50;
 
     // ── Live odds caches (Caffeine — bounded + TTL) ───────────────────────
-    // OddsCacheEntry wraps the odds list with its own expiry so the live 2-min
-    // TTL is enforced at read time even within Caffeine's longer write expiry.
     private final Cache<UUID, OddsCacheEntry> liveOddsCache =
             Caffeine.newBuilder()
                     .maximumSize(LIVE_ODDS_MAX_ENTRIES)
@@ -65,8 +67,6 @@ public class MatchService {
                     .build();
 
     // ── Pre-match odds caches (Caffeine — bounded + TTL) ─────────────────
-    // Deterministic but still evicted after PRE_MATCH_TTL_MINUTES so memory
-    // doesn't fill up between daily fixture changes.
     private final Cache<UUID, List<Map<String, Object>>> preMatchOddsCache =
             Caffeine.newBuilder()
                     .maximumSize(PRE_MATCH_MAX_ENTRIES)
@@ -77,6 +77,13 @@ public class MatchService {
             Caffeine.newBuilder()
                     .maximumSize(PRE_MATCH_MAX_ENTRIES)
                     .expireAfterWrite(PRE_MATCH_TTL_MINUTES, TimeUnit.MINUTES)
+                    .build();
+
+    // ── warnedDemotions: bounded Caffeine cache (prevents unbounded growth) ──
+    private final Cache<String, Boolean> warnedDemotions =
+            Caffeine.newBuilder()
+                    .maximumSize(500)
+                    .expireAfterWrite(15, TimeUnit.MINUTES)
                     .build();
 
     private record OddsCacheEntry(List<Map<String, Object>> odds, long expiresAt) {
@@ -92,11 +99,6 @@ public class MatchService {
             default         -> true;
         };
     }
-
-    // warnedDemotions only holds externalIds of LIVE→FINISHED demotions we've
-    // already logged once; bounded in practice by the number of live matches
-    // (~20 at peak), cleared by LiveScorePoller's stale sweep every 10 minutes.
-    private final Set<String> warnedDemotions = ConcurrentHashMap.newKeySet();
 
     // ── Pre-built display-name sets ───────────────────────────────────────
     private static final Set<String> CUP_NAMES =
@@ -134,6 +136,20 @@ public class MatchService {
     private UUID toUuid(String id) {
         try { return UUID.fromString(id); }
         catch (IllegalArgumentException e) { throw ApiException.notFound("Match not found: " + id); }
+    }
+
+    // ── isToday helper for smart cache eviction ───────────────────────────
+    private static boolean isToday(Match match) {
+        if (match.getKickoffAt() == null) return false;
+        LocalDate today    = LocalDate.now(ZoneOffset.UTC);
+        LocalDate matchDay = match.getKickoffAt().atZone(ZoneOffset.UTC).toLocalDate();
+        return today.equals(matchDay);
+    }
+
+    // ── Safe cache clear helper ───────────────────────────────────────────
+    private void clearCache(String name) {
+        org.springframework.cache.Cache c = cacheManager.getCache(name);
+        if (c != null) c.clear();
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -186,7 +202,7 @@ public class MatchService {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // BASIC QUERIES — delegate to ALL LEAGUES (source of truth)
+    // BASIC QUERIES
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getLiveMatches() {
@@ -214,10 +230,15 @@ public class MatchService {
         return getRecentResultsLimited(20);
     }
 
+    // FIX: uses DB-level Pageable limit instead of loading all then stream-limiting.
+    // FIX: uses new findRecentFinishedBySportAndStatus() JPQL query added to MatchRepository.
     public List<Match> getRecentResultsLimited(int limit) {
         Instant cutoff = Instant.now().minus(72, ChronoUnit.HOURS);
-        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "FINISHED").stream()
-                .filter(m -> m.getKickoffAt() != null && m.getKickoffAt().isAfter(cutoff))
+        List<Match> matches = matchRepo
+                .findRecentFinishedBySportAndStatus(
+                        "football", "FINISHED", cutoff,
+                        PageRequest.of(0, Math.max(limit, 50)))
+                .stream()
                 .limit(limit)
                 .toList();
         log.info("getRecentResults: returning {} FINISHED football match(es) (72h window, cap={})",
@@ -229,6 +250,7 @@ public class MatchService {
     public List<Match> getFeaturedMatches() {
         List<Match> matches = matchRepo.findByFeaturedTrueOrderByKickoffAt().stream()
                 .filter(m -> "football".equalsIgnoreCase(m.getSport()))
+                .limit(50)
                 .toList();
         log.info("getFeaturedMatches: {} featured football match(es)", matches.size());
         return matches;
@@ -244,13 +266,15 @@ public class MatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Match> getAllLeaguesLiveMatches() {
-        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE");
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE")
+                .stream().limit(100).toList();
         log.info("getAllLeaguesLiveMatches: {} LIVE football match(es) across all leagues", matches.size());
         return matches;
     }
 
     public List<Match> getAllLeaguesLiveMatches(String sport) {
-        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt(sport, "LIVE");
+        List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt(sport, "LIVE")
+                .stream().limit(100).toList();
         log.info("getAllLeaguesLiveMatches(sport='{}'): {} LIVE match(es) across all leagues", sport, matches.size());
         return matches;
     }
@@ -258,10 +282,13 @@ public class MatchService {
     public List<Match> getAllLeaguesUpcomingMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS))
-                .stream().sorted(LOGO_THEN_KICKOFF).toList();
+                .stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
         int withLogos    = (int) matches.stream().filter(MatchService::hasLogos).count();
         int withoutLogos = matches.size() - withLogos;
-        log.info("getAllLeaguesUpcomingMatches: {} upcoming football match(es) across all leagues — {} with logos, {} without",
+        log.info("getAllLeaguesUpcomingMatches: {} upcoming football match(es) — {} with logos, {} without",
                 matches.size(), withLogos, withoutLogos);
         return matches;
     }
@@ -269,7 +296,8 @@ public class MatchService {
     public List<Match> getAllLeaguesTodayMatches() {
         Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
         Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
-        List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay);
+        List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay)
+                .stream().limit(200).toList();
         log.info("getAllLeaguesTodayMatches: {} football match(es) today across all leagues", matches.size());
         return matches;
     }
@@ -277,10 +305,13 @@ public class MatchService {
     public List<Match> getAllLeaguesFutureMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS))
-                .stream().sorted(LOGO_THEN_KICKOFF).toList();
+                .stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
+                .toList();
         int withLogos    = (int) matches.stream().filter(MatchService::hasLogos).count();
         int withoutLogos = matches.size() - withLogos;
-        log.info("getAllLeaguesFutureMatches: {} football match(es) next 7 days across all leagues — {} with logos, {} without",
+        log.info("getAllLeaguesFutureMatches: {} football match(es) next 7 days — {} with logos, {} without",
                 matches.size(), withLogos, withoutLogos);
         return matches;
     }
@@ -292,6 +323,7 @@ public class MatchService {
     public List<Match> getTop6LiveMatches() {
         List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
                 .filter(Top6LeagueTeams::isKnownTop6Match)
+                .limit(100)
                 .toList();
         log.info("getTop6LiveMatches: {} LIVE football match(es) in top-6 leagues (team-validated)", matches.size());
         return matches;
@@ -302,6 +334,7 @@ public class MatchService {
         List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
                 .filter(Top6LeagueTeams::isKnownTop6Match)
                 .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
                 .toList();
         log.info("getTop6UpcomingMatches: {} upcoming football match(es) in top-6 leagues (team-validated)", matches.size());
         return matches;
@@ -312,6 +345,7 @@ public class MatchService {
         Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
         List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
                 .filter(Top6LeagueTeams::isKnownTop6Match)
+                .limit(100)
                 .toList();
         log.info("getTop6TodayMatches: {} football match(es) today in top-6 leagues (team-validated)", matches.size());
         return matches;
@@ -324,6 +358,7 @@ public class MatchService {
     public List<Match> getTop6CupsLiveMatches() {
         List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
                 .filter(m -> leagueIn(m, TOP6_CUP_NAMES))
+                .limit(100)
                 .toList();
         log.info("getTop6CupsLiveMatches: {} LIVE football cup match(es)", matches.size());
         return matches;
@@ -334,6 +369,7 @@ public class MatchService {
         List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
                 .filter(m -> leagueIn(m, TOP6_CUP_NAMES))
                 .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
                 .toList();
         log.info("getTop6CupsUpcomingMatches: {} upcoming football cup match(es)", matches.size());
         return matches;
@@ -344,6 +380,7 @@ public class MatchService {
         Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
         List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
                 .filter(m -> leagueIn(m, TOP6_CUP_NAMES))
+                .limit(100)
                 .toList();
         log.info("getTop6CupsTodayMatches: {} football cup match(es) today", matches.size());
         return matches;
@@ -356,6 +393,7 @@ public class MatchService {
     public List<Match> getAllCupsLiveMatches() {
         List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
                 .filter(m -> leagueIn(m, CUP_NAMES))
+                .limit(100)
                 .toList();
         log.info("getAllCupsLiveMatches: {} LIVE football cup match(es) (all cups)", matches.size());
         return matches;
@@ -366,6 +404,7 @@ public class MatchService {
         List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS)).stream()
                 .filter(m -> leagueIn(m, CUP_NAMES))
                 .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
                 .toList();
         log.info("getAllCupsUpcomingMatches: {} upcoming football cup match(es) (all cups)", matches.size());
         return matches;
@@ -376,6 +415,7 @@ public class MatchService {
         Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
         List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
                 .filter(m -> leagueIn(m, CUP_NAMES))
+                .limit(100)
                 .toList();
         log.info("getAllCupsTodayMatches: {} football cup match(es) today (all cups)", matches.size());
         return matches;
@@ -417,6 +457,7 @@ public class MatchService {
         List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
                 .filter(m -> leagueName.equalsIgnoreCase(m.getLeague()))
                 .filter(m -> isTop6LeagueValidatedOrPassThrough(m, leagueName))
+                .limit(100)
                 .toList();
         log.info("getLiveMatchesByLeague: {} LIVE football match(es) for league='{}'", matches.size(), leagueName);
         return matches;
@@ -428,6 +469,7 @@ public class MatchService {
                 .filter(m -> leagueName.equalsIgnoreCase(m.getLeague()))
                 .filter(m -> isTop6LeagueValidatedOrPassThrough(m, leagueName))
                 .sorted(LOGO_THEN_KICKOFF)
+                .limit(200)
                 .toList();
         log.info("getUpcomingMatchesByLeague: {} upcoming football match(es) for league='{}'", matches.size(), leagueName);
         return matches;
@@ -439,6 +481,7 @@ public class MatchService {
         List<Match> matches = matchRepo.findByKickoffBetweenAndSport("football", startOfDay, endOfDay).stream()
                 .filter(m -> leagueName.equalsIgnoreCase(m.getLeague()))
                 .filter(m -> isTop6LeagueValidatedOrPassThrough(m, leagueName))
+                .limit(100)
                 .toList();
         log.info("getTodayMatchesByLeague: {} football match(es) today for league='{}'", matches.size(), leagueName);
         return matches;
@@ -458,6 +501,7 @@ public class MatchService {
         List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE").stream()
                 .filter(m -> teamName.equalsIgnoreCase(m.getHomeTeam())
                         || teamName.equalsIgnoreCase(m.getAwayTeam()))
+                .limit(50)
                 .toList();
         log.info("getLiveMatchesByTeamName: {} LIVE football match(es) for team='{}'", matches.size(), teamName);
         return matches;
@@ -469,6 +513,7 @@ public class MatchService {
                 .filter(m -> teamName.equalsIgnoreCase(m.getHomeTeam())
                         || teamName.equalsIgnoreCase(m.getAwayTeam()))
                 .sorted(LOGO_THEN_KICKOFF)
+                .limit(50)
                 .toList();
         log.info("getUpcomingMatchesByTeamName: {} upcoming football match(es) for team='{}'", matches.size(), teamName);
         return matches;
@@ -480,6 +525,7 @@ public class MatchService {
                 .filter(m -> m.getKickoffAt() != null && m.getKickoffAt().isAfter(cutoff))
                 .filter(m -> teamName.equalsIgnoreCase(m.getHomeTeam())
                         || teamName.equalsIgnoreCase(m.getAwayTeam()))
+                .limit(20)
                 .toList();
         log.info("getRecentResultsByTeamName: {} recent football result(s) for team='{}'", matches.size(), teamName);
         return matches;
@@ -491,8 +537,12 @@ public class MatchService {
 
     public List<Map<String, Object>> withOdds(List<Match> matches) {
         if (matches.isEmpty()) return Collections.emptyList();
-        List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
-        log.debug("withOdds: bundling odds for {} match(es)", sorted.size());
+        List<Match> sorted = matches.stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(MAX_ODDS_BUNDLE_SIZE)
+                .toList();
+        log.debug("withOdds: bundling odds for {} match(es) (input={}, cap={})",
+                sorted.size(), matches.size(), MAX_ODDS_BUNDLE_SIZE);
         List<Map<String, Object>> out = new ArrayList<>(sorted.size());
         for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
@@ -521,8 +571,12 @@ public class MatchService {
 
     public List<Map<String, Object>> withAllOdds(List<Match> matches) {
         if (matches.isEmpty()) return Collections.emptyList();
-        List<Match> sorted = matches.stream().sorted(LOGO_THEN_KICKOFF).toList();
-        log.debug("withAllOdds: bundling all markets for {} match(es)", sorted.size());
+        List<Match> sorted = matches.stream()
+                .sorted(LOGO_THEN_KICKOFF)
+                .limit(MAX_ODDS_BUNDLE_SIZE)
+                .toList();
+        log.debug("withAllOdds: bundling all markets for {} match(es) (input={}, cap={})",
+                sorted.size(), matches.size(), MAX_ODDS_BUNDLE_SIZE);
         List<Map<String, Object>> out = new ArrayList<>(sorted.size());
         for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
@@ -759,26 +813,16 @@ public class MatchService {
     }
 
     public List<Map<String, Object>> getEspnFinishedMatchesByLeague(EspnFootballDataService.EspnLeague league) {
-        return fetchFinishedByEspnLeague(league, league.displayName());
-    }
-
-    private List<Map<String, Object>> fetchFinishedByEspnLeague(
-            EspnFootballDataService.EspnLeague espnLeague, String displayName) {
-        log.info("getEspnFinishedMatchesByLeague: fetching finished events for league='{}'", displayName);
-        List<Map<String, Object>> finished = espnFootballDataService.getFinishedMatches(espnLeague);
-        log.info("getEspnFinishedMatchesByLeague: {} finished event(s) for league='{}'", finished.size(), displayName);
+        log.info("getEspnFinishedMatchesByLeague: fetching finished events for league='{}'", league.displayName());
+        List<Map<String, Object>> finished = espnFootballDataService.getFinishedMatches(league);
+        log.info("getEspnFinishedMatchesByLeague: {} finished event(s) for league='{}'", finished.size(), league.displayName());
         return finished;
     }
 
     public List<Map<String, Object>> getEspnFinishedMatchesByCup(EspnFootballDataService.EspnCup cup) {
-        return fetchFinishedByEspnCup(cup, cup.displayName());
-    }
-
-    private List<Map<String, Object>> fetchFinishedByEspnCup(
-            EspnFootballDataService.EspnCup espnCup, String displayName) {
-        log.info("getEspnFinishedMatchesByCup: fetching finished events for cup='{}'", displayName);
-        List<Map<String, Object>> finished = espnFootballDataService.getCupFinishedMatches(espnCup);
-        log.info("getEspnFinishedMatchesByCup: {} finished event(s) for cup='{}'", finished.size(), displayName);
+        log.info("getEspnFinishedMatchesByCup: fetching finished events for cup='{}'", cup.displayName());
+        List<Map<String, Object>> finished = espnFootballDataService.getCupFinishedMatches(cup);
+        log.info("getEspnFinishedMatchesByCup: {} finished event(s) for cup='{}'", finished.size(), cup.displayName());
         return finished;
     }
 
@@ -788,8 +832,7 @@ public class MatchService {
 
     public Map<String, List<Map<String, Object>>> getEspnAllMatchesTodayByStatus() {
         log.info("getEspnAllMatchesTodayByStatus: fetching all leagues + cups today by status");
-        Map<String, List<Map<String, Object>>> result =
-                espnFootballDataService.getAllMatchesTodayByStatus();
+        Map<String, List<Map<String, Object>>> result = espnFootballDataService.getAllMatchesTodayByStatus();
         log.info("getEspnAllMatchesTodayByStatus: live={}, upcoming={}, finished={}",
                 result.getOrDefault("live",     List.of()).size(),
                 result.getOrDefault("upcoming", List.of()).size(),
@@ -820,8 +863,7 @@ public class MatchService {
 
     public Map<String, List<Map<String, Object>>> getEspnUpcomingFixturesNext7Days() {
         log.info("getEspnUpcomingFixturesNext7Days: fetching all leagues + cups next 7 days");
-        Map<String, List<Map<String, Object>>> byDate =
-                espnFootballDataService.getUpcomingFixturesNext7Days();
+        Map<String, List<Map<String, Object>>> byDate = espnFootballDataService.getUpcomingFixturesNext7Days();
         int total = byDate.values().stream().mapToInt(List::size).sum();
         log.info("getEspnUpcomingFixturesNext7Days: {} date(s), {} total fixture(s)", byDate.size(), total);
         return byDate;
@@ -829,17 +871,15 @@ public class MatchService {
 
     public List<Map<String, Object>> getEspnUpcomingFixturesNext7DaysFlatList() {
         log.info("getEspnUpcomingFixturesNext7DaysFlatList: fetching flat list all leagues + cups");
-        List<Map<String, Object>> fixtures =
-                espnFootballDataService.getUpcomingFixturesNext7DaysFlatList();
+        List<Map<String, Object>> fixtures = espnFootballDataService.getUpcomingFixturesNext7DaysFlatList();
         log.info("getEspnUpcomingFixturesNext7DaysFlatList: {} total fixture(s)", fixtures.size());
         return fixtures;
     }
 
-    public List<Map<String, Object>> getEspnAllFixturesByDate(String yyyymmdd) {
-        log.info("getEspnAllFixturesByDate: fetching all leagues + cups for date='{}'", yyyymmdd);
-        List<Map<String, Object>> fixtures =
-                espnFootballDataService.getAllUpcomingFixturesByDate(yyyymmdd);
-        log.info("getEspnAllFixturesByDate: {} fixture(s) for date='{}'", fixtures.size(), yyyymmdd);
+    public List<Map<String, Object>> getEspnAllFixturesByDate(String dateYmd) {
+        log.info("getEspnAllFixturesByDate: fetching all leagues + cups for date='{}'", dateYmd);
+        List<Map<String, Object>> fixtures = espnFootballDataService.getAllUpcomingFixturesByDate(dateYmd);
+        log.info("getEspnAllFixturesByDate: {} fixture(s) for date='{}'", fixtures.size(), dateYmd);
         return fixtures;
     }
 
@@ -876,19 +916,14 @@ public class MatchService {
     }
 
     public Map<String, Object> getCupMatchDetail(EspnFootballDataService.EspnCup cup, String eventId) {
-        return fetchCupMatchDetail(cup, cup.displayName(), eventId);
-    }
-
-    private Map<String, Object> fetchCupMatchDetail(
-            EspnFootballDataService.EspnCup espnCup, String displayName, String eventId) {
-        log.info("getCupMatchDetail: fetching summary for cup='{}' eventId='{}'", displayName, eventId);
-        Map<String, Object> summary = espnFootballDataService.getCupMatchSummary(espnCup, eventId);
+        log.info("getCupMatchDetail: fetching summary for cup='{}' eventId='{}'", cup.displayName(), eventId);
+        Map<String, Object> summary = espnFootballDataService.getCupMatchSummary(cup, eventId);
         if (summary.isEmpty()) {
-            log.warn("getCupMatchDetail: empty summary for cup='{}' eventId='{}'", displayName, eventId);
+            log.warn("getCupMatchDetail: empty summary for cup='{}' eventId='{}'", cup.displayName(), eventId);
             return Map.of();
         }
-        log.info("getCupMatchDetail: summary fetched for cup='{}' eventId='{}'", displayName, eventId);
-        return Map.of("source", "espn-football", "cup", displayName, "data", summary);
+        log.info("getCupMatchDetail: summary fetched for cup='{}' eventId='{}'", cup.displayName(), eventId);
+        return Map.of("source", "espn-football", "cup", cup.displayName(), "data", summary);
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -998,18 +1033,13 @@ public class MatchService {
             log.warn("getEspnTeamSchedule: no ESPN mapping for league='{}' teamId='{}'", league.displayName(), teamId);
             return Map.of();
         }
-        return fetchTeamSchedule(espnLeague, league.displayName(), teamId);
+        return getEspnTeamSchedule(espnLeague, teamId);
     }
 
     public Map<String, Object> getEspnTeamSchedule(EspnFootballDataService.EspnLeague league, String teamId) {
-        return fetchTeamSchedule(league, league.displayName(), teamId);
-    }
-
-    private Map<String, Object> fetchTeamSchedule(
-            EspnFootballDataService.EspnLeague espnLeague, String displayName, String teamId) {
-        log.info("getEspnTeamSchedule: fetching schedule for teamId='{}' in league='{}'", teamId, displayName);
-        Map<String, Object> schedule = espnFootballDataService.getTeamSchedule(espnLeague, teamId);
-        log.info("getEspnTeamSchedule: schedule data fetched for teamId='{}' league='{}'", teamId, displayName);
+        log.info("getEspnTeamSchedule: fetching schedule for teamId='{}' in league='{}'", teamId, league.displayName());
+        Map<String, Object> schedule = espnFootballDataService.getTeamSchedule(league, teamId);
+        log.info("getEspnTeamSchedule: schedule data fetched for teamId='{}' league='{}'", teamId, league.displayName());
         return schedule;
     }
 
@@ -1064,20 +1094,17 @@ public class MatchService {
     }
 
     public Map<String, Object> getTopScorersByLeague(CompetitionIds.Top6League league) {
-        log.debug("getTopScorersByLeague: top-scorers endpoint not available via ESPN for league='{}'",
-                league.displayName());
+        log.debug("getTopScorersByLeague: top-scorers endpoint not available via ESPN for league='{}'", league.displayName());
         return Map.of();
     }
 
     public Map<String, Object> getTopScorersByLeague(EspnFootballDataService.EspnLeague league) {
-        log.debug("getTopScorersByLeague: top-scorers endpoint not available via ESPN for league='{}'",
-                league.displayName());
+        log.debug("getTopScorersByLeague: top-scorers endpoint not available via ESPN for league='{}'", league.displayName());
         return Map.of();
     }
 
     public Map<String, Object> getTopScorersByLeagueComp(CompetitionIds.LeagueCompetition league) {
-        log.debug("getTopScorersByLeagueComp: top-scorers endpoint not available via ESPN for league='{}'",
-                league.displayName());
+        log.debug("getTopScorersByLeagueComp: top-scorers endpoint not available via ESPN for league='{}'", league.displayName());
         return Map.of();
     }
 
@@ -1166,8 +1193,38 @@ public class MatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
-    @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
     public Match saveOrUpdate(Match match) {
+        // FIX: Only evict caches that are actually affected by this match.
+        // Previously used @CacheEvict on every save, busting todayMatches
+        // on every single fixture update (pollers call this hundreds of times/min).
+        boolean evictToday    = isToday(match);
+        boolean evictFeatured = match.isFeatured(); // FIX: was getFeatured() — Lombok generates isFeatured() for boolean
+
+        Match saved = doSaveOrUpdate(match);
+
+        if (evictToday || evictFeatured) {
+            log.debug("saveOrUpdate: evicting relevant caches for matchId={} today={} featured={}",
+                    saved.getId(), evictToday, evictFeatured);
+            evictMatchCaches(evictToday, evictFeatured);
+        }
+
+        return saved;
+    }
+
+    // FIX: uses CacheManager directly so eviction is conditional and works without
+    // Spring AOP proxy (self-invocation). Removed @CacheEvict annotation.
+    public void evictMatchCaches(boolean evictToday, boolean evictFeatured) {
+        if (evictToday) {
+            clearCache("matches");
+            clearCache("todayMatches");
+            clearCache("futureMatches");
+        }
+        if (evictFeatured) {
+            clearCache("featuredMatches");
+        }
+    }
+
+    private Match doSaveOrUpdate(Match match) {
         if (match.getExternalId() == null || match.getExternalId().isBlank())
             return matchRepo.save(match);
 
@@ -1181,7 +1238,8 @@ public class MatchService {
                             }
                             existing.setStatus(match.getStatus());
                         } else {
-                            if (warnedDemotions.add(existing.getExternalId())) {
+                            if (warnedDemotions.getIfPresent(existing.getExternalId()) == null) {
+                                warnedDemotions.put(existing.getExternalId(), true);
                                 log.warn("saveOrUpdate: blocked status demotion externalId={} {} → {} (keeping {})",
                                         existing.getExternalId(),
                                         existing.getStatus(), match.getStatus(),
@@ -1237,22 +1295,24 @@ public class MatchService {
     }
 
     @Transactional
-    @CacheEvict(value = {"matches", "todayMatches"}, allEntries = true)
     public int finishStaleLiveMatches(Instant cutoff) {
         List<Match> stale = matchRepo.findStaleLiveBySport("football", cutoff);
         if (stale.isEmpty()) return 0;
         log.info("finishStaleLiveMatches: force-finishing {} stale football match(es)", stale.size());
         for (Match m : stale) { m.setStatus("FINISHED"); matchRepo.save(m); }
+        clearCache("matches");
+        clearCache("todayMatches");
         return stale.size();
     }
 
     @Transactional
-    @CacheEvict(value = {"matches", "todayMatches"}, allEntries = true)
     public int finishStaleLiveMatches(Instant cutoff, String sport) {
         List<Match> stale = matchRepo.findStaleLiveBySport(sport, cutoff);
         if (stale.isEmpty()) return 0;
         log.info("finishStaleLiveMatches(sport='{}'): force-finishing {} stale match(es)", sport, stale.size());
         for (Match m : stale) { m.setStatus("FINISHED"); matchRepo.save(m); }
+        clearCache("matches");
+        clearCache("todayMatches");
         return stale.size();
     }
 

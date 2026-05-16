@@ -86,6 +86,19 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
     default List<Match> findByStatusAndSport(Sport sport, String status) {
         return findByStatusAndSport(sport != null ? sport.key() : null, status);
     }
+    // MatchRepository.java
+    @Query("""
+        SELECT m FROM Match m
+        WHERE m.sport = :sport
+          AND m.status = :status
+          AND m.kickoffAt > :cutoff
+        ORDER BY m.kickoffAt DESC
+        """)
+    List<Match> findRecentFinishedBySportAndStatus(
+            @Param("sport")   String  sport,
+            @Param("status")  String  status,
+            @Param("cutoff")  Instant cutoff,
+            Pageable pageable);
 
     // ── Existing sport‑specific methods (remain) ─────────────────────────
 
