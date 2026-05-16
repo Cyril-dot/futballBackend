@@ -1270,16 +1270,9 @@ public class MatchService {
                     if (existing.getSource() == null && match.getSource() != null)                existing.setSource(match.getSource());
 
                     if (match.getKickoffAt() != null) {
-                        boolean existingMissing = existing.getKickoffAt() == null
-                                || !isRealKickoff(existing.getKickoffAt());
-                        boolean incomingReal    = isRealKickoff(match.getKickoffAt());
-                        if (existingMissing && incomingReal) {
-                            log.debug("saveOrUpdate: healing kickoffAt externalId={} old={} new={}",
-                                    existing.getExternalId(), existing.getKickoffAt(), match.getKickoffAt());
-                            existing.setKickoffAt(match.getKickoffAt());
-                        } else if (existing.getKickoffAt() == null) {
-                            existing.setKickoffAt(match.getKickoffAt());
-                        }
+                        log.debug("saveOrUpdate: updating kickoffAt externalId={} old={} new={}",
+                                existing.getExternalId(), existing.getKickoffAt(), match.getKickoffAt());
+                        existing.setKickoffAt(match.getKickoffAt());
                     }
 
                     log.debug("saveOrUpdate: updated externalId={} status='{}' home='{}' away='{}' league='{}' kickoff='{}'",

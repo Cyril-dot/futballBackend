@@ -442,7 +442,8 @@ public class BaseballMatchService {
                     if (existing.getSource() == null && match.getSource() != null)                existing.setSource(match.getSource());
 
                     // ── Kickoff healing — only upgrade to a real timestamp ─
-                    if (match.getKickoffAt() != null && existing.getKickoffAt() == null) {
+                    // ── Kickoff healing — always update when incoming has a value ─
+                    if (match.getKickoffAt() != null) {
                         existing.setKickoffAt(match.getKickoffAt());
                     }
 

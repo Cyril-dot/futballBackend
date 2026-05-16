@@ -152,7 +152,7 @@ public class BaseballDataService {
     public List<Map<String, Object>> getTodayGames() {
         String today = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
         return cached("scoreboard:mlb:today:" + today, () -> {
-            Map<String, Object> response = fetch(MLB_PATH + "/scoreboard");
+            Map<String, Object> response = fetch(MLB_PATH + "/scoreboard?dates=" + today); // ← fix
             if (response == null) return Collections.emptyList();
             List<Map<String, Object>> games = extractEvents(response);
             log.info("getTodayGames: {} game(s) found for {}", games.size(), today);

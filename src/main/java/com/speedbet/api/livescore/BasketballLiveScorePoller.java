@@ -590,11 +590,10 @@ public class BasketballLiveScorePoller {
      */
     @SuppressWarnings("unchecked")
     private static Instant parseKickoff(Map<String, Object> game) {
-        // Try root level first
+        // Try root level first — ESPN puts date here as ISO-8601 UTC e.g. "2026-05-16T01:30Z"
         Object dateObj = game.get("date");
-
-        // Fallback: competitions[0].date
         if (dateObj == null) {
+            // Fallback: competitions[0].date
             try {
                 List<?> competitions = (List<?>) game.get("competitions");
                 if (competitions != null && !competitions.isEmpty()) {
@@ -603,15 +602,19 @@ public class BasketballLiveScorePoller {
                 }
             } catch (ClassCastException ignored) {}
         }
-
         if (dateObj == null) return null;
         String dateStr = dateObj.toString().trim();
         if (dateStr.isBlank()) return null;
         try {
             return Instant.parse(dateStr);
         } catch (Exception e) {
-            log.debug("Basketball parseKickoff: could not parse '{}' — {}", dateStr, e.getMessage());
-            return null;
+            // Handle truncated ISO-8601 missing seconds e.g. "2026-05-16T01:30Z"
+            try {
+                return Instant.parse(dateStr.replace("Z", ":00Z"));
+            } catch (Exception e2) {
+                log.debug("Basketball parseKickoff: could not parse '{}' — {}", dateStr, e2.getMessage());
+                return null;
+            }
         }
     }
 }

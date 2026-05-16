@@ -539,9 +539,14 @@ public class BaseballLiveScorePoller {
         try {
             return Instant.parse(dateStr);
         } catch (Exception e) {
-            log.debug("parseKickoff (MLB): could not parse '{}' for espnId={} — {}",
-                    dateStr, espnId, e.getMessage());
-            return null;
+            // Handle truncated ISO-8601 e.g. "2026-05-16T17:10Z" missing seconds
+            try {
+                return Instant.parse(dateStr.replace("Z", ":00Z"));
+            } catch (Exception e2) {
+                log.debug("parseKickoff (MLB): could not parse '{}' for espnId={} — {}",
+                        dateStr, espnId, e2.getMessage());
+                return null;
+            }
         }
     }
 }
