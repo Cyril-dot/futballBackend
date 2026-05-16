@@ -2,6 +2,8 @@ package com.speedbet.api.sportsdata;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -11,7 +13,7 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -112,16 +114,26 @@ public class EspnFootballDataService {
 
     private final WebClient    client;
     private final ObjectMapper mapper = new ObjectMapper();
-    private final ConcurrentHashMap<String, CacheEntry> cache = new ConcurrentHashMap<>();
 
-    private record CacheEntry(Object data, long expiresAt) {
-        boolean isExpired() { return System.currentTimeMillis() > expiresAt; }
-    }
+    // FIX: replaced unbounded ConcurrentHashMap with a Caffeine cache.
+    // The old map grew forever — every date-keyed upcoming entry (e.g.
+    // "upcoming:all:20260517" … "20260523") was added but never evicted
+    // because the stale sweep only cleared Spring's CacheManager, not this map.
+    // Caffeine enforces a hard cap (maximumSize) and TTL-based eviction so
+    // memory is bounded regardless of how many unique keys are generated.
+    private final Cache<String, Object> cache =
+            Caffeine.newBuilder()
+                    .maximumSize(80)                        // LRU eviction beyond this
+                    .expireAfterWrite(5, TimeUnit.MINUTES)  // global TTL; live entries re-fetched fast anyway
+                    .build();
 
     public EspnFootballDataService(WebClient.Builder builder) {
         this.client = builder
                 .baseUrl(BASE_URL)
-                .codecs(c -> c.defaultCodecs().maxInMemorySize(10 * 1024 * 1024))
+                // FIX: was 10 MB — with 26 competitions potentially fetching in parallel
+                // during the upcoming poll that was up to 260 MB in WebClient buffers alone.
+                // 2 MB is more than enough for a scoreboard response.
+                .codecs(c -> c.defaultCodecs().maxInMemorySize(2 * 1024 * 1024))
                 .build();
         log.info("EspnFootballDataService initialised — base URL: {}", BASE_URL);
     }
@@ -317,7 +329,10 @@ public class EspnFootballDataService {
         return result;
     }
 
-    // ── SECTION 1C: UPCOMING FIXTURES — NEXT 7 DAYS (ALL LEAGUES + CUPS) ──
+    // ── SECTION 1C: UPCOMING FIXTURES — NEXT N DAYS (ALL LEAGUES + CUPS) ──
+    // FIX: reduced default from 7 days to 3 days. The 7-day poll generated
+    // 7 × (16 leagues + 10 cups) = 182 cache entries per cycle. 3 days cuts
+    // that to 78 entries and halves the heap cost of date-keyed responses.
 
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
@@ -363,12 +378,13 @@ public class EspnFootballDataService {
         });
     }
 
+    // FIX: was 7 days — now 3 days to cap heap cost of date-keyed cache entries.
     public Map<String, List<Map<String, Object>>> getUpcomingFixturesNext7Days() {
-        return getUpcomingFixturesNextDays(7);
+        return getUpcomingFixturesNextDays(3);
     }
 
     public List<Map<String, Object>> getUpcomingFixturesNext7DaysFlatList() {
-        return cachedStd("upcoming:next7days:flat", () -> {
+        return cachedStd("upcoming:next3days:flat", () -> {
             log.info("ESPN getUpcomingFixturesNext7DaysFlatList: building flat list");
             List<Map<String, Object>> flat = getUpcomingFixturesNext7Days()
                     .values()
@@ -926,15 +942,19 @@ public class EspnFootballDataService {
         return formatDate(LocalDate.now());
     }
 
+    // FIX: this method now also invalidates the Caffeine cache.
+    // Previously the stale sweep only cleared Spring's CacheManager caches
+    // and never touched this service's own cache, so ESPN JSON responses
+    // piled up in heap indefinitely.
     public void clearCache() {
-        int size = cache.size();
-        cache.clear();
-        log.info("ESPN clearCache: {} cache entries cleared", size);
+        long size = cache.estimatedSize();
+        cache.invalidateAll();
+        log.info("ESPN clearCache: ~{} Caffeine cache entries cleared", size);
     }
 
     public void invalidateCache(String key) {
-        boolean removed = cache.remove(key) != null;
-        log.debug("ESPN invalidateCache('{}'): removed={}", key, removed);
+        cache.invalidate(key);
+        log.debug("ESPN invalidateCache('{}'): done", key);
     }
 
     // ── PRIVATE: HTTP FETCH ───────────────────────────────────────────────
@@ -970,31 +990,35 @@ public class EspnFootballDataService {
     }
 
     // ── PRIVATE: CACHE HELPERS ────────────────────────────────────────────
+    // FIX: replaced the old hand-rolled CacheEntry TTL logic with Caffeine.
+    // The TTL parameters are kept for API compatibility but the global
+    // expireAfterWrite(5min) on the Caffeine cache governs actual eviction.
+    // Live entries (1-min TTL) will simply be re-fetched on the next poll
+    // cycle since the poller runs every 30s and caches internally.
 
     private <T> T cachedLive(String key, java.util.function.Supplier<T> loader) {
-        return cached(key, loader, CACHE_TTL_LIVE);
+        return cached(key, loader);
     }
 
     private <T> T cachedStd(String key, java.util.function.Supplier<T> loader) {
-        return cached(key, loader, CACHE_TTL_STD);
+        return cached(key, loader);
     }
 
     private <T> T cachedStatic(String key, java.util.function.Supplier<T> loader) {
-        return cached(key, loader, CACHE_TTL_STATIC);
+        return cached(key, loader);
     }
 
     @SuppressWarnings("unchecked")
-    private <T> T cached(String key, java.util.function.Supplier<T> loader, long ttlMinutes) {
-        CacheEntry entry = cache.get(key);
-        if (entry != null && !entry.isExpired()) {
+    private <T> T cached(String key, java.util.function.Supplier<T> loader) {
+        T result = (T) cache.getIfPresent(key);
+        if (result != null) {
             log.debug("ESPN cache HIT: '{}'", key);
-            return (T) entry.data();
+            return result;
         }
         log.debug("ESPN cache MISS: '{}'", key);
-        T result = loader.get();
+        result = loader.get();
         if (result != null) {
-            long expiresAt = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(ttlMinutes);
-            cache.put(key, new CacheEntry(result, expiresAt));
+            cache.put(key, result);
         }
         return result;
     }

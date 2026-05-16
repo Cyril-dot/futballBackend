@@ -224,8 +224,6 @@ public class LiveScorePoller {
                 for (Map<String, Object> event : allLive) {
                     String rawId = "espn-" + EspnFootballDataService.extractEventId(event);
 
-                    // FIX: was confirmedFinishedIds.contains(rawId) on a Set —
-                    // now uses Caffeine cache lookup
                     if (confirmedFinishedIds.getIfPresent(rawId) != null) {
                         log.debug("Live poll: skipping confirmed-finished externalId={}", rawId);
                         skipped++;
@@ -238,7 +236,6 @@ public class LiveScorePoller {
                             Match persisted = matchService.saveOrUpdate(m);
 
                             if ("LIVE".equals(m.getStatus()) && "FINISHED".equals(persisted.getStatus())) {
-                                // FIX: was confirmedFinishedIds.add(rawId) on Set
                                 confirmedFinishedIds.put(m.getExternalId(), true);
                                 log.info("Live poll: confirmed-finished suppression added for externalId={} " +
                                                 "— ESPN feed is stuck; will skip until TTL expires.",
@@ -291,11 +288,11 @@ public class LiveScorePoller {
             log.info("Today poll: all-leagues — live={}, upcoming={}, finished={} event(s)",
                     liveToday.size(), upcomingToday.size(), finishedToday.size());
 
-            List<Map<String, Object>> allToday = new ArrayList<>();
-            allToday.addAll(liveToday);
-            allToday.addAll(upcomingToday);
-            allToday.addAll(finishedToday);
-            allToday = deduplicateByEventId(allToday);
+            // FIX: stream directly to avoid three simultaneous lists in heap
+            List<Map<String, Object>> allToday = deduplicateByEventId(
+                    java.util.stream.Stream.of(liveToday, upcomingToday, finishedToday)
+                            .flatMap(Collection::stream)
+                            .collect(java.util.stream.Collectors.toList()));
 
             if (allToday.isEmpty()) {
                 log.info("Today poll: no matches returned.");
@@ -342,17 +339,20 @@ public class LiveScorePoller {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // 3. UPCOMING FIXTURES (next 7 days) — every hour
+    // 3. UPCOMING FIXTURES (next 3 days) — every hour
+    //    FIX: reduced from 7 days to 3 days to cap the number of date-keyed
+    //    ESPN cache entries (was 7 × 26 competitions = 182 entries per cycle).
     //    FIX: previously collected ALL persisted matches into toGenerateOdds
     //    before chunking — so all 234 Match objects sat in heap simultaneously.
     //    Now processes odds inline per chunk so only ODDS_CHUNK_SIZE matches
     //    are live in memory at a time. The accumulator list is gone entirely.
     // ═══════════════════════════════════════════════════════════════════════
 
-    @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
+    @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 5 * 60_000L)
     public void pollUpcomingFixtures() {
         log.info("=== Upcoming fixtures poll starting ===");
         try {
+            // FIX: getUpcomingFixturesNext7Days() now internally calls getUpcomingFixturesNextDays(3)
             Map<String, List<Map<String, Object>>> byDate =
                     espnService.getUpcomingFixturesNext7Days();
 
@@ -424,6 +424,13 @@ public class LiveScorePoller {
                 log.debug("Stale sweep: no stale LIVE matches found.");
             }
 
+            // FIX: also clear the ESPN service's own Caffeine cache.
+            // Previously the sweep only cleared Spring's CacheManager caches and
+            // never touched EspnFootballDataService.cache — so ESPN JSON responses
+            // (including date-keyed upcoming entries) piled up in heap indefinitely.
+            espnService.clearCache();
+            log.info("Stale sweep: cleared ESPN service cache.");
+
             // FIX: Caffeine TTL handles expiry automatically, but we still do
             // an explicit invalidateAll() here to free memory sooner on the
             // sweep cycle rather than waiting for per-entry TTL expiry.
@@ -489,7 +496,6 @@ public class LiveScorePoller {
                 ? persisted.getExternalId()
                 : persisted.getId().toString();
 
-        // FIX: was oddsPersistedIds.contains(key) on an unbounded Set
         if (oddsPersistedIds.getIfPresent(key) != null) {
             log.debug("{}: odds already persisted this cycle for externalId={} — skipping", caller, key);
             return;
@@ -497,7 +503,6 @@ public class LiveScorePoller {
 
         try {
             oddsPersistenceService.generateAndSaveAllOdds(persisted);
-            // FIX: was oddsPersistedIds.add(key) on an unbounded Set
             oddsPersistedIds.put(key, true);
         } catch (Exception oe) {
             log.warn("{}: odds save failed matchId={} — {}", caller, persisted.getId(), oe.getMessage());
