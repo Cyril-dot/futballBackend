@@ -1043,21 +1043,7 @@ public class MatchService {
         return schedule;
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // CACHE MANAGEMENT
-    // ══════════════════════════════════════════════════════════════════════
 
-    public void clearEspnCache() {
-        log.info("clearEspnCache: clearing all ESPN scoreboard/standings cache entries");
-        espnFootballDataService.clearCache();
-        log.info("clearEspnCache: ESPN cache cleared");
-    }
-
-    public void invalidateEspnCacheKey(String key) {
-        log.info("invalidateEspnCacheKey: invalidating ESPN cache key='{}'", key);
-        espnFootballDataService.invalidateCache(key);
-        log.info("invalidateEspnCacheKey: done for key='{}'", key);
-    }
 
     // ══════════════════════════════════════════════════════════════════════
     // STANDINGS / SCORERS

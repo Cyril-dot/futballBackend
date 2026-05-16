@@ -15,8 +15,10 @@ import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 @Service
@@ -49,13 +51,12 @@ public class OddsPersistenceService {
 
         List<Odds> entities = toEntities(allOdds, matchId, home, away);
 
-        // Delete first, flush to DB immediately so the unique constraint
-        // won't fire when we insert the fresh rows in the same transaction.
         oddsRepository.deleteByMatchId(matchId);
         oddsRepository.flush();
-
         oddsRepository.saveAll(entities);
-        log.info("generateAndSaveAllOdds: matchId={} — saved {} odds rows", matchId, entities.size());
+
+        log.info("generateAndSaveAllOdds: matchId={} {} vs {} — saved {} odds rows",
+                matchId, home, away, entities.size());
     }
 
     // ── Live: replaces only 1X2 + asian_handicap rows ────────────────────
@@ -75,11 +76,10 @@ public class OddsPersistenceService {
 
         List<Odds> entities = toEntities(liveOdds, matchId, home, away);
 
-        // Delete the specific markets being replaced, flush before re-inserting.
         oddsRepository.deleteByMatchIdAndMarketIn(matchId, List.of("1X2", "asian_handicap"));
         oddsRepository.flush();
-
         oddsRepository.saveAll(entities);
+
         log.info("generateAndSaveLiveOdds: matchId={} score={}-{} min={} — saved {} rows",
                 matchId, scoreHome, scoreAway, minute, entities.size());
     }
@@ -106,11 +106,13 @@ public class OddsPersistenceService {
                                   String home, String away) {
         Instant now = Instant.now();
         List<Odds> result = new ArrayList<>();
+        // O(1) duplicate check — replaces the O(n²) stream scan
+        Set<String> seen = new HashSet<>();
 
         for (Map<String, Object> o : odds) {
             Object rawOdd = o.get("odd");
             if (rawOdd == null) {
-                log.warn("toEntities: matchId={} skipping row with null odd — selection={}",
+                log.warn("toEntities: matchId={} skipping null odd — selection={}",
                         matchId, o.get("selection"));
                 continue;
             }
@@ -119,12 +121,11 @@ public class OddsPersistenceService {
             try {
                 oddValue = parseOddValue(rawOdd.toString());
             } catch (Exception e) {
-                log.warn("toEntities: matchId={} skipping unparseable odd='{}' selection={} — {}",
+                log.warn("toEntities: matchId={} unparseable odd='{}' selection={} — {}",
                         matchId, rawOdd, o.get("selection"), e.getMessage());
                 continue;
             }
 
-            // Sanity-check: odds below 1.0 are invalid (would imply negative payout)
             if (oddValue.compareTo(BigDecimal.ONE) < 0) {
                 log.warn("toEntities: matchId={} skipping odd={} < 1.0 for selection={}",
                         matchId, oddValue, o.get("selection"));
@@ -134,7 +135,7 @@ public class OddsPersistenceService {
             BigDecimal handicapVal = null;
             if (o.get("handicap") != null) {
                 try {
-                    handicapVal = parseOddValue(o.get("handicap").toString());
+                    handicapVal = parseSpread(o.get("handicap").toString());
                 } catch (Exception e) {
                     log.warn("toEntities: matchId={} could not parse handicap='{}' — setting null",
                             matchId, o.get("handicap"));
@@ -144,14 +145,8 @@ public class OddsPersistenceService {
             String normalizedMarket    = normalizeMarket((String) o.get("market"));
             String normalizedSelection = normalizeSelection((String) o.get("selection"), home, away);
 
-            // Skip duplicate (market, selection) pairs within the same batch —
-            // the last generator to produce a given key wins, but duplicates
-            // within one batch would violate the unique constraint on insert.
-            boolean alreadyInBatch = result.stream().anyMatch(existing ->
-                    existing.getMarket().equals(normalizedMarket) &&
-                            existing.getSelection().equals(normalizedSelection));
-
-            if (alreadyInBatch) {
+            String dedupeKey = normalizedMarket + "|" + normalizedSelection;
+            if (!seen.add(dedupeKey)) {
                 log.debug("toEntities: matchId={} skipping duplicate market={} selection={}",
                         matchId, normalizedMarket, normalizedSelection);
                 continue;
@@ -191,15 +186,30 @@ public class OddsPersistenceService {
             if (denominator.compareTo(BigDecimal.ZERO) == 0) {
                 throw new ArithmeticException("Zero denominator in fractional odd: " + raw);
             }
-            // European decimal = (numerator / denominator) + 1
             return numerator
                     .divide(denominator, MathContext.DECIMAL64)
                     .add(BigDecimal.ONE)
                     .setScale(2, RoundingMode.HALF_UP);
         }
 
-        // Plain decimal or integer
         return new BigDecimal(s);
+    }
+
+    /**
+     * Parses spread/handicap values that may arrive as double-sided strings:
+     *
+     *   "+4/-4"   → BigDecimal("4")   (take the positive side)
+     *   "-3/+3"   → BigDecimal("-3")  (take the first token)
+     *   "+6.5"    → BigDecimal("6.5")
+     *   "-2.5"    → BigDecimal("-2.5")
+     */
+    private BigDecimal parseSpread(String raw) {
+        String s = raw.trim();
+        // Double-sided format e.g. "+4/-4" — take the first token
+        if (s.contains("/")) {
+            s = s.split("/")[0].trim();
+        }
+        return new BigDecimal(s).setScale(2, RoundingMode.HALF_UP);
     }
 
     private String normalizeMarket(String market) {
