@@ -14,6 +14,7 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -24,6 +25,11 @@ public class EspnFootballDataService {
     private static final long   CACHE_TTL_LIVE   = 1;
     private static final long   CACHE_TTL_STD    = 5;
     private static final long   CACHE_TTL_STATIC = 60;
+
+    // ── FIX: Batch size for sequential fan-out fetches.
+    // 5 competitions × 2 MB codec cap = ~10 MB peak WebClient buffer memory,
+    // vs the old parallel approach that hit ~260 MB (26 × 10 MB) at render time.
+    private static final int FETCH_BATCH_SIZE = 5;
 
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
     private static final DateTimeFormatter ESPN_DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
@@ -134,6 +140,53 @@ public class EspnFootballDataService {
                 .codecs(c -> c.defaultCodecs().maxInMemorySize(2 * 1024 * 1024))
                 .build();
         log.info("EspnFootballDataService initialised — base URL: {}", BASE_URL);
+    }
+
+    // ── SECTION 0: BATCHED FETCH HELPER ───────────────────────────────────
+
+    /**
+     * Fetches events for a list of URL path slugs in sequential batches of
+     * {@link #FETCH_BATCH_SIZE}, processing and discarding each batch before
+     * fetching the next.
+     *
+     * <p>This keeps WebClient buffer memory bounded (~10 MB peak for batch=5
+     * with 2 MB codec cap) compared to the old parallel {@code flatMap} streams
+     * that accumulated all responses simultaneously (~260 MB for 26 competitions).
+     *
+     * <p>Each slug is passed to {@code fetcher}, which should call {@link #fetch}
+     * and apply any status filter (live/upcoming/finished). Errors per-slug are
+     * caught and logged so one bad endpoint doesn't abort the whole batch.
+     *
+     * @param slugs   full ESPN path slugs, e.g. {@code "eng.1/scoreboard"}
+     * @param fetcher maps a slug to its list of event maps (may throw)
+     * @return merged list of all events across all batches
+     */
+    private List<Map<String, Object>> fetchBatched(
+            List<String> slugs,
+            Function<String, List<Map<String, Object>>> fetcher) {
+
+        List<Map<String, Object>> result = new ArrayList<>();
+        int total      = slugs.size();
+        int batchCount = (int) Math.ceil((double) total / FETCH_BATCH_SIZE);
+
+        for (int i = 0; i < total; i += FETCH_BATCH_SIZE) {
+            List<String> batch = slugs.subList(i, Math.min(i + FETCH_BATCH_SIZE, total));
+            int batchNum = (i / FETCH_BATCH_SIZE) + 1;
+            log.debug("fetchBatched: batch {}/{} — slugs: {}", batchNum, batchCount, batch);
+
+            for (String slug : batch) {
+                try {
+                    List<Map<String, Object>> events = fetcher.apply(slug);
+                    if (events != null) result.addAll(events);
+                } catch (Exception e) {
+                    log.warn("fetchBatched: error fetching slug='{}' — {}", slug, e.getMessage());
+                }
+            }
+            // Yield between batches so the GC has a chance to reclaim the
+            // previous batch's WebClient buffers before the next wave starts.
+            Thread.yield();
+        }
+        return result;
     }
 
     // ── SECTION 1: SCOREBOARD — LEAGUE ────────────────────────────────────
@@ -247,20 +300,31 @@ public class EspnFootballDataService {
     }
 
     // ── SECTION 1B: ALL-LEAGUES TODAY — LIVE / UPCOMING / FINISHED ────────
+    // FIX: The four methods below previously used parallel flatMap streams that
+    // accumulated all 26 competition responses in WebClient buffers simultaneously
+    // (~260 MB peak). They now use fetchBatched() to process FETCH_BATCH_SIZE
+    // competitions at a time, capping peak buffer memory at ~10 MB.
 
     public List<Map<String, Object>> getAllLiveMatchesToday() {
         return cachedLive("today:all:live", () -> {
-            log.info("ESPN getAllLiveMatchesToday: scanning all leagues + cups for live matches");
+            log.info("ESPN getAllLiveMatchesToday: scanning all leagues + cups for live matches (batched, size={})",
+                    FETCH_BATCH_SIZE);
 
-            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
-                    .flatMap(l -> getScoreboard(l).stream())
-                    .filter(EspnFootballDataService::isLive)
+            List<String> leagueSlugs = Arrays.stream(EspnLeague.values())
+                    .map(l -> l.slug() + "/scoreboard")
                     .collect(Collectors.toList());
+            List<Map<String, Object>> leagueEvents = fetchBatched(leagueSlugs,
+                    slug -> extractEvents(fetch(slug)).stream()
+                            .filter(EspnFootballDataService::isLive)
+                            .collect(Collectors.toList()));
 
-            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
-                    .flatMap(c -> getCupScoreboard(c).stream())
-                    .filter(EspnFootballDataService::isLive)
+            List<String> cupSlugs = Arrays.stream(EspnCup.values())
+                    .map(c -> c.slug() + "/scoreboard")
                     .collect(Collectors.toList());
+            List<Map<String, Object>> cupEvents = fetchBatched(cupSlugs,
+                    slug -> extractEvents(fetch(slug)).stream()
+                            .filter(EspnFootballDataService::isLive)
+                            .collect(Collectors.toList()));
 
             List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
             log.info("ESPN getAllLiveMatchesToday: {} live event(s) across all competitions", merged.size());
@@ -270,17 +334,24 @@ public class EspnFootballDataService {
 
     public List<Map<String, Object>> getAllUpcomingMatchesToday() {
         return cachedStd("today:all:upcoming", () -> {
-            log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues + cups");
+            log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues + cups (batched, size={})",
+                    FETCH_BATCH_SIZE);
 
-            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
-                    .flatMap(l -> getScoreboard(l).stream())
-                    .filter(EspnFootballDataService::isUpcoming)
+            List<String> leagueSlugs = Arrays.stream(EspnLeague.values())
+                    .map(l -> l.slug() + "/scoreboard")
                     .collect(Collectors.toList());
+            List<Map<String, Object>> leagueEvents = fetchBatched(leagueSlugs,
+                    slug -> extractEvents(fetch(slug)).stream()
+                            .filter(EspnFootballDataService::isUpcoming)
+                            .collect(Collectors.toList()));
 
-            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
-                    .flatMap(c -> getCupScoreboard(c).stream())
-                    .filter(EspnFootballDataService::isUpcoming)
+            List<String> cupSlugs = Arrays.stream(EspnCup.values())
+                    .map(c -> c.slug() + "/scoreboard")
                     .collect(Collectors.toList());
+            List<Map<String, Object>> cupEvents = fetchBatched(cupSlugs,
+                    slug -> extractEvents(fetch(slug)).stream()
+                            .filter(EspnFootballDataService::isUpcoming)
+                            .collect(Collectors.toList()));
 
             List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
             log.info("ESPN getAllUpcomingMatchesToday: {} upcoming event(s) across all competitions", merged.size());
@@ -290,17 +361,24 @@ public class EspnFootballDataService {
 
     public List<Map<String, Object>> getAllFinishedMatchesToday() {
         return cachedStd("today:all:finished", () -> {
-            log.info("ESPN getAllFinishedMatchesToday: scanning all leagues + cups");
+            log.info("ESPN getAllFinishedMatchesToday: scanning all leagues + cups (batched, size={})",
+                    FETCH_BATCH_SIZE);
 
-            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
-                    .flatMap(l -> getScoreboard(l).stream())
-                    .filter(EspnFootballDataService::isFinished)
+            List<String> leagueSlugs = Arrays.stream(EspnLeague.values())
+                    .map(l -> l.slug() + "/scoreboard")
                     .collect(Collectors.toList());
+            List<Map<String, Object>> leagueEvents = fetchBatched(leagueSlugs,
+                    slug -> extractEvents(fetch(slug)).stream()
+                            .filter(EspnFootballDataService::isFinished)
+                            .collect(Collectors.toList()));
 
-            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
-                    .flatMap(c -> getCupScoreboard(c).stream())
-                    .filter(EspnFootballDataService::isFinished)
+            List<String> cupSlugs = Arrays.stream(EspnCup.values())
+                    .map(c -> c.slug() + "/scoreboard")
                     .collect(Collectors.toList());
+            List<Map<String, Object>> cupEvents = fetchBatched(cupSlugs,
+                    slug -> extractEvents(fetch(slug)).stream()
+                            .filter(EspnFootballDataService::isFinished)
+                            .collect(Collectors.toList()));
 
             List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
             log.info("ESPN getAllFinishedMatchesToday: {} finished event(s) across all competitions", merged.size());
@@ -324,19 +402,26 @@ public class EspnFootballDataService {
     // ── SECTION 1C: UPCOMING FIXTURES — NEXT N DAYS (ALL LEAGUES + CUPS) ──
     // Window capped at 3 days. The 7-day poll generated 7 × (16 leagues + 10 cups)
     // = 182 cache entries per cycle; 3 days cuts that to 78 and halves heap cost.
+    // FIX: getAllUpcomingFixturesByDate now uses fetchBatched for the same reason
+    // as the "today" methods above — prevents ~260 MB parallel buffer spike.
 
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
         return cachedStd(cacheKey, () -> {
-            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups", yyyymmdd);
+            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups (batched, size={})",
+                    yyyymmdd, FETCH_BATCH_SIZE);
 
-            List<Map<String, Object>> leagueEvents = Arrays.stream(EspnLeague.values())
-                    .flatMap(l -> getScoreboardByDate(l, yyyymmdd).stream())
+            List<String> leagueSlugs = Arrays.stream(EspnLeague.values())
+                    .map(l -> l.slug() + "/scoreboard?dates=" + yyyymmdd)
                     .collect(Collectors.toList());
+            List<Map<String, Object>> leagueEvents = fetchBatched(leagueSlugs,
+                    slug -> extractEvents(fetch(slug)));
 
-            List<Map<String, Object>> cupEvents = Arrays.stream(EspnCup.values())
-                    .flatMap(c -> getCupScoreboardByDate(c, yyyymmdd).stream())
+            List<String> cupSlugs = Arrays.stream(EspnCup.values())
+                    .map(c -> c.slug() + "/scoreboard?dates=" + yyyymmdd)
                     .collect(Collectors.toList());
+            List<Map<String, Object>> cupEvents = fetchBatched(cupSlugs,
+                    slug -> extractEvents(fetch(slug)));
 
             List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
             log.info("ESPN getAllUpcomingFixturesByDate({}): {} event(s)", yyyymmdd, merged.size());
