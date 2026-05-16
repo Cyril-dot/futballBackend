@@ -19,6 +19,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Scheduled poller for MLB baseball.
@@ -27,7 +28,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  *   pollLiveScores()       — every 30 seconds  (live game updates)
  *   pollTodaysGames()      — every 15 minutes  (today's full scoreboard)
- *   pollUpcomingGames()    — every hour         (next 7 days, pre-match)
+ *   pollUpcomingGames()    — every hour         (next 3 days, pre-match)
  *   sweepStaleLiveGames()  — every 10 minutes  (force-finish stale LIVE rows)
  *   refreshLiveOdds()      — every 2 minutes   (in-play moneyline odds)
  *
@@ -56,6 +57,15 @@ import java.util.concurrent.ConcurrentHashMap;
  *   Baseball has no draw — live odds are two-way (HOME / AWAY) only.
  *   {@link MlbOddsPersistenceService} enforces this and silently drops any
  *   DRAW selection.
+ *
+ * ── Memory fixes ─────────────────────────────────────────────────────────
+ *
+ *   - activePollCount guard applied to both live and today polls to prevent
+ *     concurrent execution and double memory usage.
+ *   - pollUpcomingGames fetches one day at a time (3-day window) and nulls
+ *     each day's list before fetching the next, capping peak allocation.
+ *   - Large lists are explicitly nulled after processing to release memory
+ *     before the next cache eviction or ESPN fetch.
  */
 @Slf4j
 @Component
@@ -72,16 +82,22 @@ public class BaseballLiveScorePoller {
      */
     private static final long SIX_HOURS_MS = 6 * 60 * 60_000L;
 
-    private final BaseballDataService      baseballDataService;
-    private final BaseballMatchService     baseballMatchService;
+    // FIX: Reduced from 7 to 3 days — cuts the largest single allocation
+    private static final int UPCOMING_DAYS_WINDOW = 3;
+
+    private final BaseballDataService       baseballDataService;
+    private final BaseballMatchService      baseballMatchService;
     private final MlbOddsPersistenceService mlbOddsPersistenceService;
-    private final CacheManager             cacheManager;
+    private final CacheManager              cacheManager;
 
     /**
      * ESPN event IDs confirmed FINISHED in our DB but still reported LIVE by ESPN.
      * Cleared every 10 minutes by {@link #sweepStaleLiveGames()}.
      */
     private final Set<String> confirmedFinishedIds = ConcurrentHashMap.newKeySet();
+
+    // FIX: Shared re-entrancy guard — prevents live poll and today poll running simultaneously
+    private final AtomicInteger activePollCount = new AtomicInteger(0);
 
     // ═════════════════════════════════════════════════════════════════════
     //  GENUINELY-LIVE GUARD
@@ -95,15 +111,23 @@ public class BaseballLiveScorePoller {
 
     // ═════════════════════════════════════════════════════════════════════
     //  1. LIVE SCORES — every 30 seconds
-    //
-    //   Fetches BaseballDataService.getLiveGames() (always fresh, no cache).
-    //   Each in-progress game is mapped to a Match and saved via
-    //   BaseballMatchService.saveOrUpdate().  Confirmed-finished IDs are
-    //   skipped early; stale LIVE entries are demoted to FINISHED.
     // ═════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 30_000L, initialDelay = 5_000L)
     public void pollLiveScores() {
+        if (activePollCount.get() > 0) {
+            log.warn("MLB live poll: previous poll still running — skipping this tick");
+            return;
+        }
+        activePollCount.incrementAndGet();
+        try {
+            pollLiveScoresInternal();
+        } finally {
+            activePollCount.decrementAndGet();
+        }
+    }
+
+    private void pollLiveScoresInternal() {
         log.debug("=== MLB live score poll starting ===");
         try {
             List<Map<String, Object>> liveGames = baseballDataService.getLiveGames();
@@ -129,7 +153,7 @@ public class BaseballLiveScorePoller {
 
             int updated = 0, skipped = 0, demoted = 0;
             for (Map<String, Object> game : liveGames) {
-                String espnId    = BaseballDataService.extractGameId(game);
+                String espnId     = BaseballDataService.extractGameId(game);
                 String externalId = EXT_ID_PREFIX + espnId;
 
                 if (confirmedFinishedIds.contains(externalId)) {
@@ -163,6 +187,9 @@ public class BaseballLiveScorePoller {
             log.info("MLB live poll: done — live={}, demoted-to-finished={}, skipped={}.",
                     updated, demoted, skipped);
 
+            // FIX: null large list before cache eviction to release memory sooner
+            liveGames = null;
+
             if (demoted > 0) {
                 evictMatchCaches();
                 log.info("MLB live poll: evicted match caches after {} demotion(s).", demoted);
@@ -176,14 +203,25 @@ public class BaseballLiveScorePoller {
 
     // ═════════════════════════════════════════════════════════════════════
     //  2. TODAY'S GAMES — every 15 minutes
-    //
-    //   Fetches BaseballDataService.getTodayGames() (cached by ESPN service).
-    //   Saves all games (pre, live, post) and generates pre-match odds for
-    //   any UPCOMING entries found.
+    //     FIX: guarded by activePollCount to prevent overlap with live poll
     // ═════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 15 * 60_000L, initialDelay = 10_000L)
     public void pollTodaysGames() {
+        // FIX: skip if live poll is still running to prevent memory overlap
+        if (activePollCount.get() > 0) {
+            log.warn("MLB today poll: live poll still running — skipping this tick");
+            return;
+        }
+        activePollCount.incrementAndGet();
+        try {
+            pollTodaysGamesInternal();
+        } finally {
+            activePollCount.decrementAndGet();
+        }
+    }
+
+    private void pollTodaysGamesInternal() {
         log.info("=== MLB today's games poll starting for date={} ===", LocalDate.now());
         try {
             List<Map<String, Object>> todayGames = baseballDataService.getTodayGames();
@@ -223,6 +261,8 @@ public class BaseballLiveScorePoller {
             }
 
             log.info("MLB today poll: done — saved={}, skipped={}.", saved, skipped);
+            // FIX: null large list before cache eviction
+            todayGames = null;
             evictMatchCaches();
 
         } catch (Exception e) {
@@ -232,22 +272,30 @@ public class BaseballLiveScorePoller {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    //  3. UPCOMING GAMES (next 7 days) — every hour
-    //
-    //   Fetches each of the next 7 days via BaseballDataService.getGamesByDate().
-    //   Only future kickoffs (Instant.now() guard) are persisted.
-    //   Pre-match odds are generated immediately for any UPCOMING entries.
+    //  3. UPCOMING GAMES (next 3 days) — every hour
+    //     FIX: window reduced from 7 → 3 days; fetch one day at a time and
+    //     null each day's list before fetching the next to cap peak memory.
     // ═════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
     public void pollUpcomingGames() {
-        log.info("=== MLB upcoming games poll starting ===");
+        log.info("=== MLB upcoming games poll starting ({}d window) ===", UPCOMING_DAYS_WINDOW);
         try {
-            List<String> next7Days = buildNext7DayStrings();
             int saved = 0, skipped = 0;
+            DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyyMMdd");
 
-            for (String yyyymmdd : next7Days) {
-                List<Map<String, Object>> dayGames = baseballDataService.getGamesByDate(yyyymmdd);
+            // FIX: fetch one day at a time; null each batch before fetching the next
+            for (int dayOffset = 1; dayOffset <= UPCOMING_DAYS_WINDOW; dayOffset++) {
+                String yyyymmdd = LocalDate.now().plusDays(dayOffset).format(fmt);
+
+                List<Map<String, Object>> dayGames;
+                try {
+                    dayGames = baseballDataService.getGamesByDate(yyyymmdd);
+                } catch (Exception e) {
+                    log.warn("MLB upcoming poll: failed to fetch date={} — {}", yyyymmdd, e.getMessage());
+                    continue;
+                }
+
                 log.debug("MLB upcoming poll: {} game(s) for date={}", dayGames.size(), yyyymmdd);
 
                 for (Map<String, Object> game : dayGames) {
@@ -277,6 +325,9 @@ public class BaseballLiveScorePoller {
                                 BaseballDataService.extractGameId(game), e.getMessage());
                     }
                 }
+
+                // FIX: explicitly null each day's data before fetching the next
+                dayGames = null;
             }
 
             log.info("MLB upcoming poll: done — saved={}, skipped={}.", saved, skipped);
@@ -290,10 +341,6 @@ public class BaseballLiveScorePoller {
 
     // ═════════════════════════════════════════════════════════════════════
     //  4. STALE LIVE SWEEP — every 10 minutes
-    //
-    //   Force-finishes any baseball LIVE match whose kickoff was more than
-    //   6 hours ago.  Also clears confirmedFinishedIds so corrected ESPN
-    //   feeds are picked up again on the next poll cycle.
     // ═════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 10 * 60_000L, initialDelay = 5 * 60_000L)
@@ -322,9 +369,6 @@ public class BaseballLiveScorePoller {
 
     // ═════════════════════════════════════════════════════════════════════
     //  5. LIVE ODDS REFRESH — every 2 minutes
-    //
-    //   Refreshes both the in-memory live odds cache and the DB rows for all
-    //   currently LIVE baseball matches.  Calls are no-ops when no games are live.
     // ═════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 2 * 60_000L, initialDelay = 15_000L)
@@ -482,9 +526,9 @@ public class BaseballLiveScorePoller {
 
         // ── Metadata — game state for odds generators ─────────────────────
         Map<String, Object> metadata = new LinkedHashMap<>();
-        metadata.put("inning",      BaseballDataService.extractInning(game));
-        metadata.put("inningHalf",  BaseballDataService.extractInningHalf(game));
-        metadata.put("outs",        BaseballDataService.extractOuts(game));
+        metadata.put("inning",       BaseballDataService.extractInning(game));
+        metadata.put("inningHalf",   BaseballDataService.extractInningHalf(game));
+        metadata.put("outs",         BaseballDataService.extractOuts(game));
         metadata.put("statusDetail", BaseballDataService.extractStatusDetail(game));
         String situation = BaseballDataService.extractSituation(game);
         if (!situation.isBlank()) metadata.put("situation", situation);
@@ -514,20 +558,6 @@ public class BaseballLiveScorePoller {
     // ═════════════════════════════════════════════════════════════════════
     //  UTILITY
     // ═════════════════════════════════════════════════════════════════════
-
-    /**
-     * Builds date strings for the next 7 days (including today) in YYYYMMDD
-     * format for {@link BaseballDataService#getGamesByDate(String)}.
-     */
-    private static List<String> buildNext7DayStrings() {
-        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyyMMdd");
-        List<String> dates = new ArrayList<>(7);
-        LocalDate today = LocalDate.now();
-        for (int i = 0; i < 7; i++) {
-            dates.add(today.plusDays(i).format(fmt));
-        }
-        return dates;
-    }
 
     /**
      * Parses an ISO-8601 kickoff string from the ESPN event "date" field.

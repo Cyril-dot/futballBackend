@@ -115,24 +115,22 @@ public class EspnFootballDataService {
     private final WebClient    client;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    // FIX: replaced unbounded ConcurrentHashMap with a Caffeine cache.
-    // The old map grew forever — every date-keyed upcoming entry (e.g.
-    // "upcoming:all:20260517" … "20260523") was added but never evicted
-    // because the stale sweep only cleared Spring's CacheManager, not this map.
-    // Caffeine enforces a hard cap (maximumSize) and TTL-based eviction so
-    // memory is bounded regardless of how many unique keys are generated.
+    // Caffeine cache — bounded at 80 entries with a 5-minute TTL.
+    // Replaces the old unbounded ConcurrentHashMap that grew without bound
+    // as date-keyed upcoming entries (e.g. "upcoming:all:20260517") accumulated
+    // and were never evicted by the stale sweep (which only cleared Spring's
+    // CacheManager, not this map).
     private final Cache<String, Object> cache =
             Caffeine.newBuilder()
-                    .maximumSize(80)                        // LRU eviction beyond this
-                    .expireAfterWrite(5, TimeUnit.MINUTES)  // global TTL; live entries re-fetched fast anyway
+                    .maximumSize(80)
+                    .expireAfterWrite(5, TimeUnit.MINUTES)
                     .build();
 
     public EspnFootballDataService(WebClient.Builder builder) {
         this.client = builder
                 .baseUrl(BASE_URL)
-                // FIX: was 10 MB — with 26 competitions potentially fetching in parallel
-                // during the upcoming poll that was up to 260 MB in WebClient buffers alone.
-                // 2 MB is more than enough for a scoreboard response.
+                // 2 MB per response — was 10 MB, which allowed up to ~260 MB in
+                // WebClient buffers when 26 competitions fetched in parallel.
                 .codecs(c -> c.defaultCodecs().maxInMemorySize(2 * 1024 * 1024))
                 .build();
         log.info("EspnFootballDataService initialised — base URL: {}", BASE_URL);
@@ -264,9 +262,7 @@ public class EspnFootballDataService {
                     .filter(EspnFootballDataService::isLive)
                     .collect(Collectors.toList());
 
-            List<Map<String, Object>> merged = mergeByEventId(
-                    concat(leagueEvents, cupEvents));
-
+            List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
             log.info("ESPN getAllLiveMatchesToday: {} live event(s) across all competitions", merged.size());
             return merged;
         });
@@ -286,9 +282,7 @@ public class EspnFootballDataService {
                     .filter(EspnFootballDataService::isUpcoming)
                     .collect(Collectors.toList());
 
-            List<Map<String, Object>> merged = mergeByEventId(
-                    concat(leagueEvents, cupEvents));
-
+            List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
             log.info("ESPN getAllUpcomingMatchesToday: {} upcoming event(s) across all competitions", merged.size());
             return merged;
         });
@@ -308,9 +302,7 @@ public class EspnFootballDataService {
                     .filter(EspnFootballDataService::isFinished)
                     .collect(Collectors.toList());
 
-            List<Map<String, Object>> merged = mergeByEventId(
-                    concat(leagueEvents, cupEvents));
-
+            List<Map<String, Object>> merged = mergeByEventId(concat(leagueEvents, cupEvents));
             log.info("ESPN getAllFinishedMatchesToday: {} finished event(s) across all competitions", merged.size());
             return merged;
         });
@@ -330,9 +322,8 @@ public class EspnFootballDataService {
     }
 
     // ── SECTION 1C: UPCOMING FIXTURES — NEXT N DAYS (ALL LEAGUES + CUPS) ──
-    // FIX: reduced default from 7 days to 3 days. The 7-day poll generated
-    // 7 × (16 leagues + 10 cups) = 182 cache entries per cycle. 3 days cuts
-    // that to 78 entries and halves the heap cost of date-keyed responses.
+    // Window capped at 3 days. The 7-day poll generated 7 × (16 leagues + 10 cups)
+    // = 182 cache entries per cycle; 3 days cuts that to 78 and halves heap cost.
 
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
@@ -351,6 +342,20 @@ public class EspnFootballDataService {
             log.info("ESPN getAllUpcomingFixturesByDate({}): {} event(s)", yyyymmdd, merged.size());
             return merged;
         });
+    }
+
+    /**
+     * Returns fixtures for a single {@link LocalDate} across all leagues and cups.
+     *
+     * <p>Called by {@link com.speedbet.api.livescore.LiveScorePoller#pollUpcomingFixtures()}
+     * one day at a time so that only one day's worth of event maps is held in memory
+     * at a time (rather than the full multi-day map that the old
+     * {@link #getUpcomingFixturesNext7Days()} call produced).
+     */
+    public List<Map<String, Object>> getFixturesForDate(LocalDate date) {
+        String yyyymmdd = formatDate(date);
+        log.info("ESPN getFixturesForDate({}): delegating to getAllUpcomingFixturesByDate", yyyymmdd);
+        return getAllUpcomingFixturesByDate(yyyymmdd);
     }
 
     public Map<String, List<Map<String, Object>>> getUpcomingFixturesNextDays(int days) {
@@ -378,7 +383,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // FIX: was 7 days — now 3 days to cap heap cost of date-keyed cache entries.
+    /** Kept for backwards compatibility — delegates to the 3-day window. */
     public Map<String, List<Map<String, Object>>> getUpcomingFixturesNext7Days() {
         return getUpcomingFixturesNextDays(3);
     }
@@ -942,10 +947,13 @@ public class EspnFootballDataService {
         return formatDate(LocalDate.now());
     }
 
-    // FIX: this method now also invalidates the Caffeine cache.
-    // Previously the stale sweep only cleared Spring's CacheManager caches
-    // and never touched this service's own cache, so ESPN JSON responses
-    // piled up in heap indefinitely.
+    /**
+     * Clears all Caffeine cache entries.
+     *
+     * <p>Previously the stale sweep only cleared Spring's CacheManager caches
+     * and never touched this service's own internal cache, so ESPN JSON responses
+     * accumulated in the heap indefinitely. This method is now called by the sweep.
+     */
     public void clearCache() {
         long size = cache.estimatedSize();
         cache.invalidateAll();
@@ -990,11 +998,9 @@ public class EspnFootballDataService {
     }
 
     // ── PRIVATE: CACHE HELPERS ────────────────────────────────────────────
-    // FIX: replaced the old hand-rolled CacheEntry TTL logic with Caffeine.
-    // The TTL parameters are kept for API compatibility but the global
-    // expireAfterWrite(5min) on the Caffeine cache governs actual eviction.
-    // Live entries (1-min TTL) will simply be re-fetched on the next poll
-    // cycle since the poller runs every 30s and caches internally.
+    // The TTL parameters (live/std/static) are retained for naming clarity
+    // but the Caffeine cache's global expireAfterWrite(5min) governs actual
+    // eviction. Live entries are refreshed by the 30s poller anyway.
 
     private <T> T cachedLive(String key, java.util.function.Supplier<T> loader) {
         return cached(key, loader);
