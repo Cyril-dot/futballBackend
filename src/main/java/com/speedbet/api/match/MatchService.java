@@ -1,5 +1,7 @@
 package com.speedbet.api.match;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.speedbet.api.ai.MistralClient;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.odds.Odds;
@@ -21,6 +23,7 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -40,15 +43,41 @@ public class MatchService {
     private final HalfTimeOddsService         halfTimeOddsService;
     private final HandicapOddsService         handicapOddsService;
 
-    // ── Live odds caches ──────────────────────────────────────────────────
-    private static final long LIVE_ODDS_TTL_MS = 2 * 60_000L;
+    // ── Live odds TTL ─────────────────────────────────────────────────────
+    private static final long LIVE_ODDS_TTL_MS      = 2 * 60_000L;
+    private static final int  LIVE_ODDS_MAX_ENTRIES  = 100;   // at most 100 concurrent live matches
+    private static final int  PRE_MATCH_MAX_ENTRIES  = 500;   // upcoming matches over 7 days
+    private static final int  PRE_MATCH_TTL_MINUTES  = 60;    // regenerate pre-match odds after 1h
 
-    private final ConcurrentHashMap<UUID, OddsCacheEntry>            liveOddsCache         = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, OddsCacheEntry>            liveHandicapCache     = new ConcurrentHashMap<>();
+    // ── Live odds caches (Caffeine — bounded + TTL) ───────────────────────
+    // OddsCacheEntry wraps the odds list with its own expiry so the live 2-min
+    // TTL is enforced at read time even within Caffeine's longer write expiry.
+    private final Cache<UUID, OddsCacheEntry> liveOddsCache =
+            Caffeine.newBuilder()
+                    .maximumSize(LIVE_ODDS_MAX_ENTRIES)
+                    .expireAfterWrite(LIVE_ODDS_TTL_MS * 2, TimeUnit.MILLISECONDS)
+                    .build();
 
-    // ── Pre-match odds caches (deterministic — no TTL needed) ─────────────
-    private final ConcurrentHashMap<UUID, List<Map<String, Object>>> preMatchHandicapCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<UUID, List<Map<String, Object>>> preMatchOddsCache     = new ConcurrentHashMap<>();
+    private final Cache<UUID, OddsCacheEntry> liveHandicapCache =
+            Caffeine.newBuilder()
+                    .maximumSize(LIVE_ODDS_MAX_ENTRIES)
+                    .expireAfterWrite(LIVE_ODDS_TTL_MS * 2, TimeUnit.MILLISECONDS)
+                    .build();
+
+    // ── Pre-match odds caches (Caffeine — bounded + TTL) ─────────────────
+    // Deterministic but still evicted after PRE_MATCH_TTL_MINUTES so memory
+    // doesn't fill up between daily fixture changes.
+    private final Cache<UUID, List<Map<String, Object>>> preMatchOddsCache =
+            Caffeine.newBuilder()
+                    .maximumSize(PRE_MATCH_MAX_ENTRIES)
+                    .expireAfterWrite(PRE_MATCH_TTL_MINUTES, TimeUnit.MINUTES)
+                    .build();
+
+    private final Cache<UUID, List<Map<String, Object>>> preMatchHandicapCache =
+            Caffeine.newBuilder()
+                    .maximumSize(PRE_MATCH_MAX_ENTRIES)
+                    .expireAfterWrite(PRE_MATCH_TTL_MINUTES, TimeUnit.MINUTES)
+                    .build();
 
     private record OddsCacheEntry(List<Map<String, Object>> odds, long expiresAt) {
         boolean isValid() { return System.currentTimeMillis() <= expiresAt; }
@@ -64,6 +93,9 @@ public class MatchService {
         };
     }
 
+    // warnedDemotions only holds externalIds of LIVE→FINISHED demotions we've
+    // already logged once; bounded in practice by the number of live matches
+    // (~20 at peak), cleared by LiveScorePoller's stale sweep every 10 minutes.
     private final Set<String> warnedDemotions = ConcurrentHashMap.newKeySet();
 
     // ── Pre-built display-name sets ───────────────────────────────────────
@@ -109,7 +141,7 @@ public class MatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     public boolean isOddsCacheValid(UUID matchId) {
-        OddsCacheEntry entry = liveOddsCache.get(matchId);
+        OddsCacheEntry entry = liveOddsCache.getIfPresent(matchId);
         return entry != null && entry.isValid();
     }
 
@@ -120,7 +152,7 @@ public class MatchService {
     }
 
     public boolean isHandicapCacheValid(UUID matchId) {
-        OddsCacheEntry entry = liveHandicapCache.get(matchId);
+        OddsCacheEntry entry = liveHandicapCache.getIfPresent(matchId);
         return entry != null && entry.isValid();
     }
 
@@ -133,11 +165,11 @@ public class MatchService {
     public List<Map<String, Object>> getOddsFromCache(UUID matchId, String market) {
         return switch (market) {
             case "1X2" -> {
-                OddsCacheEntry entry = liveOddsCache.get(matchId);
+                OddsCacheEntry entry = liveOddsCache.getIfPresent(matchId);
                 yield (entry != null && entry.isValid()) ? entry.odds() : null;
             }
             case "asian_handicap" -> {
-                OddsCacheEntry entry = liveHandicapCache.get(matchId);
+                OddsCacheEntry entry = liveHandicapCache.getIfPresent(matchId);
                 yield (entry != null && entry.isValid()) ? entry.odds() : null;
             }
             default -> {
@@ -148,8 +180,8 @@ public class MatchService {
     }
 
     public void evictPreMatchCache(UUID matchId) {
-        preMatchOddsCache.remove(matchId);
-        preMatchHandicapCache.remove(matchId);
+        preMatchOddsCache.invalidate(matchId);
+        preMatchHandicapCache.invalidate(matchId);
         log.debug("evictPreMatchCache: evicted matchId={}", matchId);
     }
 
@@ -209,38 +241,20 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // ALL LEAGUES — DB queries (source of truth)
-    //
-    // The DB is kept in sync by LiveScorePoller:
-    //   • every 30s  → getAllLiveMatchesToday()        (all leagues + cups)
-    //   • every 15m  → getAllMatchesTodayByStatus()    (all leagues + cups)
-    //   • every 1h   → getUpcomingFixturesNext7Days()  (all leagues + cups)
-    //
-    // These methods simply read from the DB — no ESPN calls needed here.
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * All LIVE football matches across every league.
-     * DB is populated by LiveScorePoller every 30s via ESPN all-leagues feed.
-     */
     public List<Match> getAllLeaguesLiveMatches() {
         List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt("football", "LIVE");
         log.info("getAllLeaguesLiveMatches: {} LIVE football match(es) across all leagues", matches.size());
         return matches;
     }
 
-    /**
-     * All LIVE matches for a given sport across every league stored in the DB.
-     */
     public List<Match> getAllLeaguesLiveMatches(String sport) {
         List<Match> matches = matchRepo.findBySportAndStatusOrderByKickoffAt(sport, "LIVE");
         log.info("getAllLeaguesLiveMatches(sport='{}'): {} LIVE match(es) across all leagues", sport, matches.size());
         return matches;
     }
 
-    /**
-     * All UPCOMING football matches (next 7 days) across every league.
-     * DB is populated by LiveScorePoller every 1h via ESPN all-leagues feed.
-     */
     public List<Match> getAllLeaguesUpcomingMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS))
@@ -252,10 +266,6 @@ public class MatchService {
         return matches;
     }
 
-    /**
-     * All football matches today across every league.
-     * DB is populated by LiveScorePoller every 15m via ESPN all-leagues feed.
-     */
     public List<Match> getAllLeaguesTodayMatches() {
         Instant startOfDay = LocalDate.now(ZoneOffset.UTC).atStartOfDay(ZoneOffset.UTC).toInstant();
         Instant endOfDay   = startOfDay.plus(1, ChronoUnit.DAYS);
@@ -264,10 +274,6 @@ public class MatchService {
         return matches;
     }
 
-    /**
-     * All FUTURE football matches (next 7 days) across every league.
-     * DB is populated by LiveScorePoller every 1h via ESPN all-leagues feed.
-     */
     public List<Match> getAllLeaguesFutureMatches() {
         Instant now = Instant.now();
         List<Match> matches = matchRepo.findUpcomingScheduledBySport("football", now, now.plus(7, ChronoUnit.DAYS))
@@ -493,7 +499,7 @@ public class MatchService {
             entry.put("match", match);
             String status = match.getStatus();
             if ("LIVE".equals(status)) {
-                OddsCacheEntry cached = liveOddsCache.get(match.getId());
+                OddsCacheEntry cached = liveOddsCache.getIfPresent(match.getId());
                 if (cached != null && cached.isValid()) {
                     entry.put("odds", cached.odds());
                 } else {
@@ -501,7 +507,7 @@ public class MatchService {
                             match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
                 }
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-                entry.put("odds", preMatchOddsCache.computeIfAbsent(match.getId(), id ->
+                entry.put("odds", preMatchOddsCache.get(match.getId(), id ->
                         oddsGeneratorService.generatePreMatchOdds(
                                 match.getHomeTeam(), match.getAwayTeam(), match.getLeague())));
             } else {
@@ -523,8 +529,8 @@ public class MatchService {
             entry.put("match", match);
             String status = match.getStatus();
             if ("LIVE".equals(status)) {
-                OddsCacheEntry oddsEntry     = liveOddsCache.get(match.getId());
-                OddsCacheEntry handicapEntry = liveHandicapCache.get(match.getId());
+                OddsCacheEntry oddsEntry     = liveOddsCache.getIfPresent(match.getId());
+                OddsCacheEntry handicapEntry = liveHandicapCache.getIfPresent(match.getId());
                 List<Map<String, Object>> matchResult = (oddsEntry != null && oddsEntry.isValid())
                         ? oddsEntry.odds()
                         : oddsGeneratorService.generatePreMatchOdds(
@@ -536,10 +542,10 @@ public class MatchService {
                 entry.put("match_result",   matchResult);
                 entry.put("asian_handicap", asianHandicap);
             } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-                List<Map<String, Object>> matchResult = preMatchOddsCache.computeIfAbsent(
+                List<Map<String, Object>> matchResult = preMatchOddsCache.get(
                         match.getId(), id -> oddsGeneratorService.generatePreMatchOdds(
                                 match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-                List<Map<String, Object>> asianHandicap = preMatchHandicapCache.computeIfAbsent(
+                List<Map<String, Object>> asianHandicap = preMatchHandicapCache.get(
                         match.getId(), id -> handicapOddsService.generateHandicapOdds(
                                 match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
                 entry.put("match_result",   matchResult);
@@ -608,7 +614,7 @@ public class MatchService {
         Match match = getById(id);
         String status = match.getStatus();
         if ("LIVE".equals(status)) {
-            OddsCacheEntry cached = liveOddsCache.get(match.getId());
+            OddsCacheEntry cached = liveOddsCache.getIfPresent(match.getId());
             if (cached != null && cached.isValid()) return cached.odds();
             int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
             int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
@@ -619,7 +625,7 @@ public class MatchService {
             return generated;
         }
         if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-            return preMatchOddsCache.computeIfAbsent(match.getId(), id2 ->
+            return preMatchOddsCache.get(match.getId(), id2 ->
                     oddsGeneratorService.generatePreMatchOdds(
                             match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
         }
@@ -650,7 +656,7 @@ public class MatchService {
         Match match = getById(id);
         String status = match.getStatus();
         if ("LIVE".equals(status)) {
-            OddsCacheEntry cached = liveHandicapCache.get(match.getId());
+            OddsCacheEntry cached = liveHandicapCache.getIfPresent(match.getId());
             if (cached != null && cached.isValid()) return cached.odds();
             int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
             int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
@@ -661,7 +667,7 @@ public class MatchService {
             return generated;
         }
         if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-            return preMatchHandicapCache.computeIfAbsent(match.getId(), id2 ->
+            return preMatchHandicapCache.get(match.getId(), id2 ->
                     handicapOddsService.generateHandicapOdds(
                             match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
         }
@@ -777,13 +783,9 @@ public class MatchService {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // ALL-LEAGUES TODAY / LIVE / UPCOMING (ESPN) — new
+    // ALL-LEAGUES TODAY / LIVE / UPCOMING (ESPN)
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * All of today's matches across every league + cup from ESPN,
-     * split into live / upcoming / finished buckets.
-     */
     public Map<String, List<Map<String, Object>>> getEspnAllMatchesTodayByStatus() {
         log.info("getEspnAllMatchesTodayByStatus: fetching all leagues + cups today by status");
         Map<String, List<Map<String, Object>>> result =
@@ -795,9 +797,6 @@ public class MatchService {
         return result;
     }
 
-    /**
-     * All LIVE matches today across every league + cup from ESPN.
-     */
     public List<Map<String, Object>> getEspnAllLiveMatchesToday() {
         log.info("getEspnAllLiveMatchesToday: fetching all leagues + cups live");
         List<Map<String, Object>> events = espnFootballDataService.getAllLiveMatchesToday();
@@ -805,9 +804,6 @@ public class MatchService {
         return events;
     }
 
-    /**
-     * All UPCOMING matches today across every league + cup from ESPN.
-     */
     public List<Map<String, Object>> getEspnAllUpcomingMatchesToday() {
         log.info("getEspnAllUpcomingMatchesToday: fetching all leagues + cups upcoming today");
         List<Map<String, Object>> events = espnFootballDataService.getAllUpcomingMatchesToday();
@@ -815,9 +811,6 @@ public class MatchService {
         return events;
     }
 
-    /**
-     * All FINISHED matches today across every league + cup from ESPN.
-     */
     public List<Map<String, Object>> getEspnAllFinishedMatchesToday() {
         log.info("getEspnAllFinishedMatchesToday: fetching all leagues + cups finished today");
         List<Map<String, Object>> events = espnFootballDataService.getAllFinishedMatchesToday();
@@ -825,10 +818,6 @@ public class MatchService {
         return events;
     }
 
-    /**
-     * Upcoming fixtures for the next 7 days across every league + cup from ESPN,
-     * grouped by date string (yyyyMMdd).
-     */
     public Map<String, List<Map<String, Object>>> getEspnUpcomingFixturesNext7Days() {
         log.info("getEspnUpcomingFixturesNext7Days: fetching all leagues + cups next 7 days");
         Map<String, List<Map<String, Object>>> byDate =
@@ -838,9 +827,6 @@ public class MatchService {
         return byDate;
     }
 
-    /**
-     * Flat ordered list of all upcoming fixtures in the next 7 days across every league + cup.
-     */
     public List<Map<String, Object>> getEspnUpcomingFixturesNext7DaysFlatList() {
         log.info("getEspnUpcomingFixturesNext7DaysFlatList: fetching flat list all leagues + cups");
         List<Map<String, Object>> fixtures =
@@ -849,9 +835,6 @@ public class MatchService {
         return fixtures;
     }
 
-    /**
-     * All fixtures on a specific date across every league + cup from ESPN.
-     */
     public List<Map<String, Object>> getEspnAllFixturesByDate(String yyyymmdd) {
         log.info("getEspnAllFixturesByDate: fetching all leagues + cups for date='{}'", yyyymmdd);
         List<Map<String, Object>> fixtures =
@@ -859,10 +842,6 @@ public class MatchService {
         log.info("getEspnAllFixturesByDate: {} fixture(s) for date='{}'", fixtures.size(), yyyymmdd);
         return fixtures;
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // ALL-LEAGUES TODAY (ESPN) — existing methods kept for compatibility
-    // ══════════════════════════════════════════════════════════════════════
 
     public List<Map<String, Object>> getEspnAllLeaguesTodayMatches() {
         log.info("getEspnAllLeaguesTodayMatches: fetching today's events from all ESPN leagues");
@@ -918,15 +897,9 @@ public class MatchService {
 
     public Map<String, Object> getEspnMatchOdds(String id) {
         Match match = getById(id);
-        if (match.getExternalId() == null) {
-            log.debug("getEspnMatchOdds: matchId={} has no externalId", id);
-            return Map.of();
-        }
+        if (match.getExternalId() == null) { log.debug("getEspnMatchOdds: matchId={} has no externalId", id); return Map.of(); }
         EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
-        if (league == null) {
-            log.debug("getEspnMatchOdds: no ESPN league resolved for matchId={}", id);
-            return Map.of();
-        }
+        if (league == null) { log.debug("getEspnMatchOdds: no ESPN league resolved for matchId={}", id); return Map.of(); }
         String eventId = stripEspnPrefix(match.getExternalId());
         log.info("getEspnMatchOdds: extracting ESPN odds for matchId={} eventId='{}'", id, eventId);
         Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
@@ -937,15 +910,9 @@ public class MatchService {
 
     public Map<String, List<Map<String, Object>>> getEspnGoalscorerOdds(String id) {
         Match match = getById(id);
-        if (match.getExternalId() == null) {
-            log.debug("getEspnGoalscorerOdds: matchId={} has no externalId", id);
-            return Map.of();
-        }
+        if (match.getExternalId() == null) { log.debug("getEspnGoalscorerOdds: matchId={} has no externalId", id); return Map.of(); }
         EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
-        if (league == null) {
-            log.debug("getEspnGoalscorerOdds: no ESPN league resolved for matchId={}", id);
-            return Map.of();
-        }
+        if (league == null) { log.debug("getEspnGoalscorerOdds: no ESPN league resolved for matchId={}", id); return Map.of(); }
         String eventId = stripEspnPrefix(match.getExternalId());
         log.info("getEspnGoalscorerOdds: extracting goalscorer markets for matchId={} eventId='{}'", id, eventId);
         Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
@@ -956,15 +923,9 @@ public class MatchService {
 
     public List<Map<String, Object>> getEspnRecentForm(String id) {
         Match match = getById(id);
-        if (match.getExternalId() == null) {
-            log.debug("getEspnRecentForm: matchId={} has no externalId", id);
-            return List.of();
-        }
+        if (match.getExternalId() == null) { log.debug("getEspnRecentForm: matchId={} has no externalId", id); return List.of(); }
         EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
-        if (league == null) {
-            log.debug("getEspnRecentForm: no ESPN league resolved for matchId={}", id);
-            return List.of();
-        }
+        if (league == null) { log.debug("getEspnRecentForm: no ESPN league resolved for matchId={}", id); return List.of(); }
         String eventId = stripEspnPrefix(match.getExternalId());
         log.info("getEspnRecentForm: fetching recent form for matchId={} eventId='{}'", id, eventId);
         Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
@@ -975,15 +936,9 @@ public class MatchService {
 
     public List<Map<String, Object>> getEspnMatchNews(String id) {
         Match match = getById(id);
-        if (match.getExternalId() == null) {
-            log.debug("getEspnMatchNews: matchId={} has no externalId", id);
-            return List.of();
-        }
+        if (match.getExternalId() == null) { log.debug("getEspnMatchNews: matchId={} has no externalId", id); return List.of(); }
         EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
-        if (league == null) {
-            log.debug("getEspnMatchNews: no ESPN league resolved for matchId={}", id);
-            return List.of();
-        }
+        if (league == null) { log.debug("getEspnMatchNews: no ESPN league resolved for matchId={}", id); return List.of(); }
         String eventId = stripEspnPrefix(match.getExternalId());
         log.info("getEspnMatchNews: fetching news articles for matchId={} eventId='{}'", id, eventId);
         Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
@@ -994,15 +949,9 @@ public class MatchService {
 
     public List<Map<String, Object>> getEspnMatchVideos(String id) {
         Match match = getById(id);
-        if (match.getExternalId() == null) {
-            log.debug("getEspnMatchVideos: matchId={} has no externalId", id);
-            return List.of();
-        }
+        if (match.getExternalId() == null) { log.debug("getEspnMatchVideos: matchId={} has no externalId", id); return List.of(); }
         EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
-        if (league == null) {
-            log.debug("getEspnMatchVideos: no ESPN league resolved for matchId={}", id);
-            return List.of();
-        }
+        if (league == null) { log.debug("getEspnMatchVideos: no ESPN league resolved for matchId={}", id); return List.of(); }
         String eventId = stripEspnPrefix(match.getExternalId());
         log.info("getEspnMatchVideos: fetching videos for matchId={} eventId='{}'", id, eventId);
         Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
@@ -1013,15 +962,9 @@ public class MatchService {
 
     public String getEspnMatchVenue(String id) {
         Match match = getById(id);
-        if (match.getExternalId() == null) {
-            log.debug("getEspnMatchVenue: matchId={} has no externalId", id);
-            return "";
-        }
+        if (match.getExternalId() == null) { log.debug("getEspnMatchVenue: matchId={} has no externalId", id); return ""; }
         EspnFootballDataService.EspnLeague league = resolveEspnLeague(match);
-        if (league == null) {
-            log.debug("getEspnMatchVenue: no ESPN league resolved for matchId={}", id);
-            return "";
-        }
+        if (league == null) { log.debug("getEspnMatchVenue: no ESPN league resolved for matchId={}", id); return ""; }
         String eventId = stripEspnPrefix(match.getExternalId());
         log.info("getEspnMatchVenue: fetching venue for matchId={} eventId='{}'", id, eventId);
         Map<String, Object> summary = espnFootballDataService.getMatchSummary(league, eventId);
@@ -1043,14 +986,9 @@ public class MatchService {
     }
 
     public Map<String, Object> getEspnTeamsByLeague(EspnFootballDataService.EspnLeague league) {
-        return fetchTeamsByEspnLeague(league, league.displayName());
-    }
-
-    private Map<String, Object> fetchTeamsByEspnLeague(
-            EspnFootballDataService.EspnLeague espnLeague, String displayName) {
-        log.info("getEspnTeamsByLeague: fetching team list for league='{}'", displayName);
-        Map<String, Object> teams = espnFootballDataService.getTeams(espnLeague);
-        log.info("getEspnTeamsByLeague: team data fetched for league='{}'", displayName);
+        log.info("getEspnTeamsByLeague: fetching team list for league='{}'", league.displayName());
+        Map<String, Object> teams = espnFootballDataService.getTeams(league);
+        log.info("getEspnTeamsByLeague: team data fetched for league='{}'", league.displayName());
         return teams;
     }
 
@@ -1147,33 +1085,13 @@ public class MatchService {
     // ESPN FOOTBALL PASS-THROUGH HELPERS
     // ══════════════════════════════════════════════════════════════════════
 
-    public List<Map<String, Object>> getEspnFootballLive() {
-        return espnFootballDataService.getTop6LiveMatches();
-    }
-
-    public List<Map<String, Object>> getEspnFootballToday() {
-        return espnFootballDataService.getTop6TodayMatches();
-    }
-
-    public List<Map<String, Object>> getEspnFootballFixtures() {
-        return espnFootballDataService.getTop6UpcomingMatches();
-    }
-
-    public List<Map<String, Object>> getEspnFootballTop6Live() {
-        return espnFootballDataService.getTop6LiveMatches();
-    }
-
-    public List<Map<String, Object>> getEspnFootballTop6CupsLive() {
-        return espnFootballDataService.getTop6CupsLiveMatches();
-    }
-
-    public List<Map<String, Object>> getEspnFootballTop6Fixtures() {
-        return espnFootballDataService.getTop6UpcomingMatches();
-    }
-
-    public List<Map<String, Object>> getEspnFootballTop6CupFixtures() {
-        return espnFootballDataService.getTop6CupsUpcomingMatches();
-    }
+    public List<Map<String, Object>> getEspnFootballLive()                { return espnFootballDataService.getTop6LiveMatches(); }
+    public List<Map<String, Object>> getEspnFootballToday()               { return espnFootballDataService.getTop6TodayMatches(); }
+    public List<Map<String, Object>> getEspnFootballFixtures()            { return espnFootballDataService.getTop6UpcomingMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6Live()            { return espnFootballDataService.getTop6LiveMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6CupsLive()        { return espnFootballDataService.getTop6CupsLiveMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6Fixtures()        { return espnFootballDataService.getTop6UpcomingMatches(); }
+    public List<Map<String, Object>> getEspnFootballTop6CupFixtures()     { return espnFootballDataService.getTop6CupsUpcomingMatches(); }
 
     public List<Map<String, Object>> getEspnFootballTop6AndCupFixtures() {
         List<Map<String, Object>> combined = new ArrayList<>();
