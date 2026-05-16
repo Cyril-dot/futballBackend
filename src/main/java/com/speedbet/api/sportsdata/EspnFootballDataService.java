@@ -41,56 +41,12 @@ public class EspnFootballDataService {
         EREDIVISIE          ("ned.1",  "Eredivisie",              false),
         PRIMEIRA_LIGA       ("por.1",  "Primeira Liga",           false),
         SCOTTISH_PREM       ("sco.1",  "Scottish Premiership",    false),
-        BELGIAN_PRO         ("bel.1",  "Belgian Pro League",      false),
         TURKISH_SUPER       ("tur.1",  "Turkish Süper Lig",       false),
-        RUSSIAN_PREMIER     ("rus.1",  "Russian Premier League",  false),
-        GREEK_SUPER         ("gre.1",  "Greek Super League",      false),
-        UKRAINIAN_PREMIER   ("ukr.1",  "Ukrainian Premier League",false),
-        AUSTRIAN_BUNDESLIGA ("aut.1",  "Austrian Bundesliga",     false),
-        SWISS_SUPER         ("sui.1",  "Swiss Super League",      false),
-        DANISH_SUPER        ("den.1",  "Danish Superliga",        false),
-        NORWEGIAN_ELITE     ("nor.1",  "Norwegian Eliteserien",   false),
-        SWEDISH_ALLSVENSKAN ("swe.1",  "Swedish Allsvenskan",     false),
-        CZECH_FIRST         ("cze.1",  "Czech First League",      false),
-        POLISH_EKSTRA       ("pol.1",  "Polish Ekstraklasa",      false),
-        ROMANIAN_LIGA1      ("rom.1",  "Romanian Liga 1",         false),
-        CROATIAN_HNL        ("cro.1",  "Croatian HNL",            false),
-        SERBIAN_SUPER       ("srb.1",  "Serbian SuperLiga",       false),
-        ISRAELI_PREMIER     ("isr.1",  "Israeli Premier League",  false),
-        HUNGARIAN_LIGA      ("hun.1",  "Hungarian OTP Bank Liga", false),
-        SLOVAK_SUPER        ("svk.1",  "Slovak Super Liga",       false),
-        SLOVENIAN_PRVA      ("svn.1",  "Slovenian PrvaLiga",      false),
-        BELARUSIAN_PREMIER  ("blr.1",  "Belarusian Premier League",false),
-        KAZAKH_PREMIER      ("kaz.1",  "Kazakh Premier League",   false),
-        FINNISH_VEIKKAUS    ("fin.1",  "Finnish Veikkausliiga",   false),
-        SOUTH_AFRICAN_PREMIER ("rsa.1", "South African Premier Division", false),
-        MOROCCAN_BOTOLA       ("mar.1", "Moroccan Botola Pro",            false),
-        EGYPTIAN_PREMIER      ("egy.1", "Egyptian Premier League",        false),
-        NIGERIAN_PREMIER      ("nga.1", "Nigerian Premier Football League",false),
-        GHANAIAN_PREMIER      ("gha.1", "Ghanaian Premier League",        false),
-        SAUDI_PRO     ("ksa.1", "Saudi Pro League",       false),
-        UAE_PRO       ("uae.1", "UAE Pro League",          false),
-        INDIAN_SUPER  ("ind.1", "Indian Super League",     false),
-        J1_LEAGUE     ("jpn.1", "J1 League",               false),
-        K_LEAGUE_1    ("kor.1", "K League 1",              false),
-        CHINESE_SUPER ("chn.1", "Chinese Super League",    false),
-        THAI_LEAGUE_1 ("tha.1", "Thai League 1",           false),
-        MALAYSIAN_SUPER("mys.1","Malaysian Super League",  false),
-        INDONESIAN_LIGA1("idn.1","Indonesian Liga 1",      false),
-        IRANIAN_PGPL  ("irn.1", "Iranian Persian Gulf Pro League", false),
-        A_LEAGUE      ("aus.1", "A-League",                false),
-        MLS           ("usa.1", "MLS",                     false),
-        LIGA_MX       ("mex.1", "Liga MX",                 false),
-        BRAZILIAN_SERIE_A  ("bra.1", "Brazilian Série A",  false),
-        ARGENTINE_PRIMERA  ("arg.1", "Argentine Primera",  false),
-        COLOMBIAN_PRIMERA  ("col.1", "Colombian Primera A",false),
-        CHILEAN_PRIMERA    ("chi.1", "Chilean Primera División", false),
-        PERUVIAN_LIGA1     ("per.1", "Peruvian Liga 1",    false),
-        ECUADORIAN_SERIE_A ("ecu.1", "Ecuadorian Serie A", false),
-        URUGUAYAN_PRIMERA  ("uru.1", "Uruguayan Primera División", false),
-        VENEZUELAN_PRIMERA ("ven.1", "Venezuelan Primera División", false),
-        BOLIVIAN_DFP       ("bol.1", "Bolivian DFP",       false),
-        PARAGUAYAN_DP      ("par.1", "Paraguayan División Profesional", false);
+        MLS                 ("usa.1",  "MLS",                     false),
+        LIGA_MX             ("mex.1",  "Liga MX",                 false),
+        BRAZILIAN_SERIE_A   ("bra.1",  "Brazilian Série A",       false),
+        ARGENTINE_PRIMERA   ("arg.1",  "Argentine Primera",       false),
+        SAUDI_PRO           ("ksa.1",  "Saudi Pro League",        false);
 
         private final String  slug;
         private final String  displayName;
@@ -111,8 +67,7 @@ public class EspnFootballDataService {
         }
 
         public static List<EspnLeague> african() {
-            return List.of(SOUTH_AFRICAN_PREMIER, MOROCCAN_BOTOLA, EGYPTIAN_PREMIER,
-                    NIGERIAN_PREMIER, GHANAIAN_PREMIER);
+            return List.of();
         }
     }
 
@@ -126,17 +81,7 @@ public class EspnFootballDataService {
         CHAMPIONS_LEAGUE ("uefa.champions_league", "UEFA Champions League",  true),
         EUROPA_LEAGUE    ("uefa.europa",            "UEFA Europa League",     true),
         CONFERENCE_LEAGUE("uefa.europa.conference","UEFA Conference League", true),
-        NATIONS_LEAGUE   ("uefa.nations",           "UEFA Nations League",    false),
-        EUROS            ("uefa.euro",              "UEFA Euros",             false),
-        COPA_LIBERTADORES("conmebol.libertadores",  "Copa Libertadores",      false),
-        COPA_AMERICA     ("conmebol.america",        "Copa América",           false),
-        CONCACAF_CHAMPIONS("concacaf.champions",    "CONCACAF Champions Cup", false),
-        AFC_CHAMPIONS    ("afc.champions",           "AFC Champions League",   false),
-        CAF_CHAMPIONS    ("caf.champions",           "CAF Champions League",   false),
-        AFCON            ("caf.nations",              "Africa Cup of Nations",  false),
-        WORLD_CUP        ("fifa.world",              "FIFA World Cup",          false),
-        WOMENS_WORLD_CUP ("fifa.wwc",                "Women's World Cup",       false),
-        CLUB_WORLD_CUP   ("fifa.cwc",                "FIFA Club World Cup",     false);
+        WORLD_CUP        ("fifa.world",             "FIFA World Cup",         false);
 
         private final String  slug;
         private final String  displayName;
@@ -293,10 +238,6 @@ public class EspnFootballDataService {
 
     // ── SECTION 1B: ALL-LEAGUES TODAY — LIVE / UPCOMING / FINISHED ────────
 
-    /**
-     * Today's LIVE matches across every league and every cup competition.
-     * Fetches all leagues + all cups, filters to state == "in", deduplicates.
-     */
     public List<Map<String, Object>> getAllLiveMatchesToday() {
         return cachedLive("today:all:live", () -> {
             log.info("ESPN getAllLiveMatchesToday: scanning all leagues + cups for live matches");
@@ -319,10 +260,6 @@ public class EspnFootballDataService {
         });
     }
 
-    /**
-     * Today's UPCOMING (pre-kick-off) matches across every league and every cup competition.
-     * Date = today (current server date). Filters to state == "pre".
-     */
     public List<Map<String, Object>> getAllUpcomingMatchesToday() {
         return cachedStd("today:all:upcoming", () -> {
             log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues + cups");
@@ -345,10 +282,6 @@ public class EspnFootballDataService {
         });
     }
 
-    /**
-     * Today's FINISHED matches across every league and every cup competition.
-     * Filters to state == "post".
-     */
     public List<Map<String, Object>> getAllFinishedMatchesToday() {
         return cachedStd("today:all:finished", () -> {
             log.info("ESPN getAllFinishedMatchesToday: scanning all leagues + cups");
@@ -371,13 +304,6 @@ public class EspnFootballDataService {
         });
     }
 
-    /**
-     * ALL of today's matches (live + upcoming + finished) across every league and cup.
-     * Convenience wrapper that combines the three status buckets without re-fetching
-     * (each bucket is individually cached so this is cheap to call).
-     *
-     * Returns a map with three keys: "live", "upcoming", "finished".
-     */
     public Map<String, List<Map<String, Object>>> getAllMatchesTodayByStatus() {
         log.info("ESPN getAllMatchesTodayByStatus: assembling live/upcoming/finished buckets");
         Map<String, List<Map<String, Object>>> result = new LinkedHashMap<>();
@@ -393,10 +319,6 @@ public class EspnFootballDataService {
 
     // ── SECTION 1C: UPCOMING FIXTURES — NEXT 7 DAYS (ALL LEAGUES + CUPS) ──
 
-    /**
-     * All upcoming fixtures across every league and cup for a single future date.
-     * yyyymmdd must be today or later; results are cached with standard TTL.
-     */
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
         return cachedStd(cacheKey, () -> {
@@ -416,15 +338,6 @@ public class EspnFootballDataService {
         });
     }
 
-    /**
-     * All upcoming fixtures across every league and cup for the next {@code days} days,
-     * starting from tomorrow (today is handled by getAllMatchesTodayByStatus / getAllUpcomingMatchesToday).
-     *
-     * Results are grouped by date string (yyyyMMdd) so callers can render a day-by-day schedule.
-     *
-     * @param days number of future days to look ahead (1 = tomorrow only, 7 = next week)
-     * @return LinkedHashMap keyed by date string in chronological order
-     */
     public Map<String, List<Map<String, Object>>> getUpcomingFixturesNextDays(int days) {
         String cacheKey = "upcoming:next-" + days + "days";
         return cachedStd(cacheKey, () -> {
@@ -450,18 +363,10 @@ public class EspnFootballDataService {
         });
     }
 
-    /**
-     * Convenience method — upcoming fixtures for the next 7 days across all leagues and cups,
-     * grouped by date.
-     */
     public Map<String, List<Map<String, Object>>> getUpcomingFixturesNext7Days() {
         return getUpcomingFixturesNextDays(7);
     }
 
-    /**
-     * Flat list of all upcoming fixtures in the next 7 days (all leagues + cups), sorted by date.
-     * Useful when you just want a single ordered list rather than a date-grouped map.
-     */
     public List<Map<String, Object>> getUpcomingFixturesNext7DaysFlatList() {
         return cachedStd("upcoming:next7days:flat", () -> {
             log.info("ESPN getUpcomingFixturesNext7DaysFlatList: building flat list");
@@ -1183,7 +1088,6 @@ public class EspnFootballDataService {
         return result;
     }
 
-    /** Null-safe concatenation of two lists into a new ArrayList. */
     private static <T> List<T> concat(List<T> a, List<T> b) {
         List<T> result = new ArrayList<>(a.size() + b.size());
         result.addAll(a);
