@@ -1,5 +1,7 @@
 package com.speedbet.api.livescore;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.speedbet.api.match.Match;
 import com.speedbet.api.match.MatchService;
 import com.speedbet.api.match.MatchSource;
@@ -10,7 +12,6 @@ import com.speedbet.api.sportsdata.EspnFootballDataService.EspnCup;
 import com.speedbet.api.sportsdata.odds.OddsPersistenceService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -19,7 +20,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
@@ -32,22 +33,38 @@ public class LiveScorePoller {
     private final OddsPersistenceService  oddsPersistenceService;
     private final CacheManager            cacheManager;
 
-    private static final long FOUR_HOURS_MS              = 4 * 60 * 60_000L;
+    private static final long FOUR_HOURS_MS                  = 4 * 60 * 60_000L;
     private static final long SKIP_FINISHED_OLDER_THAN_HOURS = 24;
 
-    // ── Odds persistence chunk size — avoids materialising all 234 matches at once ──
-    private static final int  ODDS_CHUNK_SIZE            = 20;
+    // ── Odds persistence chunk size ───────────────────────────────────────
+    private static final int ODDS_CHUNK_SIZE = 20;
 
     // ── Champions League circuit breaker ──────────────────────────────────
-    private final AtomicInteger clFailureCount    = new AtomicInteger(0);
-    private volatile Instant    clBackoffUntil    = Instant.EPOCH;
-    private static final int    CL_FAILURE_THRESH = 3;
+    private final AtomicInteger clFailureCount  = new AtomicInteger(0);
+    private volatile Instant    clBackoffUntil  = Instant.EPOCH;
+    private static final int    CL_FAILURE_THRESH  = 3;
     private static final long   CL_BACKOFF_MINUTES = 10;
 
-    private final Set<String> confirmedFinishedIds = ConcurrentHashMap.newKeySet();
+    // ── Poll re-entrancy guard — prevents two live polls stacking in memory ──
+    // FIX: if a 30s poll takes >30s (slow ESPN), two polls would overlap and
+    // double heap pressure. This guard skips the tick instead.
+    private final AtomicInteger activePollCount = new AtomicInteger(0);
 
-    // ── Already-persisted-odds guard — avoids regenerating on every hourly sweep ──
-    private final Set<String> oddsPersistedIds = ConcurrentHashMap.newKeySet();
+    // ── FIX: was unbounded ConcurrentHashMap.newKeySet() — grew forever if
+    // the stale sweep crashed and stopped clearing it. Now a bounded Caffeine
+    // cache with a 15-minute TTL so it self-limits even without the sweep. ─
+    private final Cache<String, Boolean> confirmedFinishedIds =
+            Caffeine.newBuilder()
+                    .maximumSize(500)
+                    .expireAfterWrite(15, TimeUnit.MINUTES)
+                    .build();
+
+    // ── FIX: same unbounded growth problem as confirmedFinishedIds. ───────
+    private final Cache<String, Boolean> oddsPersistedIds =
+            Caffeine.newBuilder()
+                    .maximumSize(1000)
+                    .expireAfterWrite(10, TimeUnit.MINUTES)
+                    .build();
 
     private static boolean isGenuinelyLive(Instant kickoffAt) {
         if (kickoffAt == null) return false;
@@ -91,11 +108,6 @@ public class LiveScorePoller {
     // CIRCUIT BREAKER — Champions League (returns 400 repeatedly)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Returns true when the Champions League endpoint is in backoff and should
-     * be skipped. Records a failure and arms the backoff after CL_FAILURE_THRESH
-     * consecutive failures.
-     */
     private boolean isChampionsLeagueBlocked(boolean callFailed) {
         if (callFailed) {
             int failures = clFailureCount.incrementAndGet();
@@ -105,7 +117,6 @@ public class LiveScorePoller {
                         failures, CL_BACKOFF_MINUTES, clBackoffUntil);
             }
         } else {
-            // success — reset
             if (clFailureCount.get() > 0) {
                 log.info("CL circuit breaker: reset after successful call");
                 clFailureCount.set(0);
@@ -121,6 +132,22 @@ public class LiveScorePoller {
 
     @Scheduled(fixedRate = 30_000L, initialDelay = 5_000L)
     public void pollLiveScores() {
+        // FIX: guard against re-entrant execution — if the previous tick is still
+        // running (slow ESPN response), skip this tick entirely rather than
+        // stacking two polls in memory simultaneously.
+        if (activePollCount.get() > 0) {
+            log.warn("Live poll: previous poll still running — skipping this tick");
+            return;
+        }
+        activePollCount.incrementAndGet();
+        try {
+            pollLiveScoresInternal();
+        } finally {
+            activePollCount.decrementAndGet();
+        }
+    }
+
+    private void pollLiveScoresInternal() {
         log.debug("=== Live score poll starting ===");
         try {
             List<Map<String, Object>> allLive = new ArrayList<>(
@@ -132,7 +159,6 @@ public class LiveScorePoller {
                 log.debug("Live poll: primary empty — falling back to per-league/cup calls.");
 
                 for (EspnLeague league : EspnLeague.values()) {
-                    // Skip Champions League if circuit breaker is open
                     if (isChampionsLeagueCup(league) && isChampionsLeagueBlocked(false)) {
                         log.debug("Live poll [fallback]: CL circuit breaker open — skipping {}", league.displayName());
                         continue;
@@ -140,7 +166,7 @@ public class LiveScorePoller {
                     try {
                         List<Map<String, Object>> leagueLive = espnService.getLiveMatches(league);
                         if (isChampionsLeagueCup(league)) {
-                            isChampionsLeagueBlocked(false); // success
+                            isChampionsLeagueBlocked(false);
                         }
                         if (!leagueLive.isEmpty()) {
                             log.debug("Live poll [fallback]: {} live event(s) for {}",
@@ -198,7 +224,9 @@ public class LiveScorePoller {
                 for (Map<String, Object> event : allLive) {
                     String rawId = "espn-" + EspnFootballDataService.extractEventId(event);
 
-                    if (confirmedFinishedIds.contains(rawId)) {
+                    // FIX: was confirmedFinishedIds.contains(rawId) on a Set —
+                    // now uses Caffeine cache lookup
+                    if (confirmedFinishedIds.getIfPresent(rawId) != null) {
                         log.debug("Live poll: skipping confirmed-finished externalId={}", rawId);
                         skipped++;
                         continue;
@@ -210,9 +238,10 @@ public class LiveScorePoller {
                             Match persisted = matchService.saveOrUpdate(m);
 
                             if ("LIVE".equals(m.getStatus()) && "FINISHED".equals(persisted.getStatus())) {
-                                confirmedFinishedIds.add(m.getExternalId());
+                                // FIX: was confirmedFinishedIds.add(rawId) on Set
+                                confirmedFinishedIds.put(m.getExternalId(), true);
                                 log.info("Live poll: confirmed-finished suppression added for externalId={} " +
-                                                "— ESPN feed is stuck; will skip until next stale sweep.",
+                                                "— ESPN feed is stuck; will skip until TTL expires.",
                                         m.getExternalId());
                                 skipped++;
                             } else if ("LIVE".equals(persisted.getStatus())) {
@@ -314,8 +343,10 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 3. UPCOMING FIXTURES (next 7 days) — every hour
-    //    Odds are generated in chunks of ODDS_CHUNK_SIZE to avoid materialising
-    //    all 234 matches simultaneously and exhausting heap.
+    //    FIX: previously collected ALL persisted matches into toGenerateOdds
+    //    before chunking — so all 234 Match objects sat in heap simultaneously.
+    //    Now processes odds inline per chunk so only ODDS_CHUNK_SIZE matches
+    //    are live in memory at a time. The accumulator list is gone entirely.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 30_000L)
@@ -327,9 +358,7 @@ public class LiveScorePoller {
 
             log.info("Upcoming poll: {} date(s) with fixtures across all competitions", byDate.size());
 
-            // Collect all persisted matches first, then chunk odds generation
-            List<Match> toGenerateOdds = new ArrayList<>();
-            int totalSaved = 0, totalSkipped = 0;
+            int totalSaved = 0, totalSkipped = 0, oddsGenerated = 0;
 
             for (Map.Entry<String, List<Map<String, Object>>> entry : byDate.entrySet()) {
                 String dateStr = entry.getKey();
@@ -337,37 +366,34 @@ public class LiveScorePoller {
 
                 log.debug("Upcoming poll: processing {} fixture(s) for date={}", fixtures.size(), dateStr);
 
-                for (Map<String, Object> event : fixtures) {
-                    try {
-                        Match m = mapEspnFixtureToMatch(event);
-                        if (m != null && m.getKickoffAt() != null
-                                && m.getKickoffAt().isAfter(Instant.now())) {
-                            Match persisted = matchService.saveOrUpdate(m);
-                            toGenerateOdds.add(persisted);
-                            totalSaved++;
-                        } else {
-                            log.debug("Upcoming poll: skipping past/null kickoff externalId={}",
-                                    m != null ? m.getExternalId() : "null");
+                // FIX: chunk at the event level — map, save, and persist odds
+                // for ODDS_CHUNK_SIZE fixtures at a time so the previous chunk
+                // can be GC'd before the next one is mapped into heap.
+                List<List<Map<String, Object>>> chunks = partition(fixtures, ODDS_CHUNK_SIZE);
+                for (List<Map<String, Object>> chunk : chunks) {
+                    for (Map<String, Object> event : chunk) {
+                        try {
+                            Match m = mapEspnFixtureToMatch(event);
+                            if (m != null && m.getKickoffAt() != null
+                                    && m.getKickoffAt().isAfter(Instant.now())) {
+                                Match persisted = matchService.saveOrUpdate(m);
+                                persistOddsIfNeeded(persisted, "Upcoming poll");
+                                oddsGenerated++;
+                                totalSaved++;
+                            } else {
+                                log.debug("Upcoming poll: skipping past/null kickoff externalId={}",
+                                        m != null ? m.getExternalId() : "null");
+                                totalSkipped++;
+                            }
+                        } catch (Exception e) {
                             totalSkipped++;
+                            log.warn("Upcoming poll: failed fixture id={} — {}",
+                                    EspnFootballDataService.extractEventId(event), e.getMessage());
                         }
-                    } catch (Exception e) {
-                        totalSkipped++;
-                        log.warn("Upcoming poll: failed fixture id={} — {}",
-                                EspnFootballDataService.extractEventId(event), e.getMessage());
                     }
+                    // Allow GC to reclaim the processed chunk before the next one
+                    Thread.yield();
                 }
-            }
-
-            // Generate odds in chunks so GC can reclaim between batches
-            int oddsGenerated = 0;
-            List<List<Match>> chunks = partition(toGenerateOdds, ODDS_CHUNK_SIZE);
-            for (List<Match> chunk : chunks) {
-                for (Match persisted : chunk) {
-                    persistOddsIfNeeded(persisted, "Upcoming poll");
-                    oddsGenerated++;
-                }
-                // Allow GC to breathe between chunks
-                Thread.yield();
             }
 
             log.info("Upcoming poll: done — saved={}, skipped={}, oddsGenerated={}",
@@ -398,17 +424,19 @@ public class LiveScorePoller {
                 log.debug("Stale sweep: no stale LIVE matches found.");
             }
 
-            if (!confirmedFinishedIds.isEmpty()) {
-                log.info("Stale sweep: clearing {} confirmed-finished suppression id(s).",
-                        confirmedFinishedIds.size());
-                confirmedFinishedIds.clear();
+            // FIX: Caffeine TTL handles expiry automatically, but we still do
+            // an explicit invalidateAll() here to free memory sooner on the
+            // sweep cycle rather than waiting for per-entry TTL expiry.
+            long confirmedSize = confirmedFinishedIds.estimatedSize();
+            if (confirmedSize > 0) {
+                confirmedFinishedIds.invalidateAll();
+                log.info("Stale sweep: cleared ~{} confirmed-finished suppression id(s).", confirmedSize);
             }
 
-            // Periodic cleanup of the odds-persisted guard to allow re-generation
-            // after the daily reset (keep the set from growing without bound).
-            if (!oddsPersistedIds.isEmpty()) {
-                log.debug("Stale sweep: clearing {} oddsPersistedIds guard entries.", oddsPersistedIds.size());
-                oddsPersistedIds.clear();
+            long oddsSize = oddsPersistedIds.estimatedSize();
+            if (oddsSize > 0) {
+                oddsPersistedIds.invalidateAll();
+                log.debug("Stale sweep: cleared ~{} oddsPersistedIds guard entries.", oddsSize);
             }
 
         } catch (Exception e) {
@@ -453,28 +481,24 @@ public class LiveScorePoller {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // ODDS PERSISTENCE HELPER — skip if already done this sweep cycle
+    // ODDS PERSISTENCE HELPER
     // ═══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Generates and persists odds for a match only if we haven't already done
-     * so in the current sweep cycle. The oddsPersistedIds set is cleared every
-     * 10 minutes by sweepStaleLiveMatches so odds are refreshed periodically
-     * without being regenerated on every poll.
-     */
     private void persistOddsIfNeeded(Match persisted, String caller) {
         String key = persisted.getExternalId() != null
                 ? persisted.getExternalId()
                 : persisted.getId().toString();
 
-        if (oddsPersistedIds.contains(key)) {
+        // FIX: was oddsPersistedIds.contains(key) on an unbounded Set
+        if (oddsPersistedIds.getIfPresent(key) != null) {
             log.debug("{}: odds already persisted this cycle for externalId={} — skipping", caller, key);
             return;
         }
 
         try {
             oddsPersistenceService.generateAndSaveAllOdds(persisted);
-            oddsPersistedIds.add(key);
+            // FIX: was oddsPersistedIds.add(key) on an unbounded Set
+            oddsPersistedIds.put(key, true);
         } catch (Exception oe) {
             log.warn("{}: odds save failed matchId={} — {}", caller, persisted.getId(), oe.getMessage());
         }
@@ -488,7 +512,7 @@ public class LiveScorePoller {
         List<String> names = List.of("matches", "futureMatches");
         int cleared = 0;
         for (String name : names) {
-            Cache cache = cacheManager.getCache(name);
+            org.springframework.cache.Cache cache = cacheManager.getCache(name);
             if (cache != null) { cache.clear(); cleared++; }
         }
         log.info("evictUpcomingCaches: {}/{} caches cleared.", cleared, names.size());
@@ -498,7 +522,7 @@ public class LiveScorePoller {
         List<String> names = List.of("matches", "todayMatches", "futureMatches", "featuredMatches");
         int cleared = 0;
         for (String name : names) {
-            Cache cache = cacheManager.getCache(name);
+            org.springframework.cache.Cache cache = cacheManager.getCache(name);
             log.debug("evictMatchCaches: cache='{}' found={}", name, cache != null);
             if (cache != null) { cache.clear(); cleared++; }
         }
@@ -521,9 +545,6 @@ public class LiveScorePoller {
         return result;
     }
 
-    /**
-     * Splits a list into consecutive sublists of at most {@code size} elements.
-     */
     private static <T> List<List<T>> partition(List<T> list, int size) {
         List<List<T>> parts = new ArrayList<>();
         for (int i = 0; i < list.size(); i += size) {
@@ -532,10 +553,6 @@ public class LiveScorePoller {
         return parts;
     }
 
-    /**
-     * Returns true when the given league or cup is the UEFA Champions League
-     * endpoint that repeatedly returns 400.
-     */
     private static boolean isChampionsLeagueCup(EspnLeague league) {
         return league.displayName().toLowerCase().contains("champions league");
     }
