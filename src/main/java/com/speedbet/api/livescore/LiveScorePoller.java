@@ -35,10 +35,7 @@ public class LiveScorePoller {
 
     private static final long FOUR_HOURS_MS                  = 4 * 60 * 60_000L;
     private static final long SKIP_FINISHED_OLDER_THAN_HOURS = 24;
-    private static final int  ODDS_CHUNK_SIZE                 = 20;
-
-    // ── FIX: Reduce upcoming window from 7 to 3 days ─────────────────────
-    private static final int  UPCOMING_DAYS_WINDOW = 3;
+    private static final int  UPCOMING_DAYS_WINDOW            = 3;
 
     // ── Champions League circuit breaker ──────────────────────────────────
     private final AtomicInteger clFailureCount = new AtomicInteger(0);
@@ -46,21 +43,30 @@ public class LiveScorePoller {
     private static final int    CL_FAILURE_THRESH  = 3;
     private static final long   CL_BACKOFF_MINUTES = 10;
 
-    // ── FIX: Shared re-entrancy guard (live + today polls) ────────────────
+    // ── Shared re-entrancy guard (live + today + upcoming polls) ──────────
     private final AtomicInteger activePollCount = new AtomicInteger(0);
 
-    // ── Bounded Caffeine caches (self-limiting even if sweep crashes) ─────
+    // ── confirmedFinishedIds: tracks matches we know are done this cycle ───
     private final Cache<String, Boolean> confirmedFinishedIds =
             Caffeine.newBuilder()
                     .maximumSize(500)
                     .expireAfterWrite(15, TimeUnit.MINUTES)
                     .build();
 
+    // ── oddsPersistedIds: 5-min TTL so the next poll cycle retries odds
+    //    quickly after a failed or missing attempt, while still preventing
+    //    redundant saves within the same 15-min today-poll window.
+    //    Do NOT clear this in the stale sweep — doing so was the root cause
+    //    of upcoming matches losing their odds between poll cycles.
     private final Cache<String, Boolean> oddsPersistedIds =
             Caffeine.newBuilder()
                     .maximumSize(1000)
-                    .expireAfterWrite(10, TimeUnit.MINUTES)
+                    .expireAfterWrite(5, TimeUnit.MINUTES)
                     .build();
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
 
     private static boolean isGenuinelyLive(Instant kickoffAt) {
         if (kickoffAt == null) return false;
@@ -198,7 +204,6 @@ public class LiveScorePoller {
                 }
 
                 log.info("Live poll: done — live={}, demoted={}, skipped={}.", updated, demoted, skipped);
-                // FIX: null large list before cache eviction to release memory sooner
                 allLive = null;
                 if (demoted > 0) evictMatchCaches();
             }
@@ -210,12 +215,10 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 2. TODAY'S FIXTURES — every 15 minutes
-    //    FIX: guarded by activePollCount to prevent overlap with live poll
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 15 * 60_000L, initialDelay = 10_000L)
     public void pollTodaysFixtures() {
-        // FIX: skip if live poll is still running to prevent memory overlap
         if (activePollCount.get() > 0) {
             log.warn("Today poll: live poll still running — skipping this tick");
             return;
@@ -233,15 +236,12 @@ public class LiveScorePoller {
         try {
             Map<String, List<Map<String, Object>>> byStatus = espnService.getAllMatchesTodayByStatus();
 
-            List<Map<String, Object>> allToday = deduplicateByEventId(
-                    java.util.stream.Stream.of(
-                                    byStatus.getOrDefault("live",     List.of()),
-                                    byStatus.getOrDefault("upcoming", List.of()),
-                                    byStatus.getOrDefault("finished", List.of()))
-                            .flatMap(Collection::stream)
-                            .collect(java.util.stream.Collectors.toList()));
+            List<Map<String, Object>> allToday = new ArrayList<>();
+            allToday.addAll(byStatus.getOrDefault("live",     List.of()));
+            allToday.addAll(byStatus.getOrDefault("upcoming", List.of()));
+            allToday.addAll(byStatus.getOrDefault("finished", List.of()));
+            allToday = deduplicateByEventId(allToday);
 
-            // FIX: release the byStatus map — allToday holds what we need
             byStatus = null;
 
             log.info("Today poll: {} deduplicated event(s) to process.", allToday.size());
@@ -249,10 +249,18 @@ public class LiveScorePoller {
             int saved = 0, skipped = 0;
             for (Map<String, Object> event : allToday) {
                 try {
-                    Match m = mapEspnEventToMatch(event);
+                    final Match m;
+                    if (EspnFootballDataService.isUpcoming(event)) {
+                        m = mapEspnFixtureToMatch(event);
+                    } else {
+                        m = mapEspnEventToMatch(event);
+                    }
+
                     if (m == null) { skipped++; continue; }
                     if (isStaleHistoricalFinished(m)) { skipped++; continue; }
+
                     Match persisted = matchService.saveOrUpdate(m);
+
                     if ("UPCOMING".equals(persisted.getStatus()) || "SCHEDULED".equals(persisted.getStatus())) {
                         persistOddsIfNeeded(persisted, "Today poll");
                     }
@@ -265,7 +273,6 @@ public class LiveScorePoller {
             }
 
             log.info("Today poll: done — saved={}, skipped={}.", saved, skipped);
-            // FIX: null large list before cache eviction
             allToday = null;
             evictMatchCaches();
         } catch (Exception e) {
@@ -276,17 +283,31 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 3. UPCOMING FIXTURES (next 3 days) — every hour
-    //    FIX: window reduced from 7 → 3 days; fetch one day at a time to
-    //    avoid holding the full multi-day map in memory simultaneously.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 60 * 60_000L, initialDelay = 5 * 60_000L)
     public void pollUpcomingFixtures() {
+        // FIX: upstream polls (live + today) increment activePollCount.
+        // The upcoming poll must also participate in the same guard so it
+        // cannot race against either of them and cause dirty reads / duplicate
+        // odds writes on shared state (oddsPersistedIds, DB).
+        if (activePollCount.get() > 0) {
+            log.warn("Upcoming poll: another poll still running — skipping this tick");
+            return;
+        }
+        activePollCount.incrementAndGet();
+        try {
+            pollUpcomingFixturesInternal();
+        } finally {
+            activePollCount.decrementAndGet();
+        }
+    }
+
+    private void pollUpcomingFixturesInternal() {
         log.info("=== Upcoming fixtures poll starting ({}d window) ===", UPCOMING_DAYS_WINDOW);
         try {
-            int totalSaved = 0, totalSkipped = 0, oddsGenerated = 0;
+            int totalSaved = 0, totalSkipped = 0, oddsAttempted = 0;
 
-            // FIX: fetch one day at a time and discard each batch before fetching the next
             for (int dayOffset = 1; dayOffset <= UPCOMING_DAYS_WINDOW; dayOffset++) {
                 LocalDate targetDate = LocalDate.now().plusDays(dayOffset);
                 log.debug("Upcoming poll: fetching fixtures for date={}", targetDate);
@@ -301,34 +322,46 @@ public class LiveScorePoller {
 
                 log.debug("Upcoming poll: {} event(s) for date={}", dayFixtures.size(), targetDate);
 
-                List<List<Map<String, Object>>> chunks = partition(dayFixtures, ODDS_CHUNK_SIZE);
-                for (List<Map<String, Object>> chunk : chunks) {
-                    for (Map<String, Object> event : chunk) {
-                        try {
-                            Match m = mapEspnFixtureToMatch(event);
-                            if (m != null && m.getKickoffAt() != null && m.getKickoffAt().isAfter(Instant.now())) {
-                                Match persisted = matchService.saveOrUpdate(m);
-                                persistOddsIfNeeded(persisted, "Upcoming poll");
-                                oddsGenerated++;
-                                totalSaved++;
-                            } else {
-                                totalSkipped++;
-                            }
-                        } catch (Exception e) {
+                for (Map<String, Object> event : dayFixtures) {
+                    try {
+                        Match m = mapEspnFixtureToMatch(event);
+
+                        if (m == null) {
+                            String evId = EspnFootballDataService.extractEventId(event);
+                            log.debug("Upcoming poll: mapEspnFixtureToMatch returned null for event id={} date={}",
+                                    evId, targetDate);
                             totalSkipped++;
-                            log.warn("Upcoming poll: failed fixture id={} — {}",
-                                    EspnFootballDataService.extractEventId(event), e.getMessage());
+                            continue;
                         }
+
+                        // Only skip events whose kickoff is definitively in the past.
+                        // Fixtures with a null kickoff are still saved — odds can be
+                        // generated later once the date is resolved.
+                        if (m.getKickoffAt() != null && !m.getKickoffAt().isAfter(Instant.now())) {
+                            log.debug("Upcoming poll: skipping past fixture externalId={} kickoffAt={}",
+                                    m.getExternalId(), m.getKickoffAt());
+                            totalSkipped++;
+                            continue;
+                        }
+
+                        Match persisted = matchService.saveOrUpdate(m);
+                        totalSaved++;
+
+                        persistOddsIfNeeded(persisted, "Upcoming poll");
+                        oddsAttempted++;
+
+                    } catch (Exception e) {
+                        totalSkipped++;
+                        log.warn("Upcoming poll: failed fixture id={} date={} — {}",
+                                EspnFootballDataService.extractEventId(event), targetDate, e.getMessage());
                     }
-                    Thread.yield();
                 }
 
-                // FIX: explicitly null each day's data before fetching the next
                 dayFixtures = null;
             }
 
-            log.info("Upcoming poll: done — saved={}, skipped={}, oddsGenerated={}",
-                    totalSaved, totalSkipped, oddsGenerated);
+            log.info("Upcoming poll: done — saved={}, skipped={}, oddsAttempted={}",
+                    totalSaved, totalSkipped, oddsAttempted);
             evictUpcomingCaches();
             evictMatchCaches();
         } catch (Exception e) {
@@ -339,15 +372,12 @@ public class LiveScorePoller {
 
     // ═══════════════════════════════════════════════════════════════════════
     // 4. STALE LIVE SWEEP — every 10 minutes
-    //    FIX: ESPN cache is only cleared when no poll is actively running,
-    //    avoiding a cold-fetch spike immediately after a cache wipe.
     // ═══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedRate = 10 * 60_000L, initialDelay = 5 * 60_000L)
     public void sweepStaleLiveMatches() {
         log.debug("=== Stale LIVE sweep starting ===");
         try {
-            // Force-finish any matches stuck in LIVE for >4 hours
             Instant cutoff = Instant.now().minus(4, ChronoUnit.HOURS);
             int closed = matchService.finishStaleLiveMatches(cutoff);
             if (closed > 0) {
@@ -357,8 +387,6 @@ public class LiveScorePoller {
                 log.debug("Stale sweep: no stale LIVE matches found.");
             }
 
-            // FIX: only wipe ESPN cache when no poll is in flight — prevents
-            // a large cold-fetch spike immediately after clearing
             if (activePollCount.get() == 0) {
                 clearEspnCache();
                 invalidateHighChurnKeys();
@@ -367,17 +395,14 @@ public class LiveScorePoller {
                 log.info("Stale sweep: skipping ESPN cache clear — poll is active.");
             }
 
-            // Explicitly free bounded caches sooner than their TTL
+            // Only clear confirmedFinishedIds here.
+            // oddsPersistedIds is intentionally NOT cleared — its 5-min Caffeine
+            // TTL handles its own expiry.  Clearing it here was the root cause of
+            // upcoming matches losing their odds between poll cycles.
             long confirmedSize = confirmedFinishedIds.estimatedSize();
             if (confirmedSize > 0) {
                 confirmedFinishedIds.invalidateAll();
                 log.info("Stale sweep: cleared ~{} confirmed-finished id(s).", confirmedSize);
-            }
-
-            long oddsSize = oddsPersistedIds.estimatedSize();
-            if (oddsSize > 0) {
-                oddsPersistedIds.invalidateAll();
-                log.debug("Stale sweep: cleared ~{} oddsPersistedIds entries.", oddsSize);
             }
 
         } catch (Exception e) {
@@ -455,10 +480,6 @@ public class LiveScorePoller {
         log.info("invalidateHighChurnKeys: invalidated {}/{} keys", invalidated, keys.size());
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // CACHE HELPERS
-    // ═══════════════════════════════════════════════════════════════════════
-
     private void evictUpcomingCaches() {
         List<String> names = List.of("matches", "futureMatches");
         int cleared = 0;
@@ -483,6 +504,22 @@ public class LiveScorePoller {
     // ODDS PERSISTENCE HELPER
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Generates and saves all odds for a match if not already done this cycle.
+     *
+     * <p>The deduplication key is the match's externalId (e.g. "espn-740963")
+     * or its internal UUID as a fallback. The oddsPersistedIds cache has a
+     * 5-minute TTL so that:
+     * <ul>
+     *   <li>Odds are not regenerated on every 30-sec live-poll tick (cache hit)</li>
+     *   <li>Odds ARE retried quickly (within 5 min) after any failure</li>
+     *   <li>The stale sweep no longer invalidates this cache, removing the root
+     *       cause of upcoming matches losing their odds between poll cycles</li>
+     * </ul>
+     *
+     * <p>A failed odds save does NOT put a "true" entry into oddsPersistedIds,
+     * so the next poll cycle will retry correctly.
+     */
     private void persistOddsIfNeeded(Match persisted, String caller) {
         String key = persisted.getExternalId() != null
                 ? persisted.getExternalId()
@@ -494,8 +531,11 @@ public class LiveScorePoller {
         try {
             oddsPersistenceService.generateAndSaveAllOdds(persisted);
             oddsPersistedIds.put(key, true);
+            log.debug("{}: odds persisted for externalId={}", caller, key);
         } catch (Exception oe) {
-            log.warn("{}: odds save failed matchId={} — {}", caller, persisted.getId(), oe.getMessage());
+            log.warn("{}: odds save failed matchId={} externalId={} — {}",
+                    caller, persisted.getId(), key, oe.getMessage());
+            // Do NOT put a "true" entry on failure — allow retry on next poll cycle.
         }
     }
 
@@ -513,13 +553,6 @@ public class LiveScorePoller {
         return result;
     }
 
-    private static <T> List<List<T>> partition(List<T> list, int size) {
-        List<List<T>> parts = new ArrayList<>();
-        for (int i = 0; i < list.size(); i += size)
-            parts.add(list.subList(i, Math.min(i + size, list.size())));
-        return parts;
-    }
-
     private static boolean isChampionsLeagueCup(EspnLeague league) {
         return league.displayName().toLowerCase().contains("champions league");
     }
@@ -532,6 +565,10 @@ public class LiveScorePoller {
     // MAPPERS
     // ═══════════════════════════════════════════════════════════════════════
 
+    /**
+     * Maps a live or finished ESPN event to a Match.
+     * Returns null for upcoming (state=pre) events — use mapEspnFixtureToMatch for those.
+     */
     private Match mapEspnEventToMatch(Map<String, Object> event) {
         if (event == null) return null;
         String externalId = EspnFootballDataService.extractEventId(event);
@@ -582,6 +619,10 @@ public class LiveScorePoller {
         return match;
     }
 
+    /**
+     * Maps any ESPN event (including upcoming/pre-match) to a Match with status UPCOMING.
+     * Used for today's upcoming fixtures and the multi-day upcoming poll.
+     */
     private Match mapEspnFixtureToMatch(Map<String, Object> event) {
         if (event == null) return null;
         String externalId = EspnFootballDataService.extractEventId(event);
@@ -613,7 +654,10 @@ public class LiveScorePoller {
             return Instant.parse(dateStr);
         } catch (Exception e) {
             try { return Instant.parse(dateStr.replace("Z", ":00Z")); }
-            catch (Exception e2) { return null; }
+            catch (Exception e2) {
+                log.warn("parseKickoff: could not parse date '{}' — fixture will be saved with null kickoff", dateStr);
+                return null;
+            }
         }
     }
 }

@@ -17,23 +17,26 @@ public class CacheConfig {
     public CacheManager cacheManager() {
         var manager = new SimpleCacheManager();
         manager.setCaches(List.of(
-                build("matches",           30,    1000),
-                build("odds",              15,    2000),
-                build("liveScores",        10,    500),
-                build("featuredMatches",   30,    100),
-                build("todayMatches",      60,    500),
-                build("futureMatches",     300,   500),
-                build("predictions",       3600,  500),
-                build("adminKpis",         60,    200),
-                build("config",            300,   50),
-                build("vipStatus",         60,    1000),
-                build("userProfiles",      120,   1000),
-                build("lineups",           86400, 500),
+                build("matches",            30,    1000),
+                build("odds",               15,    2000),
+                build("liveScores",         10,    500),
+                build("featuredMatches",    30,    100),
+                build("todayMatches",       60,    500),
+                build("futureMatches",      300,   500),
+                build("predictions",        3600,  500),
+                build("adminKpis",          60,    200),
+                build("config",             300,   50),
+                build("vipStatus",          60,    1000),
+                build("userProfiles",       120,   1000),
+                build("lineups",            86400, 500),
                 build("h2h",               86400, 500),
-                build("crashInsights",     3600,  100),
-                build("mlbTodayMatches",   60,    200),   // ← added
-                build("mlbUpcomingMatches",300,   200)    // ← added
-        ));        return manager;
+                build("crashInsights",      3600,  100),
+                build("mlbTodayMatches",    60,    200),
+                build("mlbUpcomingMatches", 300,   200),
+                build("nflTodayMatches",    60,    200),
+                build("nflUpcomingMatches", 300,   200)
+        ));
+        return manager;
     }
 
     private CaffeineCache build(String name, long ttlSeconds, int maxSize) {

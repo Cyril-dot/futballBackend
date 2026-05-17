@@ -255,7 +255,14 @@ public class BasketballOddsPersistenceService {
         Object raw = o.get(key);
         if (raw == null) return null;
         try {
-            return new BigDecimal(raw.toString().replace("+", ""));
+            String s = raw.toString().trim();
+            // Handle "home/away" spread format like "-2/+2" → take the first part
+            if (s.contains("/")) {
+                s = s.split("/")[0].trim();
+            }
+            // Strip leading "+" sign
+            s = s.replace("+", "");
+            return new BigDecimal(s);
         } catch (Exception e) {
             log.warn("toEntities [NBA]: matchId={} could not parse {}='{}' -- setting null",
                     matchId, key, raw);
