@@ -202,7 +202,10 @@ public class SecurityConfig {
                 "https://futballadmin.vercel.app",
                 "https://poikiloblastic-leeanne-gazeless.ngrok-free.dev",
                 "https://www.futball.site",
-                "https://superbet.vercel.app"
+                "https://superbet.vercel.app",
+                // ── nxtbet ────────────────────────────────────────────────────────
+                "https://nxtbet.site",
+                "https://www.nxtbet.site"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
