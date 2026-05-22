@@ -35,10 +35,6 @@ public class EspnFootballDataService {
         BUNDESLIGA          ("ger.1",  "Bundesliga",             true),
         SERIE_A             ("ita.1",  "Serie A",                true),
         LIGUE_1             ("fra.1",  "Ligue 1",                true),
-        // NOTE: CHAMPIONS_LEAGUE_GROUP removed — its slug (uefa.champions_league) returns HTTP 400
-        // on the scoreboard endpoint and poisoned every EspnLeague.values() scan (live, today,
-        // upcoming), causing all those polls to cache partial/empty results and silently drop
-        // fixtures + odds.  UCL is covered correctly via EspnCup.CHAMPIONS_LEAGUE.
         CHAMPIONSHIP        ("eng.2",  "Championship",           false),
         EREDIVISIE          ("ned.1",  "Eredivisie",             false),
         PRIMEIRA_LIGA       ("por.1",  "Primeira Liga",          false),
@@ -48,7 +44,38 @@ public class EspnFootballDataService {
         LIGA_MX             ("mex.1",  "Liga MX",                false),
         BRAZILIAN_SERIE_A   ("bra.1",  "Brazilian Série A",      false),
         ARGENTINE_PRIMERA   ("arg.1",  "Argentine Primera",      false),
-        SAUDI_PRO           ("ksa.1",  "Saudi Pro League",       false);
+        SAUDI_PRO           ("ksa.1",  "Saudi Pro League",       false),
+
+        // ── AFRICA ────────────────────────────────────────────
+        RSA_PREMIERSHIP     ("rsa.1",  "South African Premiership",        false),
+        RSA_FIRST_DIVISION  ("rsa.2",  "South African First Division",     false),
+        NIGERIAN_PL         ("nga.1",  "Nigerian Professional League",     false),
+        GHANAIAN_PL         ("gha.1",  "Ghanaian Premier League",          false),
+        KENYAN_PL           ("ken.1",  "Kenyan Premier League",            false),
+        UGANDAN_PL          ("uga.1",  "Ugandan Premier League",           false),
+        ZAMBIAN_SL          ("zam.1",  "Zambian Super League",             false),
+        ZIMBABWE_PSL        ("zim.1",  "Zimbabwean Premier Soccer League", false),
+
+        // ── ADDITIONAL EUROPE ──────────────────────────────────
+        BELGIAN_PRO         ("bel.1",  "Belgian Pro League",            false),
+        RUSSIAN_PL          ("rus.1",  "Russian Premier League",        false),
+        GREEK_SL            ("gre.1",  "Greek Super League",            false),
+        DANISH_SL           ("den.1",  "Danish Superliga",              false),
+        SWEDISH_AL          ("swe.1",  "Swedish Allsvenskan",           false),
+        NORWEGIAN_EL        ("nor.1",  "Norwegian Eliteserien",         false),
+
+        // ── ADDITIONAL AMERICAS ────────────────────────────────
+        COLOMBIAN_LP        ("col.1",  "Colombian Liga BetPlay",        false),
+        CHILEAN_PD          ("chi.1",  "Chilean Primera División",      false),
+        ECUADORIAN_PD       ("ecu.1",  "Ecuadorian LigaPro",            false),
+        PARAGUAYAN_AP       ("par.1",  "Paraguayan Apertura",           false),
+        PERUVIAN_PD         ("per.1",  "Peruvian Liga 1",               false),
+        URUGUAYAN_PD        ("uru.1",  "Uruguayan Primera División",    false),
+
+        // ── ASIA / MENA ────────────────────────────────────────
+        CHINESE_SL          ("chn.1",  "Chinese Super League",          false),
+        JAPANESE_J1         ("jpn.1",  "J1 League",                     false),
+        KOREAN_KL           ("kor.1",  "Korean K League 1",             false);
 
         private final String  slug;
         private final String  displayName;
@@ -69,7 +96,10 @@ public class EspnFootballDataService {
         }
 
         public static List<EspnLeague> african() {
-            return List.of();
+            return List.of(
+                    RSA_PREMIERSHIP, RSA_FIRST_DIVISION, NIGERIAN_PL, GHANAIAN_PL,
+                    KENYAN_PL, UGANDAN_PL, ZAMBIAN_SL, ZIMBABWE_PSL
+            );
         }
     }
 
