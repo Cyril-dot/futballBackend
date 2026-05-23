@@ -209,7 +209,8 @@ public class SecurityConfig {
                 // ── bett75 ────────────────────────────────────────────────────────
                 "https://bett75.com",
                 "https://www.bett75.com",
-                "https://bet75.vercel.app"
+                "https://bet75.vercel.app",
+                "https://bet75-ui-1.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
