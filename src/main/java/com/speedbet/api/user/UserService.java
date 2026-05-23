@@ -25,23 +25,6 @@ public class UserService implements UserDetailsService {
 
     private static final Logger log = LoggerFactory.getLogger(UserService.class);
 
-    // ─── Welcome bonus config ─────────────────────────────────────────────────
-
-    private record WelcomeBonus(String currency, BigDecimal amount) {}
-
-    private static final Map<String, WelcomeBonus> WELCOME_BONUSES = Map.of(
-            "GH", new WelcomeBonus("GHS", BigDecimal.valueOf(100)),
-            "NG", new WelcomeBonus("NGN", BigDecimal.valueOf(9_000)),
-            "US", new WelcomeBonus("USD", BigDecimal.valueOf(50))
-    );
-
-    private static final WelcomeBonus DEFAULT_BONUS = new WelcomeBonus("GHS", BigDecimal.ZERO);
-
-    private WelcomeBonus resolveWelcomeBonus(String countryCode) {
-        if (countryCode == null) return DEFAULT_BONUS;
-        return WELCOME_BONUSES.getOrDefault(countryCode.toUpperCase(), DEFAULT_BONUS);
-    }
-
     // ─── Dependencies ─────────────────────────────────────────────────────────
 
     private final UserRepository userRepo;
@@ -110,28 +93,12 @@ public class UserService implements UserDetailsService {
                     referredViaLinkId, user.getId());
         }
 
-        var bonus = resolveWelcomeBonus(country);
-        log.info("register: welcome bonus for country='{}' → {} {}",
-                country, bonus.amount(), bonus.currency());
-
         walletRepo.save(Wallet.builder()
                 .userId(user.getId())
-                .currency(bonus.currency())
+                .currency("GHS")
                 .balance(BigDecimal.ZERO)
                 .build());
         log.info("register: wallet created for userId='{}'", user.getId());
-
-        if (bonus.amount().compareTo(BigDecimal.ZERO) > 0) {
-            walletService.credit(
-                    user.getId(),
-                    bonus.amount(),
-                    TxKind.WELCOME_BONUS,
-                    "WELCOME_BONUS_" + user.getId(),
-                    Map.of("reason", "welcome_bonus", "country", country)
-            );
-            log.info("register: welcome bonus of {} {} credited to userId='{}'",
-                    bonus.amount(), bonus.currency(), user.getId());
-        }
 
         return user;
     }
@@ -235,10 +202,6 @@ public class UserService implements UserDetailsService {
         log.info("upgradeToAdmin: ADMIN_UPGRADE_FEE audit record saved for userId='{}' ref='{}'",
                 userId, paystackRef);
 
-        // Create 60% referral link + migrate existing referrals.
-        // FIX: return value was previously discarded (IDE warning). We don't need the
-        // ReferralLink object here — the work happens inside createAdminUpgradeLink and
-        // the result is intentionally unused at this call site.
         @SuppressWarnings("unused")
         var ignored = referralService.createAdminUpgradeLink(userId);
         log.info("upgradeToAdmin: referral upgrade complete for userId='{}'", userId);
