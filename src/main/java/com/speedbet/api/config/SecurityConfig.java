@@ -205,7 +205,11 @@ public class SecurityConfig {
                 "https://superbet.vercel.app",
                 // ── nxtbet ────────────────────────────────────────────────────────
                 "https://nxtbet.site",
-                "https://www.nxtbet.site"
+                "https://www.nxtbet.site",
+                // ── bett75 ────────────────────────────────────────────────────────
+                "https://bett75.com",
+                "https://www.bett75.com",
+                "https://bet75.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
