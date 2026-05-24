@@ -63,6 +63,15 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
             """)
     List<Match> findStaleLive(@Param("cutoff") Instant cutoff);
 
+
+    @Query("""
+        SELECT m FROM Match m
+        WHERE m.status = 'FINISHED'
+          AND m.settledAt IS NOT NULL
+        ORDER BY m.settledAt DESC
+        """)
+    List<Match> findSettledFinished();
+
     // ── New sport‑scoped queries (using Sport enum) ───────────────────────
 
     /**

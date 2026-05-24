@@ -1045,6 +1045,11 @@ public class MatchService {
 
 
 
+    public List<Match> getSettledFinished() {
+        return matchRepo.findSettledFinished();
+    }
+
+
     // ══════════════════════════════════════════════════════════════════════
     // STANDINGS / SCORERS
     // ══════════════════════════════════════════════════════════════════════
