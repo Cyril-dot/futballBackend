@@ -135,8 +135,8 @@ public class MoolreController {
      */
     private final ConcurrentHashMap<String, PendingCharge> pendingCharges = new ConcurrentHashMap<>();
 
-    /** Lightweight struct for cached charge params. */
-    record PendingCharge(BigDecimal amount, String phone, String channel, String externalRef) {}
+    /** Lightweight struct for cached charge params. network = "MTN" / "VODAFONE" / "AIRTELTIGO" */
+    record PendingCharge(BigDecimal amount, String phone, String network, String externalRef) {}
 
     private final WalletService           walletService;
     private final UserService             userService;
@@ -277,9 +277,12 @@ public class MoolreController {
         log.info("submitOtp: userId='{}' externalRef='{}'", user.getId(), ref);
 
         try {
-            // Per Moolre docs: re-call /open/transact/payment with otpcode populated.
+            // Per Moolre docs: re-call /open/transact/payment with same params + otpcode.
+            // pending.channel() is the original network string ("MTN" / "VODAFONE" / "AIRTELTIGO").
+            // moolreDirectCharge will detect the OTP-verified response and automatically
+            // make the follow-up call (step B) to push the USSD prompt.
             moolreDirectCharge(pending.amount(), pending.phone(), pending.channel(), ref, otp.toString().trim());
-            // Remove from cache after successful OTP submission
+            // Remove from cache — USSD prompt has been triggered
             pendingCharges.remove(ref);
         } catch (ActionRequiredException ex) {
             // Should not happen after OTP submission, but handle gracefully
@@ -612,13 +615,37 @@ public class MoolreController {
     // ─── Moolre API helpers ───────────────────────────────────────────────────
 
     /**
+     * Normalises a Ghanaian phone number to the 233XXXXXXXXX format Moolre expects.
+     *   "0244123456"    → "233244123456"
+     *   "233244123456"  → "233244123456"  (already correct)
+     *   "+233244123456" → "233244123456"
+     */
+    private static String normalisePhone(String phone) {
+        if (phone == null) return phone;
+        String p = phone.trim().replaceAll("\\s+", "");
+        if (p.startsWith("+233")) return p.substring(1);          // +233... → 233...
+        if (p.startsWith("233"))  return p;                        // already correct
+        if (p.startsWith("0"))    return "233" + p.substring(1);  // 0... → 233...
+        return p;
+    }
+
+    /**
      * Calls Moolre POST /open/transact/payment to initiate a USSD direct charge.
      *
      * When otpCode is non-null, the `otpcode` field is included in the request body.
-     * This is how Moolre handles OTP submission — by re-calling the same endpoint
-     * with the original params plus otpcode. There is NO separate OTP endpoint.
+     * Per Moolre docs, OTP submission re-calls the same /open/transact/payment
+     * endpoint with the original params + otpcode field.
      *
-     * On a successful first call (no OTP), charge params are cached in pendingCharges
+     * OTP two-step flow:
+     *   Step A — call with otpcode → Moolre validates OTP, returns
+     *             status=1 + message="Phone no. Verification Successful." + data="all"
+     *   Step B — call WITHOUT otpcode (same externalref) → Moolre pushes the USSD
+     *             prompt to the user's handset
+     *
+     * This method detects step-A success via isOtpVerifiedMessage() and
+     * automatically performs step B before returning.
+     *
+     * On the first call (no OTP), charge params are cached in pendingCharges
      * keyed by externalRef so /otp can reconstruct the full body later.
      *
      * Throws ActionRequiredException when Moolre returns status=1 with a message
@@ -626,10 +653,11 @@ public class MoolreController {
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> moolreDirectCharge(
-            BigDecimal amount, String phoneOrNetwork, String network, String externalRef, String otpCode) {
+            BigDecimal amount, String phone, String network, String externalRef, String otpCode) {
 
-        // phoneOrNetwork is always the phone; network is the network string.
-        // Resolve channel code.
+        // Normalise phone to 233XXXXXXXXX format
+        String normalisedPhone = normalisePhone(phone);
+
         String channel = switch (network.toUpperCase()) {
             case "MTN"        -> CHANNEL_MTN;
             case "VODAFONE"   -> CHANNEL_VODAFONE;
@@ -642,7 +670,7 @@ public class MoolreController {
         body.put("type",          1);
         body.put("channel",       channel);
         body.put("currency",      "GHS");
-        body.put("payer",         phoneOrNetwork);
+        body.put("payer",         normalisedPhone);
         body.put("amount",        amount.toPlainString());
         body.put("externalref",   externalRef);
         body.put("accountnumber", accountNumber);
@@ -651,8 +679,8 @@ public class MoolreController {
             log.info("moolreDirectCharge: including otpcode for externalRef='{}'", externalRef);
         }
 
-        log.info("moolreDirectCharge: calling /open/transact/payment — channel='{}' phone='{}' amount='{}' externalRef='{}' hasOtp={}",
-                channel, phoneOrNetwork, amount, externalRef, otpCode != null && !otpCode.isBlank());
+        log.info("moolreDirectCharge: calling /open/transact/payment — channel='{}' phone='{}' (normalised='{}') amount='{}' externalRef='{}' hasOtp={}",
+                channel, phone, normalisedPhone, amount, externalRef, otpCode != null && !otpCode.isBlank());
 
         String rawBody = webClientBuilder.build()
                 .post().uri(MOOLRE_BASE_URL + "/open/transact/payment")
@@ -724,12 +752,23 @@ public class MoolreController {
             throw new RuntimeException("Moolre error: " + message);
         }
 
-        // Action required (MTN SMS verification step)
+        // ── OTP verified (step A) — Moolre confirmed the SMS code.
+        //    We must now make a second call WITHOUT otpcode (step B) to actually
+        //    push the USSD prompt to the user's handset.
+        if (!message.isBlank() && isOtpVerifiedMessage(message)) {
+            log.info("moolreDirectCharge: OTP verified ('{}') — triggering USSD push (step B) for externalRef='{}'",
+                    message, externalRef);
+            // Recursive call without otpcode — this triggers the actual USSD push.
+            // Pass null for otpCode so step B body does NOT include otpcode.
+            return moolreDirectCharge(amount, phone, network, externalRef, null);
+        }
+
+        // ── Action required (MTN SMS verification step) — OTP not yet submitted.
         if (!message.isBlank() && isActionRequiredMessage(message)) {
             // Cache charge params so /otp can re-call with same body + otpcode
             if (otpCode == null || otpCode.isBlank()) {
                 pendingCharges.put(externalRef,
-                        new PendingCharge(amount, phoneOrNetwork, network, externalRef));
+                        new PendingCharge(amount, normalisedPhone, network, externalRef));
                 log.info("moolreDirectCharge: cached pending charge for externalRef='{}'", externalRef);
             }
             log.warn("moolreDirectCharge: action-required message status='{}' message='{}'", status, message);
@@ -743,6 +782,21 @@ public class MoolreController {
         }
 
         return data;
+    }
+
+    /**
+     * Returns true if Moolre's response confirms the OTP was accepted.
+     * After this, the USSD prompt hasn't been pushed yet — a second call
+     * to /open/transact/payment WITHOUT otpcode is required (step B).
+     * Known responses: "Phone no. Verification Successful." / data = "all"
+     */
+    private static boolean isOtpVerifiedMessage(String message) {
+        if (message == null) return false;
+        String lower = message.toLowerCase();
+        return lower.contains("verification successful")
+                || lower.contains("phone no. verification")
+                || lower.contains("otp verified")
+                || lower.contains("code verified");
     }
 
     /**
