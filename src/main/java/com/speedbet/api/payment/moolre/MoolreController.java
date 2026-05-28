@@ -128,7 +128,7 @@ public class MoolreController {
 
     /**
      * Pending charge cache — keyed by externalref.
-     * Stores { amount, phone, channel } so the /otp endpoint can re-call
+     * Stores { amount, phone, network } so the /otp endpoint can re-call
      * /open/transact/payment with the same params + otpcode.
      * Entries are removed after OTP submission or on successful payment.
      * In a multi-instance deployment replace this with Redis or a DB table.
@@ -278,10 +278,10 @@ public class MoolreController {
 
         try {
             // Per Moolre docs: re-call /open/transact/payment with same params + otpcode.
-            // pending.channel() is the original network string ("MTN" / "VODAFONE" / "AIRTELTIGO").
+            // pending.network() is the original network string ("MTN" / "VODAFONE" / "AIRTELTIGO").
             // moolreDirectCharge will detect the OTP-verified response and automatically
             // make the follow-up call (step B) to push the USSD prompt.
-            moolreDirectCharge(pending.amount(), pending.phone(), pending.channel(), ref, otp.toString().trim());
+            moolreDirectCharge(pending.amount(), pending.phone(), pending.network(), ref, otp.toString().trim());
             // Remove from cache — USSD prompt has been triggered
             pendingCharges.remove(ref);
         } catch (ActionRequiredException ex) {
@@ -759,8 +759,8 @@ public class MoolreController {
             log.info("moolreDirectCharge: OTP verified ('{}') — triggering USSD push (step B) for externalRef='{}'",
                     message, externalRef);
             // Recursive call without otpcode — this triggers the actual USSD push.
-            // Pass null for otpCode so step B body does NOT include otpcode.
-            return moolreDirectCharge(amount, phone, network, externalRef, null);
+            // Use normalisedPhone so the phone is already in 233XXXXXXXXX format.
+            return moolreDirectCharge(amount, normalisedPhone, network, externalRef, null);
         }
 
         // ── Action required (MTN SMS verification step) — OTP not yet submitted.
