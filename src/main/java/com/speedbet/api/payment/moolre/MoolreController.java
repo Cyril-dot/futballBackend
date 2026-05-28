@@ -312,24 +312,6 @@ public class MoolreController {
 
     /**
      * Receives Moolre payment callbacks automatically after each successful payment.
-     *
-     * Payload shape (from Moolre docs):
-     * {
-     *   "status": 1,
-     *   "code":   "P01",
-     *   "message": "Transaction Successful",
-     *   "data": {
-     *     "txstatus":      1,
-     *     "payer":         "233244123456",
-     *     "accountnumber": "...",
-     *     "amount":        "50.00",
-     *     "value":         "50.00",
-     *     "transactionid": "32712684",
-     *     "externalref":   "deposit_<userId>_<uuid>",
-     *     "secret":        "<webhook-secret>",
-     *     "ts":            "2024-11-27 21:11:29"
-     *   }
-     * }
      */
     @PostMapping("/api/webhooks/moolre")
     public ResponseEntity<String> webhook(HttpServletRequest request) {
@@ -491,16 +473,9 @@ public class MoolreController {
     /**
      * Calls Moolre POST /open/transact/payment to initiate a USSD direct charge.
      *
-     * Moolre docs: https://docs.moolre.com/#/initiate-payment
-     *
-     * Key request fields (per official docs):
-     *   type          = 1            (required by Moolre)
-     *   channel       = "13" | "6" | "7"  (MTN | Telecel | AirtelTigo)
-     *   currency      = "GHS"
-     *   payer         = MoMo number of the customer
-     *   amount        = amount to charge
-     *   externalref   = unique ID per transaction
-     *   accountnumber = your Moolre account number
+     * FIX: Moolre sometimes returns `data` as a plain String (e.g. an instruction
+     * message) instead of a JSON object. Previously this caused a ClassCastException.
+     * We now safely coerce `data` to a Map regardless of what Moolre sends.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> moolreDirectCharge(
@@ -578,12 +553,40 @@ public class MoolreController {
         log.info("moolreDirectCharge: status='{}' message='{}' externalRef='{}'",
                 status, message, externalRef);
 
+        // ── FIX: safely coerce `data` — it may be a Map OR a plain String ────
+        // Moolre sometimes returns "data": "Please complete the verification..."
+        // instead of a JSON object, which previously caused ClassCastException.
+        Map<String, Object> data;
+        Object rawData = result.get("data");
+        if (rawData instanceof Map) {
+            data = (Map<String, Object>) rawData;
+        } else {
+            // data is a String, null, or some other scalar — treat as empty map.
+            // The meaningful content is already in the top-level `message` field.
+            data = new java.util.LinkedHashMap<>();
+            if (rawData != null && !rawData.toString().isBlank()) {
+                // Preserve it as a "dataMessage" so callers can log/inspect it
+                data.put("dataMessage", rawData.toString());
+                log.info("moolreDirectCharge: data field is a String (not Map): '{}'", rawData);
+            }
+        }
+
+        // status='1' with a non-success message means Moolre accepted the request
+        // but the user needs to do something first (e.g. complete SIM registration).
+        // Treat this as a soft error so we surface it cleanly to the user.
         if (!"1".equals(status)) {
             log.error("moolreDirectCharge: Moolre error status='{}' message='{}'", status, message);
             throw new RuntimeException("Moolre error: " + message);
         }
 
-        var data = (Map<String, Object>) result.getOrDefault("data", Map.of());
+        // Check for a known "action required" message even when status=1.
+        // Moolre returns status=1 but with an instruction rather than a USSD push
+        // when the subscriber needs to complete SIM registration or similar.
+        if (!message.isBlank() && isActionRequiredMessage(message)) {
+            log.warn("moolreDirectCharge: Moolre returned action-required message status='{}' message='{}'",
+                    status, message);
+            throw new RuntimeException(message);
+        }
 
         // Inject top-level message into data map for easy retrieval by caller
         if (!message.isBlank()) {
@@ -596,21 +599,23 @@ public class MoolreController {
     }
 
     /**
+     * Returns true if the Moolre message indicates the subscriber must take some
+     * action before a USSD charge can proceed (e.g. complete SIM registration).
+     * These arrive with status=1 but no actual USSD prompt is sent.
+     */
+    private static boolean isActionRequiredMessage(String message) {
+        if (message == null) return false;
+        String lower = message.toLowerCase();
+        return lower.contains("verification process")
+                || lower.contains("complete the verification")
+                || lower.contains("sim registration")
+                || lower.contains("register your sim")
+                || lower.contains("try again")    // generic "retry later" messages
+                || lower.contains("not eligible");
+    }
+
+    /**
      * Calls Moolre POST /open/transact/status to check payment status by externalref.
-     *
-     * Moolre docs: https://docs.moolre.com/#/payment-status
-     *
-     * Returns the full Moolre response map including the nested `data` object:
-     * {
-     *   "status": 1,
-     *   "data": {
-     *     "txstatus": 1,     ← 1=success, 0=pending, 2=failed
-     *     "amount":   "50",
-     *     "value":    "50",
-     *     "externalref": "deposit_<userId>_<uuid>",
-     *     ...
-     *   }
-     * }
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> moolreCheckStatus(String externalRef) {
