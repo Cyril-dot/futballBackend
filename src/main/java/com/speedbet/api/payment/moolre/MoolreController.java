@@ -35,14 +35,17 @@ import java.util.UUID;
  *     • Accepts { amount, phone, network } from the frontend.
  *     • Calls Moolre POST /open/transact/payment to push a USSD prompt directly
  *       to the customer's MoMo number — no hosted page, no redirect.
- *     • Returns { externalref, message } to the frontend.
- *     • Customer approves the USSD prompt on their phone.
+ *     • Returns { externalref, actionRequired, message } to the frontend.
+ *       actionRequired=true means Moolre sent an SMS instead of a USSD push;
+ *       the user must complete that SMS flow before the charge can proceed.
+ *     • Customer approves the USSD prompt (or SMS flow) on their phone.
  *     • Moolre fires our webhook → wallet is credited automatically.
  *
  *  2. Initiate USSD Charge — Admin Upgrade
  *     POST /api/user/upgrade-to-admin/moolre/init
  *     • Same USSD direct flow but amount is fixed at GHS 200 and promotes
  *       the user to ADMIN on successful payment.
+ *     • Also returns actionRequired flag when applicable.
  *
  *  3. Payment Verification (manual fallback / polling)
  *     POST /api/wallet/deposit/moolre/verify
@@ -80,6 +83,22 @@ import java.util.UUID;
  *   app.moolre.account-number    → env: MOOLRE_ACCOUNT_NUMBER
  *   app.moolre.webhook-secret    → env: MOOLRE_WEBHOOK_SECRET
  *   app.platform.min-deposit-amount (default: 1)
+ *
+ * ─── Changes from previous version ───────────────────────────────────────────
+ *   FIX-1  moolreDirectCharge now throws ActionRequiredException (not
+ *          RuntimeException) when Moolre returns status=1 with an action-
+ *          required message (e.g. "complete the verification process sent
+ *          to you via SMS").  Previously this caused a 400 Bad Request even
+ *          though the transaction can still succeed after the user acts.
+ *
+ *   FIX-2  initDeposit and initAdminUpgrade now catch ActionRequiredException
+ *          separately and return HTTP 200 with { actionRequired: true } so the
+ *          frontend can guide the user through the SMS/verification step instead
+ *          of showing a hard error.
+ *
+ *   FIX-3  moolreDirectCharge safely coerces the `data` field — Moolre
+ *          sometimes returns it as a plain String instead of a JSON object,
+ *          which previously caused a ClassCastException.
  */
 @Slf4j
 @RestController
@@ -126,8 +145,16 @@ public class MoolreController {
      *   phone   – customer's MoMo number (e.g. "0244123456" or "233244123456")
      *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
      *
-     * Response:
-     *   { "externalref": "deposit_<userId>_<uuid>", "message": "..." }
+     * Response (always HTTP 200 on valid request):
+     *   {
+     *     "externalref":    "deposit_<userId>_<uuid>",
+     *     "actionRequired": false,          // true → user must complete SMS flow first
+     *     "message":        "..."
+     *   }
+     *
+     * FIX-1 / FIX-2: When Moolre returns an action-required message (status=1
+     * but no USSD push), we now return 200 + actionRequired=true instead of 400,
+     * so the frontend can guide the user through the SMS verification step.
      */
     @PostMapping("/api/wallet/deposit/moolre/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
@@ -150,9 +177,22 @@ public class MoolreController {
         log.info("initDeposit (USSD): userId='{}' amount={} phone='{}' network='{}' externalRef='{}'",
                 user.getId(), amount, phone, network, externalRef);
 
+        // FIX-2: catch ActionRequiredException separately so it becomes 200, not 400
         Map<String, Object> chargeResult;
+        boolean actionRequired = false;
+        String  actionMessage  = "";
+
         try {
             chargeResult = moolreDirectCharge(amount, phone.toString(), network.toString(), externalRef);
+        } catch (ActionRequiredException ex) {
+            // Moolre sent an SMS verification request instead of a USSD push.
+            // This is NOT a system error — the transaction can still complete
+            // once the user follows the SMS instructions and we call /verify.
+            log.warn("initDeposit: action required for userId='{}' externalRef='{}' — {}",
+                    user.getId(), externalRef, ex.getMessage());
+            actionRequired = true;
+            actionMessage  = ex.getMessage();
+            chargeResult   = Map.of();
         } catch (RuntimeException ex) {
             log.error("initDeposit: Moolre charge failed for userId='{}' externalRef='{}' — {}",
                     user.getId(), externalRef, ex.getMessage(), ex);
@@ -162,8 +202,11 @@ public class MoolreController {
         }
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "externalref", externalRef,
-                "message", chargeResult.getOrDefault("message",
+                "externalref",    externalRef,
+                "actionRequired", actionRequired,
+                "message", actionRequired
+                        ? actionMessage
+                        : chargeResult.getOrDefault("message",
                         "Please approve the USSD prompt on your phone.").toString()
         )));
     }
@@ -177,8 +220,12 @@ public class MoolreController {
      *   phone   – customer's MoMo number
      *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
      *
-     * Response:
-     *   { "externalref": "adminupgrade_<userId>_<uuid>", "message": "..." }
+     * Response (always HTTP 200 on valid request):
+     *   {
+     *     "externalref":    "adminupgrade_<userId>_<uuid>",
+     *     "actionRequired": false,
+     *     "message":        "..."
+     *   }
      */
     @PostMapping("/api/user/upgrade-to-admin/moolre/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initAdminUpgrade(
@@ -201,9 +248,19 @@ public class MoolreController {
         log.info("initAdminUpgrade (USSD): userId='{}' phone='{}' network='{}' externalRef='{}'",
                 user.getId(), phone, network, externalRef);
 
+        // FIX-2: same pattern as initDeposit
         Map<String, Object> chargeResult;
+        boolean actionRequired = false;
+        String  actionMessage  = "";
+
         try {
             chargeResult = moolreDirectCharge(ADMIN_UPGRADE_FEE, phone.toString(), network.toString(), externalRef);
+        } catch (ActionRequiredException ex) {
+            log.warn("initAdminUpgrade: action required for userId='{}' externalRef='{}' — {}",
+                    user.getId(), externalRef, ex.getMessage());
+            actionRequired = true;
+            actionMessage  = ex.getMessage();
+            chargeResult   = Map.of();
         } catch (RuntimeException ex) {
             log.error("initAdminUpgrade: Moolre charge failed for userId='{}' externalRef='{}' — {}",
                     user.getId(), externalRef, ex.getMessage(), ex);
@@ -213,8 +270,11 @@ public class MoolreController {
         }
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "externalref", externalRef,
-                "message", chargeResult.getOrDefault("message",
+                "externalref",    externalRef,
+                "actionRequired", actionRequired,
+                "message", actionRequired
+                        ? actionMessage
+                        : chargeResult.getOrDefault("message",
                         "Please approve the USSD prompt on your phone.").toString()
         )));
     }
@@ -473,9 +533,14 @@ public class MoolreController {
     /**
      * Calls Moolre POST /open/transact/payment to initiate a USSD direct charge.
      *
-     * FIX: Moolre sometimes returns `data` as a plain String (e.g. an instruction
-     * message) instead of a JSON object. Previously this caused a ClassCastException.
-     * We now safely coerce `data` to a Map regardless of what Moolre sends.
+     * FIX-1: When Moolre returns status=1 with an action-required message
+     * (e.g. "Please complete the verification process sent to you via SMS"),
+     * we now throw ActionRequiredException instead of RuntimeException.
+     * Callers catch this separately and return HTTP 200 + actionRequired=true
+     * rather than a 400 Bad Request.
+     *
+     * FIX-3: Moolre sometimes returns `data` as a plain String instead of a
+     * JSON object. We safely coerce it to a Map regardless.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> moolreDirectCharge(
@@ -553,39 +618,34 @@ public class MoolreController {
         log.info("moolreDirectCharge: status='{}' message='{}' externalRef='{}'",
                 status, message, externalRef);
 
-        // ── FIX: safely coerce `data` — it may be a Map OR a plain String ────
-        // Moolre sometimes returns "data": "Please complete the verification..."
-        // instead of a JSON object, which previously caused ClassCastException.
+        // FIX-3: safely coerce `data` — Moolre sometimes returns it as a plain
+        // String (e.g. "Please complete the verification...") instead of a Map,
+        // which previously caused a ClassCastException.
         Map<String, Object> data;
         Object rawData = result.get("data");
         if (rawData instanceof Map) {
             data = (Map<String, Object>) rawData;
         } else {
-            // data is a String, null, or some other scalar — treat as empty map.
-            // The meaningful content is already in the top-level `message` field.
             data = new java.util.LinkedHashMap<>();
             if (rawData != null && !rawData.toString().isBlank()) {
-                // Preserve it as a "dataMessage" so callers can log/inspect it
                 data.put("dataMessage", rawData.toString());
                 log.info("moolreDirectCharge: data field is a String (not Map): '{}'", rawData);
             }
         }
 
-        // status='1' with a non-success message means Moolre accepted the request
-        // but the user needs to do something first (e.g. complete SIM registration).
-        // Treat this as a soft error so we surface it cleanly to the user.
+        // Hard failure — Moolre returned a non-success status code
         if (!"1".equals(status)) {
             log.error("moolreDirectCharge: Moolre error status='{}' message='{}'", status, message);
             throw new RuntimeException("Moolre error: " + message);
         }
 
-        // Check for a known "action required" message even when status=1.
-        // Moolre returns status=1 but with an instruction rather than a USSD push
-        // when the subscriber needs to complete SIM registration or similar.
+        // FIX-1: status=1 but Moolre is asking the user to act (e.g. complete
+        // SIM registration or an SMS verification).  Throw ActionRequiredException
+        // so callers can handle this gracefully instead of returning a 400.
         if (!message.isBlank() && isActionRequiredMessage(message)) {
             log.warn("moolreDirectCharge: Moolre returned action-required message status='{}' message='{}'",
                     status, message);
-            throw new RuntimeException(message);
+            throw new ActionRequiredException(message);
         }
 
         // Inject top-level message into data map for easy retrieval by caller
@@ -600,8 +660,9 @@ public class MoolreController {
 
     /**
      * Returns true if the Moolre message indicates the subscriber must take some
-     * action before a USSD charge can proceed (e.g. complete SIM registration).
-     * These arrive with status=1 but no actual USSD prompt is sent.
+     * action before a USSD charge can proceed (e.g. complete SIM registration or
+     * an SMS-based verification step).  These arrive with status=1 but no actual
+     * USSD prompt is sent to the handset.
      */
     private static boolean isActionRequiredMessage(String message) {
         if (message == null) return false;
@@ -610,7 +671,7 @@ public class MoolreController {
                 || lower.contains("complete the verification")
                 || lower.contains("sim registration")
                 || lower.contains("register your sim")
-                || lower.contains("try again")    // generic "retry later" messages
+                || lower.contains("try again")
                 || lower.contains("not eligible");
     }
 
