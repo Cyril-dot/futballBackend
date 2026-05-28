@@ -36,25 +36,34 @@ import java.util.UUID;
  *     • Calls Moolre POST /open/transact/payment to push a USSD prompt directly
  *       to the customer's MoMo number — no hosted page, no redirect.
  *     • Returns { externalref, actionRequired, message } to the frontend.
- *       actionRequired=true means Moolre sent an SMS instead of a USSD push;
- *       the user must complete that SMS flow before the charge can proceed.
- *     • Customer approves the USSD prompt (or SMS flow) on their phone.
+ *       actionRequired=true means Moolre sent an SMS code instead of a USSD push;
+ *       the user must enter that code via /otp before the USSD prompt is sent.
+ *     • Customer approves the USSD prompt on their phone.
  *     • Moolre fires our webhook → wallet is credited automatically.
  *
- *  2. Initiate USSD Charge — Admin Upgrade
+ *  2. OTP / SMS Code Submission (actionRequired flow only)
+ *     POST /api/wallet/deposit/moolre/otp
+ *     • Only needed when /init returns actionRequired=true (MTN subscribers
+ *       who require SMS verification before a USSD push can be sent).
+ *     • Accepts { externalref, otp } from the frontend.
+ *     • Submits the SMS code to Moolre POST /open/transact/authorize.
+ *     • On success Moolre immediately pushes the USSD prompt to the user's phone.
+ *     • Frontend then moves user to the normal "approve USSD" waiting screen.
+ *
+ *  3. Initiate USSD Charge — Admin Upgrade
  *     POST /api/user/upgrade-to-admin/moolre/init
  *     • Same USSD direct flow but amount is fixed at GHS 200 and promotes
  *       the user to ADMIN on successful payment.
  *     • Also returns actionRequired flag when applicable.
  *
- *  3. Payment Verification (manual fallback / polling)
+ *  4. Payment Verification (manual fallback / polling)
  *     POST /api/wallet/deposit/moolre/verify
  *     • Accepts the externalref stored by the frontend after /init.
  *     • Calls Moolre /open/transact/status.
  *     • Credits wallet immediately if txstatus=1 and not already credited.
  *     • Idempotent — safe to poll; duplicate refs are silently ignored.
  *
- *  4. Webhook (primary / automatic credit path)
+ *  5. Webhook (primary / automatic credit path)
  *     POST /api/webhooks/moolre
  *     • Moolre POSTs here after every successful payment.
  *     • Verified by matching the `secret` field in the payload.
@@ -99,6 +108,11 @@ import java.util.UUID;
  *   FIX-3  moolreDirectCharge safely coerces the `data` field — Moolre
  *          sometimes returns it as a plain String instead of a JSON object,
  *          which previously caused a ClassCastException.
+ *
+ *   NEW-1  Added POST /api/wallet/deposit/moolre/otp — accepts the SMS code
+ *          sent by Moolre/MTN and submits it to Moolre /open/transact/authorize.
+ *          On success Moolre pushes the USSD prompt to the user's phone so they
+ *          can approve the payment normally.
  */
 @Slf4j
 @RestController
@@ -148,13 +162,13 @@ public class MoolreController {
      * Response (always HTTP 200 on valid request):
      *   {
      *     "externalref":    "deposit_<userId>_<uuid>",
-     *     "actionRequired": false,          // true → user must complete SMS flow first
+     *     "actionRequired": false,   // true → user must enter SMS code via /otp first
      *     "message":        "..."
      *   }
      *
-     * FIX-1 / FIX-2: When Moolre returns an action-required message (status=1
-     * but no USSD push), we now return 200 + actionRequired=true instead of 400,
-     * so the frontend can guide the user through the SMS verification step.
+     * When actionRequired=true the frontend should prompt the user to enter the
+     * SMS code they received, then POST it to /api/wallet/deposit/moolre/otp.
+     * Only after that will Moolre send the USSD prompt to the user's phone.
      */
     @PostMapping("/api/wallet/deposit/moolre/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
@@ -177,7 +191,6 @@ public class MoolreController {
         log.info("initDeposit (USSD): userId='{}' amount={} phone='{}' network='{}' externalRef='{}'",
                 user.getId(), amount, phone, network, externalRef);
 
-        // FIX-2: catch ActionRequiredException separately so it becomes 200, not 400
         Map<String, Object> chargeResult;
         boolean actionRequired = false;
         String  actionMessage  = "";
@@ -185,9 +198,9 @@ public class MoolreController {
         try {
             chargeResult = moolreDirectCharge(amount, phone.toString(), network.toString(), externalRef);
         } catch (ActionRequiredException ex) {
-            // Moolre sent an SMS verification request instead of a USSD push.
-            // This is NOT a system error — the transaction can still complete
-            // once the user follows the SMS instructions and we call /verify.
+            // Moolre sent an SMS code to the user instead of pushing a USSD prompt.
+            // Return actionRequired=true so the frontend collects the SMS code and
+            // submits it to /otp, which will then trigger the USSD push.
             log.warn("initDeposit: action required for userId='{}' externalRef='{}' — {}",
                     user.getId(), externalRef, ex.getMessage());
             actionRequired = true;
@@ -211,7 +224,75 @@ public class MoolreController {
         )));
     }
 
-    // ─── 2. Initiate USSD Charge — Admin Upgrade ──────────────────────────────
+    // ─── 2. OTP / SMS Code Submission ────────────────────────────────────────
+
+    /**
+     * Submits the SMS verification code sent by Moolre/MTN to authorize the
+     * USSD direct charge.  Only required when /init returns actionRequired=true.
+     *
+     * Flow:
+     *   1. /init   → Moolre sends SMS code to user's phone  (actionRequired=true)
+     *   2. /otp    → User enters SMS code here; Moolre pushes USSD prompt
+     *   3. User approves USSD on phone
+     *   4. /verify → We confirm and credit the wallet
+     *
+     * Required body fields:
+     *   externalref – the reference returned by /init
+     *   otp         – the code the user received via SMS
+     *
+     * Response (HTTP 200 on success):
+     *   { "message": "USSD prompt sent. Please approve on your phone." }
+     *
+     * ⚠️  If Moolre's actual OTP endpoint URL differs from /open/transact/authorize,
+     *     update the constant in moolreSubmitOtp() below and confirm the exact
+     *     payload field names with Moolre support.
+     */
+    @PostMapping("/api/wallet/deposit/moolre/otp")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var externalRef = req.get("externalref");
+        var otp         = req.get("otp");
+
+        if (externalRef == null || externalRef.toString().isBlank())
+            throw ApiException.badRequest("externalref is required.");
+        if (otp == null || otp.toString().isBlank())
+            throw ApiException.badRequest("otp is required.");
+
+        var ref   = externalRef.toString().trim();
+        var parts = ref.split("_", 3);
+        if (parts.length < 3)
+            throw ApiException.badRequest("Invalid externalref format.");
+
+        UUID refUserId;
+        try {
+            refUserId = UUID.fromString(parts[1]);
+        } catch (IllegalArgumentException e) {
+            throw ApiException.badRequest("Invalid externalref format.");
+        }
+
+        if (!refUserId.equals(user.getId()))
+            throw ApiException.forbidden("This payment reference does not belong to your account.");
+
+        log.info("submitOtp: userId='{}' externalRef='{}'", user.getId(), ref);
+
+        try {
+            moolreSubmitOtp(ref, otp.toString().trim());
+        } catch (RuntimeException ex) {
+            log.error("submitOtp: OTP submission failed for userId='{}' externalRef='{}' — {}",
+                    user.getId(), ref, ex.getMessage(), ex);
+            throw ApiException.badRequest(ex.getMessage() != null
+                    ? ex.getMessage()
+                    : "OTP verification failed. Please check the code and try again.");
+        }
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "message", "Code verified. A USSD prompt has been sent to your phone — please approve it to complete your payment."
+        )));
+    }
+
+    // ─── 3. Initiate USSD Charge — Admin Upgrade ─────────────────────────────
 
     /**
      * Initiates a Moolre USSD direct charge for the GHS 200 admin upgrade fee.
@@ -248,7 +329,6 @@ public class MoolreController {
         log.info("initAdminUpgrade (USSD): userId='{}' phone='{}' network='{}' externalRef='{}'",
                 user.getId(), phone, network, externalRef);
 
-        // FIX-2: same pattern as initDeposit
         Map<String, Object> chargeResult;
         boolean actionRequired = false;
         String  actionMessage  = "";
@@ -279,7 +359,7 @@ public class MoolreController {
         )));
     }
 
-    // ─── 3. Payment Verification ──────────────────────────────────────────────
+    // ─── 4. Payment Verification ──────────────────────────────────────────────
 
     /**
      * Manually verifies a Moolre payment by its externalref and credits the
@@ -368,7 +448,7 @@ public class MoolreController {
         )));
     }
 
-    // ─── 4. Webhook ───────────────────────────────────────────────────────────
+    // ─── 5. Webhook ───────────────────────────────────────────────────────────
 
     /**
      * Receives Moolre payment callbacks automatically after each successful payment.
@@ -546,7 +626,6 @@ public class MoolreController {
     private Map<String, Object> moolreDirectCharge(
             BigDecimal amount, String phone, String network, String externalRef) {
 
-        // Map frontend network name → Moolre channel code (per official docs)
         String channel = switch (network.toUpperCase()) {
             case "MTN"        -> CHANNEL_MTN;
             case "VODAFONE"   -> CHANNEL_VODAFONE;
@@ -618,9 +697,7 @@ public class MoolreController {
         log.info("moolreDirectCharge: status='{}' message='{}' externalRef='{}'",
                 status, message, externalRef);
 
-        // FIX-3: safely coerce `data` — Moolre sometimes returns it as a plain
-        // String (e.g. "Please complete the verification...") instead of a Map,
-        // which previously caused a ClassCastException.
+        // FIX-3: safely coerce `data` — Moolre sometimes returns it as a plain String
         Map<String, Object> data;
         Object rawData = result.get("data");
         if (rawData instanceof Map) {
@@ -639,16 +716,13 @@ public class MoolreController {
             throw new RuntimeException("Moolre error: " + message);
         }
 
-        // FIX-1: status=1 but Moolre is asking the user to act (e.g. complete
-        // SIM registration or an SMS verification).  Throw ActionRequiredException
-        // so callers can handle this gracefully instead of returning a 400.
+        // FIX-1: status=1 but Moolre is asking the user to act via SMS first.
         if (!message.isBlank() && isActionRequiredMessage(message)) {
             log.warn("moolreDirectCharge: Moolre returned action-required message status='{}' message='{}'",
                     status, message);
             throw new ActionRequiredException(message);
         }
 
-        // Inject top-level message into data map for easy retrieval by caller
         if (!message.isBlank()) {
             var mutable = new java.util.LinkedHashMap<>(data);
             mutable.put("message", message);
@@ -656,6 +730,93 @@ public class MoolreController {
         }
 
         return data;
+    }
+
+    /**
+     * Calls Moolre POST /open/transact/authorize to submit the SMS OTP code
+     * sent to the user's phone and trigger the USSD payment prompt.
+     *
+     * This is only called from submitOtp() when /init returned actionRequired=true.
+     *
+     * ⚠️  Confirm the exact endpoint URL and payload field names with Moolre
+     *     support if you see unexpected errors.  The implementation follows the
+     *     standard pattern used by Moolre-compatible GHS providers.
+     *     Likely endpoint: POST https://api.moolre.com/open/transact/authorize
+     *     Payload: { "externalref": "...", "otp": "123456", "accountnumber": "..." }
+     */
+    @SuppressWarnings("unchecked")
+    private void moolreSubmitOtp(String externalRef, String otp) {
+
+        // ⚠️  Update this URL if Moolre's actual OTP endpoint differs.
+        String otpEndpoint = MOOLRE_BASE_URL + "/open/transact/authorize";
+
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("externalref",   externalRef);
+        body.put("otp",           otp);
+        body.put("accountnumber", accountNumber);
+
+        log.info("moolreSubmitOtp: calling {} for externalRef='{}'", otpEndpoint, externalRef);
+
+        String rawBody = webClientBuilder.build()
+                .post().uri(otpEndpoint)
+                .header("X-API-USER",   apiUser)
+                .header("X-API-PUBKEY", publicKey)
+                .header("Content-Type", "application/json")
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(
+                        status -> status.isError(),
+                        clientResponse -> clientResponse.bodyToMono(String.class)
+                                .map(b -> {
+                                    log.error("Moolre OTP HTTP error: status={} body={}",
+                                            clientResponse.statusCode(), b);
+                                    return new RuntimeException(
+                                            "OTP verification failed: " + clientResponse.statusCode() + " — " + b);
+                                })
+                )
+                .bodyToMono(String.class)
+                .onErrorMap(
+                        ex -> !(ex instanceof RuntimeException),
+                        ex -> {
+                            log.error("Moolre API unreachable during OTP submit", ex);
+                            return new RuntimeException("Moolre is currently unavailable. Please try again.");
+                        }
+                )
+                .onErrorMap(
+                        ex -> ex instanceof RuntimeException && ex.getMessage() == null,
+                        ex -> {
+                            log.error("Moolre submitOtp: RuntimeException with null message", ex);
+                            return new RuntimeException("Moolre is currently unavailable. Please try again.");
+                        }
+                )
+                .block();
+
+        if (rawBody == null || rawBody.isBlank())
+            throw new RuntimeException("Moolre returned an empty OTP response.");
+
+        Map<String, Object> result;
+        try {
+            result = (Map<String, Object>) objectMapper.readValue(rawBody, Map.class);
+        } catch (Exception e) {
+            log.error("Moolre submitOtp: non-JSON response body='{}'", rawBody);
+            throw new RuntimeException("Moolre returned an unexpected OTP response. Please try again.");
+        }
+
+        var status  = String.valueOf(result.get("status"));
+        var message = String.valueOf(result.getOrDefault("message", ""));
+
+        log.info("moolreSubmitOtp: status='{}' message='{}' externalRef='{}'",
+                status, message, externalRef);
+
+        if (!"1".equals(status)) {
+            log.error("moolreSubmitOtp: OTP rejected status='{}' message='{}'", status, message);
+            throw new RuntimeException(
+                    message.isBlank()
+                            ? "OTP verification failed. Please check the code and try again."
+                            : message);
+        }
+
+        log.info("moolreSubmitOtp: OTP accepted — USSD prompt triggered for externalRef='{}'", externalRef);
     }
 
     /**
