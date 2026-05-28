@@ -156,6 +156,9 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/baseball/espn/upcoming").permitAll()
 
                         // ── Tips & webhooks ───────────────────────────────────────────────
+                        // NOTE: /api/webhooks/** covers /api/webhooks/moolre automatically.
+                        //       Moolre webhook identity is verified internally via the secret
+                        //       field in the payload (see MoolreController.verifyWebhookSecret).
                         .requestMatchers(HttpMethod.GET,  "/api/tip/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
 
@@ -165,6 +168,20 @@ public class SecurityConfig {
                         // ── WebSocket & health ────────────────────────────────────────────
                         .requestMatchers("/ws/**").permitAll()
                         .requestMatchers("/actuator/health").permitAll()
+
+                        // ── Moolre — deposit flow (authenticated) ─────────────────────────
+                        // POST /api/wallet/deposit/moolre/init   — initiates USSD direct charge
+                        // POST /api/wallet/deposit/moolre/verify — polls / verifies payment
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/wallet/deposit/moolre/init",
+                                "/api/wallet/deposit/moolre/verify"
+                        ).authenticated()
+
+                        // ── Moolre — admin upgrade flow (authenticated) ───────────────────
+                        // POST /api/user/upgrade-to-admin/moolre/init — pays GHS 200 upgrade fee
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/user/upgrade-to-admin/moolre/init"
+                        ).authenticated()
 
                         // ── Admin & super-admin ───────────────────────────────────────────
                         .requestMatchers((superAdminPath + "/**")).hasRole("SUPER_ADMIN")
@@ -212,7 +229,11 @@ public class SecurityConfig {
                 "https://bet75.vercel.app",
                 "https://bet75-ui-1.vercel.app",
                 "https://nxtbetadmin.vercel.app",
-                "https://bet75admin.vercel.app"
+                "https://bet75admin.vercel.app",
+                // ── zynobet ───────────────────────────────────────────────────────
+                "https://zynobet.site",
+                "https://www.zynobet.site",
+                "https://oddsking-ui.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
