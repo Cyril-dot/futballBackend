@@ -74,11 +74,11 @@ import java.util.UUID;
  * ─── Moolre API base URL (hardcoded) ─────────────────────────────────────────
  *   https://api.moolre.com
  *
- * ─── application.yml keys needed ─────────────────────────────────────────────
- *   app.moolre.api-user
- *   app.moolre.public-key
- *   app.moolre.account-number
- *   app.moolre.webhook-secret
+ * ─── application.properties keys needed ──────────────────────────────────────
+ *   app.moolre.api-user          → env: MOOLRE_API_USER
+ *   app.moolre.public-key        → env: MOOLRE_PUBLIC_KEY
+ *   app.moolre.account-number    → env: MOOLRE_ACCOUNT_NUMBER
+ *   app.moolre.webhook-secret    → env: MOOLRE_WEBHOOK_SECRET
  *   app.platform.min-deposit-amount (default: 1)
  */
 @Slf4j
@@ -110,10 +110,10 @@ public class MoolreController {
     private final WebClient.Builder       webClientBuilder;
     private final ObjectMapper            objectMapper;
 
-    @Value("${app.moolre.api-user}")           private String     apiUser;
-    @Value("${app.moolre.public-key}")         private String     publicKey;
-    @Value("${app.moolre.account-number}")     private String     accountNumber;
-    @Value("${app.moolre.webhook-secret}")     private String     webhookSecret;
+    @Value("${app.moolre.api-user}")               private String     apiUser;
+    @Value("${app.moolre.public-key}")             private String     publicKey;
+    @Value("${app.moolre.account-number}")         private String     accountNumber;
+    @Value("${app.moolre.webhook-secret}")         private String     webhookSecret;
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ─── 1. Initiate USSD Charge — Deposit ───────────────────────────────────
@@ -150,7 +150,16 @@ public class MoolreController {
         log.info("initDeposit (USSD): userId='{}' amount={} phone='{}' network='{}' externalRef='{}'",
                 user.getId(), amount, phone, network, externalRef);
 
-        var chargeResult = moolreDirectCharge(amount, phone.toString(), network.toString(), externalRef);
+        Map<String, Object> chargeResult;
+        try {
+            chargeResult = moolreDirectCharge(amount, phone.toString(), network.toString(), externalRef);
+        } catch (RuntimeException ex) {
+            log.error("initDeposit: Moolre charge failed for userId='{}' externalRef='{}' — {}",
+                    user.getId(), externalRef, ex.getMessage(), ex);
+            throw ApiException.badRequest(ex.getMessage() != null
+                    ? ex.getMessage()
+                    : "Payment initiation failed. Please try again.");
+        }
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "externalref", externalRef,
@@ -192,7 +201,16 @@ public class MoolreController {
         log.info("initAdminUpgrade (USSD): userId='{}' phone='{}' network='{}' externalRef='{}'",
                 user.getId(), phone, network, externalRef);
 
-        var chargeResult = moolreDirectCharge(ADMIN_UPGRADE_FEE, phone.toString(), network.toString(), externalRef);
+        Map<String, Object> chargeResult;
+        try {
+            chargeResult = moolreDirectCharge(ADMIN_UPGRADE_FEE, phone.toString(), network.toString(), externalRef);
+        } catch (RuntimeException ex) {
+            log.error("initAdminUpgrade: Moolre charge failed for userId='{}' externalRef='{}' — {}",
+                    user.getId(), externalRef, ex.getMessage(), ex);
+            throw ApiException.badRequest(ex.getMessage() != null
+                    ? ex.getMessage()
+                    : "Upgrade payment initiation failed. Please try again.");
+        }
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "externalref", externalRef,
