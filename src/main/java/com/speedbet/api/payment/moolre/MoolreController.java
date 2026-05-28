@@ -26,59 +26,68 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * MoolreController — LOCAL MoMo payments only (MTN, Telecel, AT — Ghana GHS).
+ * MoolreController — GHS MoMo payments via Moolre USSD Direct Charge.
  *
- * ─── Three flows ────────────────────────────────────────────────────────────
+ * ─── Payment flows ───────────────────────────────────────────────────────────
  *
- *  1. USSD Push (Initiate Payment)
+ *  1. Initiate USSD Charge — Deposit
  *     POST /api/wallet/deposit/moolre/init
- *     • Requires the user's MoMo phone number + channel + amount.
- *     • Moolre sends a USSD prompt to the customer's phone.
- *     • Two-step: first call returns OTP_REQ → frontend collects OTP from user
- *       and calls the same endpoint again with otpcode in the body.
- *     • On OTP approval Moolre fires our webhook → wallet is credited.
+ *     • Accepts { amount, phone, network } from the frontend.
+ *     • Calls Moolre POST /open/transact/payment to push a USSD prompt directly
+ *       to the customer's MoMo number — no hosted page, no redirect.
+ *     • Returns { externalref, message } to the frontend.
+ *     • Customer approves the USSD prompt on their phone.
+ *     • Moolre fires our webhook → wallet is credited automatically.
  *
- *  2. Payment Verification (manual status check)
- *     POST /api/wallet/deposit/moolre/verify
- *     • Accepts the externalref the frontend stored during init.
- *     • Calls Moolre /open/transact/status.
- *     • If txstatus=1 (success) AND the ref hasn't been credited yet,
- *       credits the wallet immediately.
- *     • Idempotent — safe to call multiple times; duplicate refs are ignored.
- *
- *  3. Admin Upgrade
+ *  2. Initiate USSD Charge — Admin Upgrade
  *     POST /api/user/upgrade-to-admin/moolre/init
- *     • Same USSD push flow but promotes user to ADMIN on success.
- *     • Same verify endpoint works — externalref prefix drives intent.
+ *     • Same USSD direct flow but amount is fixed at GHS 200 and promotes
+ *       the user to ADMIN on successful payment.
  *
- *  4. Webhook  (primary / automatic path)
+ *  3. Payment Verification (manual fallback / polling)
+ *     POST /api/wallet/deposit/moolre/verify
+ *     • Accepts the externalref stored by the frontend after /init.
+ *     • Calls Moolre /open/transact/status.
+ *     • Credits wallet immediately if txstatus=1 and not already credited.
+ *     • Idempotent — safe to poll; duplicate refs are silently ignored.
+ *
+ *  4. Webhook (primary / automatic credit path)
  *     POST /api/webhooks/moolre
- *     • Moolre calls this automatically after a successful payment.
- *     • Verified via the `secret` field in the payload body.
- *     • Verification endpoint above is the fallback for missed webhooks.
+ *     • Moolre POSTs here after every successful payment.
+ *     • Verified by matching the `secret` field in the payload.
+ *     • /verify above is the fallback for missed or delayed webhooks.
+ *
+ * ─── network values accepted by frontend → Moolre channel codes ──────────────
+ *   "MTN"        → channel "13"  (MTN MoMo)
+ *   "VODAFONE"   → channel "6"   (Telecel, formerly Vodafone Cash)
+ *   "AIRTELTIGO" → channel "7"   (AirtelTigo Money)
  *
  * ─── externalref convention ──────────────────────────────────────────────────
  *   "deposit_<userId>_<uuid>"       → credit wallet
  *   "adminupgrade_<userId>_<uuid>"  → promote user to ADMIN
  *
- * ─── Moolre channels ─────────────────────────────────────────────────────────
- *   13 = MTN MoMo
- *    6 = Telecel Cash
- *    7 = AT Money
+ * ─── Moolre txstatus codes ───────────────────────────────────────────────────
+ *   0 = pending
+ *   1 = success
+ *   2 = failed / cancelled
+ *
+ * ─── Moolre API base URL (hardcoded) ─────────────────────────────────────────
+ *   https://api.moolre.com
  *
  * ─── application.yml keys needed ─────────────────────────────────────────────
  *   app.moolre.api-user
  *   app.moolre.public-key
  *   app.moolre.account-number
  *   app.moolre.webhook-secret
- *   app.moolre.base-url          (default: https://api.moolre.com)
- *   app.platform.min-deposit-amount  (default: 1)
- *   app.platform.frontend-url
+ *   app.platform.min-deposit-amount (default: 1)
  */
 @Slf4j
 @RestController
 @RequiredArgsConstructor
 public class MoolreController {
+
+    // ─── Hardcoded Moolre base URL ────────────────────────────────────────────
+    private static final String MOOLRE_BASE_URL = "https://api.moolre.com";
 
     private static final BigDecimal ADMIN_UPGRADE_FEE    = BigDecimal.valueOf(200);
     private static final String     UPGRADE_INTENT_ADMIN = "adminupgrade";
@@ -89,6 +98,11 @@ public class MoolreController {
     private static final int TX_PENDING = 0;
     private static final int TX_FAILED  = 2;
 
+    // Moolre channel codes (from official docs)
+    private static final String CHANNEL_MTN        = "13";
+    private static final String CHANNEL_VODAFONE   = "6";
+    private static final String CHANNEL_AIRTELTIGO = "7";
+
     private final WalletService           walletService;
     private final UserService             userService;
     private final AdminUpgradeChatService adminUpgradeChatService;
@@ -96,42 +110,24 @@ public class MoolreController {
     private final WebClient.Builder       webClientBuilder;
     private final ObjectMapper            objectMapper;
 
-    @Value("${app.moolre.api-user}")                         private String     apiUser;
-    @Value("${app.moolre.public-key}")                       private String     publicKey;
-    @Value("${app.moolre.account-number}")                   private String     accountNumber;
-    @Value("${app.moolre.webhook-secret}")                   private String     webhookSecret;
-    @Value("${app.moolre.base-url:https://api.moolre.com}")  private String     baseUrl;
-    @Value("${app.platform.min-deposit-amount:1}")           private BigDecimal minDeposit;
-    @Value("${app.platform.frontend-url}")                   private String     frontendUrl;
+    @Value("${app.moolre.api-user}")           private String     apiUser;
+    @Value("${app.moolre.public-key}")         private String     publicKey;
+    @Value("${app.moolre.account-number}")     private String     accountNumber;
+    @Value("${app.moolre.webhook-secret}")     private String     webhookSecret;
+    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
-    // ─── 1. USSD Push — Deposit Init ─────────────────────────────────────────
+    // ─── 1. Initiate USSD Charge — Deposit ───────────────────────────────────
 
     /**
-     * Sends a USSD payment prompt to the customer's MoMo phone.
+     * Initiates a Moolre USSD direct charge for a wallet deposit.
      *
      * Required body fields:
-     *   amount   – GHS amount (e.g. "50")
-     *   phone    – customer's MoMo number (e.g. "0244123456" or "233244123456")
-     *   channel  – "13" (MTN), "6" (Telecel), "7" (AT)
+     *   amount  – GHS amount to deposit (e.g. "300")
+     *   phone   – customer's MoMo number (e.g. "0244123456" or "233244123456")
+     *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
      *
-     * Optional body fields:
-     *   otpcode  – OTP entered by the user (only on the second call after
-     *              Moolre returns code "OTP_REQ")
-     *
-     * Response shapes from Moolre:
-     *
-     *   Step 1 — OTP sent to customer phone:
-     *     { "status": "1", "code": "OTP_REQ", "message": "OTP sent..." }
-     *     → Frontend should prompt user to enter OTP, then call this endpoint
-     *       again with the same body + otpcode field.
-     *
-     *   Step 2 — OTP verified, USSD prompt sent:
-     *     { "status": "1", "code": "PAYMENT_REQ", "message": "Payment requested" }
-     *     → Customer approves on their phone. Moolre fires webhook on completion.
-     *       Frontend should poll /verify endpoint or wait for a push notification.
-     *
-     * The externalref is returned in the response data so the frontend can
-     * store it and use it to call the /verify endpoint.
+     * Response:
+     *   { "externalref": "deposit_<userId>_<uuid>", "message": "..." }
      */
     @PostMapping("/api/wallet/deposit/moolre/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
@@ -139,55 +135,41 @@ public class MoolreController {
             @RequestBody Map<String, Object> req) {
 
         var amount  = new BigDecimal(req.get("amount").toString());
-        var phone   = req.get("phone").toString().trim();
-        var channel = req.get("channel").toString().trim();
-        var otpCode = req.containsKey("otpcode") ? req.get("otpcode").toString().trim() : null;
+        var phone   = req.get("phone");
+        var network = req.get("network");
 
         if (amount.compareTo(minDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        if (phone == null || phone.toString().isBlank())
+            throw ApiException.badRequest("phone is required.");
+        if (network == null || network.toString().isBlank())
+            throw ApiException.badRequest("network is required (MTN, VODAFONE, AIRTELTIGO).");
 
-        if (phone.isBlank())
-            throw ApiException.badRequest("Phone number is required.");
-
-        if (!channel.equals("13") && !channel.equals("6") && !channel.equals("7"))
-            throw ApiException.badRequest("Invalid channel. Use 13 (MTN), 6 (Telecel), or 7 (AT).");
-
-        // Build a stable externalref tied to the user so we can route the webhook
-        // and verify calls back to the right user without any session state.
-        // Format: deposit_<userId>_<uuid>
         var externalRef = DEPOSIT_INTENT + "_" + user.getId() + "_" + UUID.randomUUID();
 
-        log.info("initDeposit: userId='{}' amount={} channel={} externalRef='{}'",
-                user.getId(), amount, channel, externalRef);
+        log.info("initDeposit (USSD): userId='{}' amount={} phone='{}' network='{}' externalRef='{}'",
+                user.getId(), amount, phone, network, externalRef);
 
-        var response = moolreInitiatePayment(
-                phone,
-                channel,
-                amount,
-                externalRef,
-                otpCode,
-                "Deposit to SpeedBet wallet"
-        );
+        var chargeResult = moolreDirectCharge(amount, phone.toString(), network.toString(), externalRef);
 
-        // Attach the externalRef to the response so the frontend can store it
-        // and use it when calling /verify.
-        @SuppressWarnings("unchecked")
-        var mutableResponse = new java.util.LinkedHashMap<>(response);
-        mutableResponse.put("externalref", externalRef);
-
-        log.info("initDeposit: Moolre code='{}' message='{}' for userId='{}'",
-                response.get("code"), response.get("message"), user.getId());
-
-        return ResponseEntity.ok(ApiResponse.ok(mutableResponse));
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "externalref", externalRef,
+                "message", chargeResult.getOrDefault("message",
+                        "Please approve the USSD prompt on your phone.").toString()
+        )));
     }
 
-    // ─── 2. Admin Upgrade Init ────────────────────────────────────────────────
+    // ─── 2. Initiate USSD Charge — Admin Upgrade ──────────────────────────────
 
     /**
-     * Sends a USSD GHS 200 upgrade-fee prompt to the user's MoMo phone.
+     * Initiates a Moolre USSD direct charge for the GHS 200 admin upgrade fee.
      *
-     * Required body fields: phone, channel  (same as deposit init)
-     * Optional body fields: otpcode
+     * Required body fields:
+     *   phone   – customer's MoMo number
+     *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
+     *
+     * Response:
+     *   { "externalref": "adminupgrade_<userId>_<uuid>", "message": "..." }
      */
     @PostMapping("/api/user/upgrade-to-admin/moolre/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initAdminUpgrade(
@@ -197,48 +179,36 @@ public class MoolreController {
         if (user.getRole().name().equals("ADMIN"))
             throw ApiException.badRequest("You are already an Admin.");
 
-        var phone   = req.get("phone").toString().trim();
-        var channel = req.get("channel").toString().trim();
-        var otpCode = req.containsKey("otpcode") ? req.get("otpcode").toString().trim() : null;
+        var phone   = req.get("phone");
+        var network = req.get("network");
 
-        if (phone.isBlank())
-            throw ApiException.badRequest("Phone number is required.");
+        if (phone == null || phone.toString().isBlank())
+            throw ApiException.badRequest("phone is required.");
+        if (network == null || network.toString().isBlank())
+            throw ApiException.badRequest("network is required (MTN, VODAFONE, AIRTELTIGO).");
 
-        // Format: adminupgrade_<userId>_<uuid>
         var externalRef = UPGRADE_INTENT_ADMIN + "_" + user.getId() + "_" + UUID.randomUUID();
 
-        log.info("initAdminUpgrade: userId='{}' phone='{}' externalRef='{}'",
-                user.getId(), phone, externalRef);
+        log.info("initAdminUpgrade (USSD): userId='{}' phone='{}' network='{}' externalRef='{}'",
+                user.getId(), phone, network, externalRef);
 
-        var response = moolreInitiatePayment(
-                phone,
-                channel,
-                ADMIN_UPGRADE_FEE,
-                externalRef,
-                otpCode,
-                "SpeedBet Admin Upgrade — GHS 200"
-        );
+        var chargeResult = moolreDirectCharge(ADMIN_UPGRADE_FEE, phone.toString(), network.toString(), externalRef);
 
-        @SuppressWarnings("unchecked")
-        var mutableResponse = new java.util.LinkedHashMap<>(response);
-        mutableResponse.put("externalref", externalRef);
-
-        return ResponseEntity.ok(ApiResponse.ok(mutableResponse));
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "externalref", externalRef,
+                "message", chargeResult.getOrDefault("message",
+                        "Please approve the USSD prompt on your phone.").toString()
+        )));
     }
 
     // ─── 3. Payment Verification ──────────────────────────────────────────────
 
     /**
-     * Manually verifies a Moolre payment by its externalref and, if successful,
-     * credits the wallet immediately (idempotent).
-     *
-     * Use this as a fallback when:
-     *   • The webhook was delayed or missed.
-     *   • The user returns to the app after completing MoMo approval and wants
-     *     their balance updated right away.
+     * Manually verifies a Moolre payment by its externalref and credits the
+     * wallet if successful. Idempotent — safe to poll.
      *
      * Required body fields:
-     *   externalref – the reference returned by /init (stored by the frontend)
+     *   externalref – the reference returned by /init
      *
      * Response:
      *   { credited: true/false, txstatus: 1|0|2, message: "..." }
@@ -252,10 +222,7 @@ public class MoolreController {
         if (externalRef == null || externalRef.toString().isBlank())
             throw ApiException.badRequest("externalref is required.");
 
-        var ref = externalRef.toString().trim();
-
-        // Security: ensure the externalref belongs to this authenticated user
-        // Format is always "<intent>_<userId>_<uuid>"
+        var ref   = externalRef.toString().trim();
         var parts = ref.split("_", 3);
         if (parts.length < 3)
             throw ApiException.badRequest("Invalid externalref format.");
@@ -272,59 +239,52 @@ public class MoolreController {
 
         log.info("verifyPayment: userId='{}' externalRef='{}'", user.getId(), ref);
 
-        // Call Moolre status API
         var statusResponse = moolreCheckStatus(ref);
 
         @SuppressWarnings("unchecked")
-        var data      = (Map<String, Object>) statusResponse.get("data");
-        var txStatus  = data != null
+        var data     = (Map<String, Object>) statusResponse.get("data");
+        var txStatus = data != null
                 ? Integer.parseInt(data.getOrDefault("txstatus", "-1").toString())
                 : -1;
 
         if (txStatus == TX_PENDING) {
-            log.info("verifyPayment: still pending externalRef='{}'", ref);
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                    "credited",  false,
-                    "txstatus",  TX_PENDING,
-                    "message",   "Payment is still pending. Please approve the USSD prompt on your phone."
+                    "credited", false,
+                    "txstatus", TX_PENDING,
+                    "message",  "Payment is still pending. Please approve the USSD prompt on your phone."
             )));
         }
 
         if (txStatus == TX_FAILED) {
-            log.warn("verifyPayment: payment failed externalRef='{}'", ref);
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                    "credited",  false,
-                    "txstatus",  TX_FAILED,
-                    "message",   "Payment failed or was cancelled."
+                    "credited", false,
+                    "txstatus", TX_FAILED,
+                    "message",  "Payment failed or was cancelled."
             )));
         }
 
         if (txStatus != TX_SUCCESS) {
             log.warn("verifyPayment: unknown txstatus={} externalRef='{}'", txStatus, ref);
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                    "credited",  false,
-                    "txstatus",  txStatus,
-                    "message",   "Unexpected payment status. Please contact support."
+                    "credited", false,
+                    "txstatus", txStatus,
+                    "message",  "Unexpected payment status. Please contact support."
             )));
         }
 
         // txstatus = 1 (success) — credit the wallet
-        var valueStr = data.getOrDefault("value", data.get("amount")).toString();
+        var valueStr = resolveAmount(data, ref);
         var amount   = new BigDecimal(valueStr);
-        var intent   = parts[0]; // "deposit" or "adminupgrade"
+        var intent   = parts[0];
 
-        boolean credited = false;
-
-        if (UPGRADE_INTENT_ADMIN.equals(intent)) {
-            credited = verifyAndHandleAdminUpgrade(user.getId(), ref, amount);
-        } else {
-            credited = verifyAndHandleDeposit(user.getId(), ref, amount);
-        }
+        boolean credited = UPGRADE_INTENT_ADMIN.equals(intent)
+                ? verifyAndHandleAdminUpgrade(user.getId(), ref, amount)
+                : verifyAndHandleDeposit(user.getId(), ref, amount);
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "credited",  credited,
-                "txstatus",  TX_SUCCESS,
-                "message",   credited
+                "credited", credited,
+                "txstatus", TX_SUCCESS,
+                "message",  credited
                         ? "Payment verified. GHS " + amount + " has been added to your wallet."
                         : "Payment was already processed."
         )));
@@ -335,10 +295,11 @@ public class MoolreController {
     /**
      * Receives Moolre payment callbacks automatically after each successful payment.
      *
-     * Payload shape:
+     * Payload shape (from Moolre docs):
      * {
      *   "status": 1,
      *   "code":   "P01",
+     *   "message": "Transaction Successful",
      *   "data": {
      *     "txstatus":      1,
      *     "payer":         "233244123456",
@@ -346,14 +307,11 @@ public class MoolreController {
      *     "amount":        "50.00",
      *     "value":         "50.00",
      *     "transactionid": "32712684",
-     *     "externalref":   "deposit_uuid_uuid",
-     *     "secret":        "<webhook-secret-from-dashboard>",
+     *     "externalref":   "deposit_<userId>_<uuid>",
+     *     "secret":        "<webhook-secret>",
      *     "ts":            "2024-11-27 21:11:29"
      *   }
      * }
-     *
-     * Verification: compare data.secret with app.moolre.webhook-secret using
-     * constant-time comparison (MessageDigest.isEqual) to prevent timing attacks.
      */
     @PostMapping("/api/webhooks/moolre")
     public ResponseEntity<String> webhook(HttpServletRequest request) {
@@ -386,6 +344,14 @@ public class MoolreController {
                 return ResponseEntity.status(400).body("Invalid secret");
             }
 
+            // ── Belt-and-suspenders: verify accountnumber matches ours ───────
+            var incomingAccount = data.getOrDefault("accountnumber", "").toString();
+            if (!accountNumber.equals(incomingAccount)) {
+                log.warn("Moolre webhook: accountnumber mismatch — incoming='{}' expected='{}'",
+                        incomingAccount, accountNumber);
+                return ResponseEntity.status(400).body("Account mismatch");
+            }
+
             // ── Only process successful transactions ─────────────────────────
             var txStatus = Integer.parseInt(data.getOrDefault("txstatus", "-1").toString());
             if (txStatus != TX_SUCCESS) {
@@ -402,7 +368,7 @@ public class MoolreController {
             }
 
             var ref      = externalRef.toString();
-            var valueStr = data.getOrDefault("value", data.get("amount")).toString();
+            var valueStr = resolveAmount(data, ref);
             var amount   = new BigDecimal(valueStr);
 
             // ── Route by intent encoded in externalref prefix ────────────────
@@ -440,17 +406,12 @@ public class MoolreController {
 
     // ─── Private — wallet handlers ────────────────────────────────────────────
 
-    /**
-     * Credits the user's wallet on a successful deposit.
-     * Returns true if credited now, false if already credited (duplicate ref).
-     */
     private boolean handleDeposit(UUID userId, String ref, BigDecimal amount) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}'", userId, amount, ref);
         try {
             walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
                     Map.of("provider", "moolre", "reference", ref));
-            log.info("handleDeposit: GHS {} credited to userId='{}' ref='{}'",
-                    amount, userId, ref);
+            log.info("handleDeposit: GHS {} credited to userId='{}' ref='{}'", amount, userId, ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("handleDeposit: duplicate ref='{}' already processed — skipping", ref);
@@ -459,43 +420,25 @@ public class MoolreController {
             throw ex;
         }
 
-        // ── Attribute referral commission ──────────────────────────────────
         try {
             referralService.attributeCommission(userId, amount);
-            log.info("handleDeposit: commission attributed for userId='{}' deposit='{}'",
-                    userId, amount);
+            log.info("handleDeposit: commission attributed for userId='{}' deposit='{}'", userId, amount);
         } catch (Exception ex) {
-            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate",
-                    userId, ex);
+            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate", userId, ex);
         }
 
         return true;
     }
 
-    /**
-     * Same as handleDeposit but called from the /verify endpoint.
-     * Separated for clarity — behaviour is identical.
-     */
     private boolean verifyAndHandleDeposit(UUID userId, String ref, BigDecimal amount) {
         return handleDeposit(userId, ref, amount);
     }
 
-    /**
-     * Promotes the user to ADMIN after a successful GHS 200 upgrade payment.
-     * Returns true if promoted now, false if already processed (duplicate ref).
-     *
-     * Steps:
-     *   1. Validate amount >= GHS 200
-     *   2. userService.upgradeToAdmin  (409 = already done → idempotent skip)
-     *   3. walletService.recordExternalDebit — audit record only (Moolre collected funds)
-     *   4. adminUpgradeChatService.createUpgradeChat — onboarding with Super Admin
-     */
     private boolean handleAdminUpgrade(UUID userId, String ref, BigDecimal amount) {
         log.info("handleAdminUpgrade: userId='{}' amount={} ref='{}'", userId, amount, ref);
 
         if (amount.compareTo(ADMIN_UPGRADE_FEE) < 0) {
-            log.error("handleAdminUpgrade: amount {} < GHS 200 for userId='{}' ref='{}'",
-                    amount, userId, ref);
+            log.error("handleAdminUpgrade: amount {} < GHS 200 for userId='{}' ref='{}'", amount, userId, ref);
             throw ApiException.badRequest(
                     "Upgrade payment GHS " + amount + " is less than required GHS 200.");
         }
@@ -521,9 +464,6 @@ public class MoolreController {
         return true;
     }
 
-    /**
-     * Same as handleAdminUpgrade but called from the /verify endpoint.
-     */
     private boolean verifyAndHandleAdminUpgrade(UUID userId, String ref, BigDecimal amount) {
         return handleAdminUpgrade(userId, ref, amount);
     }
@@ -531,93 +471,116 @@ public class MoolreController {
     // ─── Moolre API helpers ───────────────────────────────────────────────────
 
     /**
-     * Calls Moolre POST /open/transact/payment (Initiate Payment — USSD push).
+     * Calls Moolre POST /open/transact/payment to initiate a USSD direct charge.
      *
-     * This is a two-step flow:
-     *   Call 1 (no otpcode): Moolre sends OTP to customer's phone.
-     *                         Returns code="OTP_REQ".
-     *   Call 2 (with otpcode): Moolre verifies OTP and sends USSD approval
-     *                          prompt to customer's phone.
-     *                          Returns code="PAYMENT_REQ".
+     * Moolre docs: https://docs.moolre.com/#/initiate-payment
      *
-     * The sessionid field (optional) can skip the OTP step if you have a
-     * USSD session ID — not used here.
-     *
-     * Moolre channel codes:
-     *   13 = MTN MoMo
-     *    6 = Telecel Cash
-     *    7 = AT Money
+     * Key request fields (per official docs):
+     *   type          = 1            (required by Moolre)
+     *   channel       = "13" | "6" | "7"  (MTN | Telecel | AirtelTigo)
+     *   currency      = "GHS"
+     *   payer         = MoMo number of the customer
+     *   amount        = amount to charge
+     *   externalref   = unique ID per transaction
+     *   accountnumber = your Moolre account number
      */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> moolreInitiatePayment(String phone,
-                                                      String channel,
-                                                      BigDecimal amount,
-                                                      String externalRef,
-                                                      String otpCode,
-                                                      String reference) {
+    private Map<String, Object> moolreDirectCharge(
+            BigDecimal amount, String phone, String network, String externalRef) {
 
-        var bodyBuilder = new java.util.LinkedHashMap<String, Object>();
-        bodyBuilder.put("type",          1);
-        bodyBuilder.put("channel",       channel);
-        bodyBuilder.put("currency",      "GHS");
-        bodyBuilder.put("payer",         phone);
-        bodyBuilder.put("amount",        amount.toPlainString());
-        bodyBuilder.put("externalref",   externalRef);
-        bodyBuilder.put("reference",     reference);
-        bodyBuilder.put("accountnumber", accountNumber);
-        // Only include otpcode when the frontend is submitting the OTP (Step 2)
-        if (otpCode != null && !otpCode.isBlank()) {
-            bodyBuilder.put("otpcode", otpCode);
-        }
+        // Map frontend network name → Moolre channel code (per official docs)
+        String channel = switch (network.toUpperCase()) {
+            case "MTN"        -> CHANNEL_MTN;
+            case "VODAFONE"   -> CHANNEL_VODAFONE;
+            case "AIRTELTIGO" -> CHANNEL_AIRTELTIGO;
+            default -> throw new RuntimeException("Unsupported network: " + network
+                    + ". Must be MTN, VODAFONE, or AIRTELTIGO.");
+        };
 
-        var result = (Map<String, Object>) webClientBuilder.build()
-                .post().uri(baseUrl + "/open/transact/payment")
-                .header("X-API-USER",    apiUser)
-                .header("X-API-PUBKEY",  publicKey)
-                .header("Content-Type",  "application/json")
-                .bodyValue(bodyBuilder)
+        var body = new java.util.LinkedHashMap<String, Object>();
+        body.put("type",          1);
+        body.put("channel",       channel);
+        body.put("currency",      "GHS");
+        body.put("payer",         phone);
+        body.put("amount",        amount.toPlainString());
+        body.put("externalref",   externalRef);
+        body.put("accountnumber", accountNumber);
+
+        log.info("moolreDirectCharge: calling /open/transact/payment — channel='{}' phone='{}' amount='{}' externalRef='{}'",
+                channel, phone, amount, externalRef);
+
+        String rawBody = webClientBuilder.build()
+                .post().uri(MOOLRE_BASE_URL + "/open/transact/payment")
+                .header("X-API-USER",   apiUser)
+                .header("X-API-PUBKEY", publicKey)
+                .header("Content-Type", "application/json")
+                .bodyValue(body)
                 .retrieve()
                 .onStatus(
                         status -> status.isError(),
                         clientResponse -> clientResponse.bodyToMono(String.class)
-                                .map(body -> {
-                                    log.error("Moolre initiatePayment error: status={} body={}",
-                                            clientResponse.statusCode(), body);
+                                .map(b -> {
+                                    log.error("Moolre directCharge HTTP error: status={} body={}",
+                                            clientResponse.statusCode(), b);
                                     return new RuntimeException(
-                                            "Moolre returned " + clientResponse.statusCode()
-                                                    + ": " + body);
+                                            "Moolre returned HTTP " + clientResponse.statusCode() + ": " + b);
                                 })
                 )
-                .bodyToMono(java.util.Map.class)
+                .bodyToMono(String.class)
                 .onErrorMap(
-                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> !(ex instanceof RuntimeException),
                         ex -> {
-                            log.error("Moolre API unreachable", ex);
-                            return new RuntimeException(
-                                    "Moolre is currently unavailable. Please try again.");
+                            log.error("Moolre API unreachable during directCharge", ex);
+                            return new RuntimeException("Moolre is currently unavailable. Please try again.");
+                        }
+                )
+                .onErrorMap(
+                        ex -> ex instanceof RuntimeException && ex.getMessage() == null,
+                        ex -> {
+                            log.error("Moolre directCharge: RuntimeException with null message", ex);
+                            return new RuntimeException("Moolre is currently unavailable. Please try again.");
                         }
                 )
                 .block();
 
-        if (result == null)
+        if (rawBody == null || rawBody.isBlank())
             throw new RuntimeException("Moolre returned an empty response.");
 
-        log.info("moolreInitiatePayment: status='{}' code='{}' message='{}'",
-                result.get("status"), result.get("code"), result.get("message"));
+        Map<String, Object> result;
+        try {
+            result = (Map<String, Object>) objectMapper.readValue(rawBody, Map.class);
+        } catch (Exception e) {
+            log.error("Moolre directCharge: non-JSON response body='{}'", rawBody);
+            throw new RuntimeException("Moolre returned an unexpected response. Please try again.");
+        }
 
-        // Moolre uses status "0" (string) for errors in this endpoint
-        var status = String.valueOf(result.get("status"));
-        if ("0".equals(status)) {
-            var message = result.getOrDefault("message", "Moolre declined the request").toString();
-            log.error("moolreInitiatePayment: Moolre status=0 — {}", message);
+        var status  = String.valueOf(result.get("status"));
+        var message = String.valueOf(result.getOrDefault("message", ""));
+
+        log.info("moolreDirectCharge: status='{}' message='{}' externalRef='{}'",
+                status, message, externalRef);
+
+        if (!"1".equals(status)) {
+            log.error("moolreDirectCharge: Moolre error status='{}' message='{}'", status, message);
             throw new RuntimeException("Moolre error: " + message);
         }
 
-        return result;
+        var data = (Map<String, Object>) result.getOrDefault("data", Map.of());
+
+        // Inject top-level message into data map for easy retrieval by caller
+        if (!message.isBlank()) {
+            var mutable = new java.util.LinkedHashMap<>(data);
+            mutable.put("message", message);
+            return mutable;
+        }
+
+        return data;
     }
 
     /**
      * Calls Moolre POST /open/transact/status to check payment status by externalref.
+     *
+     * Moolre docs: https://docs.moolre.com/#/payment-status
      *
      * Returns the full Moolre response map including the nested `data` object:
      * {
@@ -625,8 +588,8 @@ public class MoolreController {
      *   "data": {
      *     "txstatus": 1,     ← 1=success, 0=pending, 2=failed
      *     "amount":   "50",
-     *     "value":    "50",  ← post-fee actual credited amount
-     *     "externalref": "deposit_uuid_uuid",
+     *     "value":    "50",
+     *     "externalref": "deposit_<userId>_<uuid>",
      *     ...
      *   }
      * }
@@ -634,14 +597,14 @@ public class MoolreController {
     @SuppressWarnings("unchecked")
     private Map<String, Object> moolreCheckStatus(String externalRef) {
 
-        var result = (Map<String, Object>) webClientBuilder.build()
-                .post().uri(baseUrl + "/open/transact/status")
+        String rawBody = webClientBuilder.build()
+                .post().uri(MOOLRE_BASE_URL + "/open/transact/status")
                 .header("X-API-USER",   apiUser)
                 .header("X-API-PUBKEY", publicKey)
                 .header("Content-Type", "application/json")
                 .bodyValue(Map.of(
                         "type",          1,
-                        "idtype",        "1",      // 1 = lookup by externalref
+                        "idtype",        "1",
                         "id",            externalRef,
                         "accountnumber", accountNumber
                 ))
@@ -649,27 +612,40 @@ public class MoolreController {
                 .onStatus(
                         status -> status.isError(),
                         clientResponse -> clientResponse.bodyToMono(String.class)
-                                .map(body -> {
-                                    log.error("Moolre checkStatus error: status={} body={}",
-                                            clientResponse.statusCode(), body);
+                                .map(b -> {
+                                    log.error("Moolre checkStatus HTTP error: status={} body={}",
+                                            clientResponse.statusCode(), b);
                                     return new RuntimeException(
-                                            "Moolre returned " + clientResponse.statusCode()
-                                                    + ": " + body);
+                                            "Moolre returned HTTP " + clientResponse.statusCode() + ": " + b);
                                 })
                 )
-                .bodyToMono(java.util.Map.class)
+                .bodyToMono(String.class)
                 .onErrorMap(
-                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> !(ex instanceof RuntimeException),
                         ex -> {
                             log.error("Moolre API unreachable during status check", ex);
-                            return new RuntimeException(
-                                    "Moolre is currently unavailable. Please try again.");
+                            return new RuntimeException("Moolre is currently unavailable. Please try again.");
+                        }
+                )
+                .onErrorMap(
+                        ex -> ex instanceof RuntimeException && ex.getMessage() == null,
+                        ex -> {
+                            log.error("Moolre checkStatus: RuntimeException with null message", ex);
+                            return new RuntimeException("Moolre is currently unavailable. Please try again.");
                         }
                 )
                 .block();
 
-        if (result == null)
+        if (rawBody == null || rawBody.isBlank())
             throw new RuntimeException("Moolre returned an empty status response.");
+
+        Map<String, Object> result;
+        try {
+            result = (Map<String, Object>) objectMapper.readValue(rawBody, Map.class);
+        } catch (Exception e) {
+            log.error("Moolre checkStatus: non-JSON response body='{}'", rawBody);
+            throw new RuntimeException("Moolre returned an unexpected status response. Please try again.");
+        }
 
         log.info("moolreCheckStatus: status='{}' message='{}' for externalRef='{}'",
                 result.get("status"), result.get("message"), externalRef);
@@ -677,12 +653,29 @@ public class MoolreController {
         return result;
     }
 
+    // ─── Utility helpers ──────────────────────────────────────────────────────
+
+    /**
+     * Safely resolves the transaction amount from a Moolre data map.
+     * Priority: "value" → "amount" → throws ApiException if neither present.
+     */
+    private static String resolveAmount(Map<String, Object> data, String ref) {
+        var value = data.get("value");
+        if (value != null && !value.toString().isBlank()) return value.toString();
+
+        var amount = data.get("amount");
+        if (amount != null && !amount.toString().isBlank()) return amount.toString();
+
+        throw ApiException.badRequest(
+                "Moolre response is missing both 'value' and 'amount' fields for ref='" + ref + "'");
+    }
+
     // ─── Webhook secret verification ──────────────────────────────────────────
 
     /**
-     * Moolre does not use HMAC — it sends a plain secret string inside the
-     * payload body that matches the one configured on your Moolre dashboard.
-     * We use MessageDigest.isEqual for constant-time comparison.
+     * Moolre sends a plain secret string inside the payload body that matches
+     * the one configured on your Moolre dashboard.
+     * Uses MessageDigest.isEqual for constant-time comparison.
      */
     private boolean verifyWebhookSecret(String incomingSecret) {
         if (incomingSecret == null || incomingSecret.isBlank()) {
