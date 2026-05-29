@@ -13,69 +13,6 @@ import java.math.RoundingMode;
 import java.util.List;
 import java.util.UUID;
 
-/**
- * SettlementEngine — settles bets across all SpeedBet markets:
- *
- *   Markets handled:
- *   ┌─────────────────┬───────────────────────────────────────────────────────┐
- *   │ 1X2 / ONE_X_TWO │ Full-time: Home Win / Draw / Away Win                 │
- *   │ HOME_WIN        │ Alias — home wins at full time                         │
- *   │ AWAY_WIN        │ Alias — away wins at full time                         │
- *   │ BTTS            │ Both Teams To Score — Yes / No                         │
- *   │ OVER_UNDER      │ Total goals — line parsed from selection string         │
- *   │ CORRECT_SCORE   │ Exact full-time scoreline "h-a"                        │
- *   │ DOUBLE_CHANCE   │ 1X / X2 / 12                                           │
- *   │ HALF_TIME       │ Half-time result: Home / Draw / Away                   │
- *   │ ASIAN_HANDICAP  │ Half / Whole / Quarter lines — push & partial support  │
- *   └─────────────────┴───────────────────────────────────────────────────────┘
- *
- *  Asian Handicap settlement:
- *   • Half lines  (e.g. ±0.5, ±1.5, ±2.5)  — FULL WIN or FULL LOSS only
- *   • Whole lines (e.g. ±1,  ±2)            — WIN, PUSH (refund), or LOSS
- *   • Quarter lines (e.g. ±0.25, ±0.75)    — stake split 50/50 across two sub-lines;
- *                                             results: FULL WIN, HALF WIN, PUSH,
- *                                             HALF LOSS, or FULL LOSS
- *
- *  The selection string for ASIAN_HANDICAP encodes side and line together:
- *   e.g. "Home -1.5", "Away +0.25", "Home -1"
- *
- *  Void odds product:
- *   When a selection is fully voided (VOID or PUSH on a whole-line handicap),
- *   its locked odds are divided OUT of the parlay total so the remaining legs
- *   are settled at their true combined odds.
- *
- *  Partial payouts (quarter handicap half results):
- *   When a selection is HALF_WON the effective payout multiplier is:
- *       (oddsLocked + 1) / 2      — half at odds, half returned at 1.0
- *   When a selection is HALF_LOST the multiplier is 0.5 (half stake lost).
- *   A HALF_LOST leg does NOT fail the entire accumulator — a partial
- *   odds adjustment is applied instead.
- *
- *  FIX 1 — evaluate1X2: normalise selection to uppercase before matching so
- *   that persistence-normalised values ("HOME", "AWAY", "DRAW") settle
- *   correctly alongside human-readable aliases ("Home Win", "Away Win").
- *
- *  FIX 2 — evaluateAsianHandicap: use epsilon comparisons (< 0.01) for all
- *   fractional checks instead of exact == equality, preventing floating-point
- *   parse drift from routing a valid line into the VOID branch.
- *
- *  FIX 3 — run(): after markSettled(), do a final sweep for any bets placed
- *   during the settlement window (race-condition guard).
- *
- *  FIX 4 — runOrphanedBetRecovery(): every 2 minutes, scan all already-settled
- *   matches for any PENDING bets that were missed (e.g. placed after settlement
- *   or skipped due to a race condition). This is the primary safety net that
- *   prevents the issue where bets placed before a match finishes are never
- *   settled because the match was already marked settled when the engine ran.
- *
- *  FIX 5 — settleOneBet(): multi-leg accumulator fix. Previously, the
- *   allSettled check used "PENDING".equals(s.getResult()) across ALL selections,
- *   meaning legs from other not-yet-finished matches (still result=PENDING in DB)
- *   would always cause the bet to defer and never pay out. The fix restricts the
- *   check to only legs whose match is either the current match being settled OR
- *   already fully settled — so a multi-leg bet correctly resolves once its last
- *   outstanding match finishes.
- */
 @Slf4j
 @Component
 @RequiredArgsConstructor
@@ -99,7 +36,6 @@ public class SettlementEngine {
                 matchService.markSettled(match.getId().toString());
                 log.info("Settlement run: match {} marked settled", match.getId());
 
-                // FIX 3: final sweep for bets placed during the settlement window
                 List<Bet> lateBets = betService.getPendingBetsForMatch(match.getId());
                 if (!lateBets.isEmpty()) {
                     log.warn("Settlement run: {} late bet(s) found after settling match {} — processing now",
@@ -122,16 +58,8 @@ public class SettlementEngine {
         log.info("Settlement run: complete");
     }
 
-    // ── Orphan recovery — catches bets missed due to race conditions ──────
+    // ── Orphan recovery ───────────────────────────────────────────────────
 
-    /**
-     * FIX 4: Scans all already-settled matches every 2 minutes for any PENDING
-     * bets that were never processed. This handles the case where:
-     *   - A bet was placed after the match was marked settled
-     *   - The engine ran and marked the match settled before getPendingBetsForMatch()
-     *     returned the bet (timing/transaction visibility issue)
-     *   - Any other edge case that left a bet stranded as PENDING
-     */
     @Scheduled(fixedDelay = 120_000)
     public void runOrphanedBetRecovery() {
         log.info("Orphan recovery: scanning for pending bets on already-settled matches");
@@ -183,7 +111,6 @@ public class SettlementEngine {
         int a = match.getScoreAway();
         log.info("settleMatch: match {} final score {}-{}", match.getId(), h, a);
 
-        // Log half-time metadata so we can verify it arrived before settling HALF_TIME bets
         Integer htHome = extractIntFromMetadata(match, "score_home_ht");
         Integer htAway = extractIntFromMetadata(match, "score_away_ht");
         if (htHome != null && htAway != null) {
@@ -195,7 +122,7 @@ public class SettlementEngine {
         var pendingBets = betService.getPendingBetsForMatch(match.getId());
         log.info("settleMatch: {} pending bet(s) found for match {}", pendingBets.size(), match.getId());
 
-        int won = 0, lost = 0, voided = 0, partial = 0;
+        int won = 0, lost = 0, voided = 0, deferred = 0;
         for (var bet : pendingBets) {
             BetStatus before = bet.getStatus();
             settleOneBet(bet, match);
@@ -203,13 +130,13 @@ public class SettlementEngine {
             if      (BetStatus.WON.equals(after))  won++;
             else if (BetStatus.LOST.equals(after)) lost++;
             else if (BetStatus.VOID.equals(after)) voided++;
-            else                                   partial++;
+            else                                   deferred++;
             if (!before.equals(after)) {
                 log.debug("settleMatch: bet {} {} → {}", bet.getId(), before, after);
             }
         }
-        log.info("settleMatch: match {} done — WON={} LOST={} VOID={} other={}",
-                match.getId(), won, lost, voided, partial);
+        log.info("settleMatch: match {} done — WON={} LOST={} VOID={} DEFERRED={}",
+                match.getId(), won, lost, voided, deferred);
     }
 
     // ── Bet-level settlement ──────────────────────────────────────────────
@@ -219,10 +146,11 @@ public class SettlementEngine {
                 bet.getId(), bet.getStake(), bet.getTotalOdds(), bet.getSelections().size());
 
         boolean hasFullLoss = false;
-        BigDecimal oddsAdjustment = BigDecimal.ONE;
 
+        // Step 1: evaluate selections belonging to the current match that are still PENDING
         for (var sel : bet.getSelections()) {
             if (!sel.getMatchId().equals(match.getId())) continue;
+            if (!"PENDING".equals(sel.getResult())) continue;
 
             String result = evaluateSelection(sel, match);
             sel.setResult(result);
@@ -231,19 +159,39 @@ public class SettlementEngine {
                     bet.getId(), sel.getId(), sel.getMarket(), sel.getSelection(),
                     sel.getOddsLocked(), result);
 
-            switch (result) {
-                case "LOST" -> {
-                    hasFullLoss = true;
-                    log.debug("settleOneBet: bet {} — full loss flagged on sel {}", bet.getId(), sel.getId());
-                }
+            if ("LOST".equals(result)) {
+                hasFullLoss = true;
+            }
+        }
 
-                case "VOID", "PUSH" -> {
-                    oddsAdjustment = oddsAdjustment
-                            .divide(sel.getOddsLocked(), MathContext.DECIMAL64);
-                    log.debug("settleOneBet: bet {} sel {} {} — divided out odds {}, adjustment now {}",
-                            bet.getId(), sel.getId(), result, sel.getOddsLocked(), oddsAdjustment);
-                }
+        // A losing leg ends the bet immediately
+        if (hasFullLoss) {
+            log.info("settleOneBet: bet {} LOST (outright losing leg on match {})", bet.getId(), match.getId());
+            betService.settleBet(bet, BetStatus.LOST, null);
+            return;
+        }
 
+        // Step 2: check if any legs are still outstanding on unfinished matches
+        boolean allSettled = bet.getSelections().stream().noneMatch(s -> {
+            if (!"PENDING".equals(s.getResult())) return false;
+            if (s.getMatchId().equals(match.getId())) return false;
+            return !isMatchSettled(s.getMatchId());
+        });
+
+        if (!allSettled) {
+            log.debug("settleOneBet: bet {} — outstanding legs remain, saving progress and deferring", bet.getId());
+            betService.saveSelectionsOnly(bet);
+            return;
+        }
+
+        // Step 3: all legs resolved — calculate effective odds across every selection
+        BigDecimal oddsAdjustment = BigDecimal.ONE;
+        for (var sel : bet.getSelections()) {
+            switch (sel.getResult()) {
+                case "WON"  -> {}
+                case "LOST" -> hasFullLoss = true;
+                case "VOID", "PUSH" -> oddsAdjustment = oddsAdjustment
+                        .divide(sel.getOddsLocked(), MathContext.DECIMAL64);
                 case "HALF_WON" -> {
                     BigDecimal halfWinMultiplier = sel.getOddsLocked()
                             .add(BigDecimal.ONE)
@@ -251,48 +199,18 @@ public class SettlementEngine {
                     oddsAdjustment = oddsAdjustment
                             .divide(sel.getOddsLocked(), MathContext.DECIMAL64)
                             .multiply(halfWinMultiplier, MathContext.DECIMAL64);
-                    log.debug("settleOneBet: bet {} sel {} HALF_WON — halfWinMultiplier={} adjustment now {}",
-                            bet.getId(), sel.getId(), halfWinMultiplier, oddsAdjustment);
                 }
-
-                case "HALF_LOST" -> {
-                    oddsAdjustment = oddsAdjustment
-                            .divide(sel.getOddsLocked(), MathContext.DECIMAL64)
-                            .multiply(new BigDecimal("0.5"), MathContext.DECIMAL64);
-                    log.debug("settleOneBet: bet {} sel {} HALF_LOST — adjustment now {}",
-                            bet.getId(), sel.getId(), oddsAdjustment);
-                }
-
-                case "WON" -> log.debug("settleOneBet: bet {} sel {} WON — no odds adjustment",
-                        bet.getId(), sel.getId());
-
-                default -> log.warn("settleOneBet: unknown result '{}' for sel {} — treating as VOID",
-                        result, sel.getId());
+                case "HALF_LOST" -> oddsAdjustment = oddsAdjustment
+                        .divide(sel.getOddsLocked(), MathContext.DECIMAL64)
+                        .multiply(new BigDecimal("0.5"), MathContext.DECIMAL64);
+                default -> log.warn("settleOneBet: unrecognised result '{}' on sel {} — treating as VOID",
+                        sel.getResult(), sel.getId());
             }
         }
 
         if (hasFullLoss) {
-            log.info("settleOneBet: bet {} LOST (at least one outright losing leg)", bet.getId());
+            log.info("settleOneBet: bet {} LOST (losing leg found in final sweep)", bet.getId());
             betService.settleBet(bet, BetStatus.LOST, null);
-            return;
-        }
-
-        // ── FIX 5: Multi-leg accumulator fix ─────────────────────────────────
-        // Previously this checked ALL selections for "PENDING", which meant legs
-        // from other not-yet-finished matches (still PENDING in the DB) would
-        // always cause the bet to defer, so multi-leg bets were never settled.
-        //
-        // The fix: only consider a leg "outstanding" if its match is neither the
-        // current match nor already fully settled. Legs from finished+settled
-        // matches will have a non-PENDING result stored in the DB; legs from the
-        // current match just had their result set above. Only legs from genuinely
-        // still-live matches should keep the bet deferred.
-        boolean allSettled = bet.getSelections().stream()
-                .filter(s -> s.getMatchId().equals(match.getId()) || isMatchSettled(s.getMatchId()))
-                .noneMatch(s -> "PENDING".equals(s.getResult()));
-
-        if (!allSettled) {
-            log.debug("settleOneBet: bet {} — not all legs settled yet, deferring payout", bet.getId());
             return;
         }
 
@@ -303,8 +221,7 @@ public class SettlementEngine {
                 bet.getId(), bet.getTotalOdds(), oddsAdjustment, effectiveOdds);
 
         if (effectiveOdds.compareTo(BigDecimal.ONE) < 0) {
-            log.warn("settleOneBet: bet {} effectiveOdds {} < 1.0 — clamping to 1.0 (stake return)",
-                    bet.getId(), effectiveOdds);
+            log.warn("settleOneBet: bet {} effectiveOdds {} < 1.0 — clamping to 1.0", bet.getId(), effectiveOdds);
             effectiveOdds = BigDecimal.ONE;
         }
 
@@ -323,14 +240,6 @@ public class SettlementEngine {
 
     // ── Helper: check if a match is already fully settled ─────────────────
 
-    /**
-     * FIX 5 helper: Returns true if the given matchId refers to a match that has
-     * already been marked as settled (i.e. settledAt is non-null). Used by settleOneBet()
-     * to determine whether a selection from another match should block payout on a multi-leg bet.
-     *
-     * matchService.getById() requires a String and throws ApiException (not an Optional)
-     * if not found, so we catch and default to false.
-     */
     private boolean isMatchSettled(UUID matchId) {
         try {
             com.speedbet.api.match.Match m = matchService.getById(matchId.toString());
@@ -346,49 +255,49 @@ public class SettlementEngine {
     private String evaluateSelection(BetSelection sel, com.speedbet.api.match.Match match) {
         int h = match.getScoreHome();
         int a = match.getScoreAway();
-        String market = sel.getMarket().toUpperCase();
+
+        // Normalise: trim, lowercase, spaces → underscores, then uppercase
+        // Handles DB values like "correct_score", "1x2", "Correct Score", "MATCH_RESULT" etc.
+        String market = sel.getMarket()
+                .trim()
+                .toLowerCase()
+                .replace(" ", "_")
+                .toUpperCase();
 
         log.debug("evaluateSelection: sel {} market={} selection='{}' score={}-{}",
                 sel.getId(), market, sel.getSelection(), h, a);
 
-        String result = switch (market) {
+        return switch (market) {
+            case "1X2", "ONE_X_TWO", "MATCH_RESULT", "FT_RESULT", "FULL_TIME_RESULT" ->
+                    evaluate1X2(sel.getSelection(), h, a, sel.getId().toString());
 
-            case "1X2", "ONE_X_TWO"  -> evaluate1X2(sel.getSelection(), h, a, sel.getId().toString());
-            case "HOME_WIN"          -> h > a ? "WON" : "LOST";
-            case "AWAY_WIN"          -> a > h ? "WON" : "LOST";
+            case "HOME_WIN"  -> h > a ? "WON" : "LOST";
+            case "AWAY_WIN"  -> a > h ? "WON" : "LOST";
 
-            case "BTTS" -> {
-                boolean bothScored = h > 0 && a > 0;
-                boolean wantsBoth  = "Yes".equalsIgnoreCase(sel.getSelection());
-                String r = wantsBoth == bothScored ? "WON" : "LOST";
-                log.debug("evaluateSelection: BTTS sel {} wantsBoth={} bothScored={} → {}",
-                        sel.getId(), wantsBoth, bothScored, r);
-                yield r;
-            }
+            case "BTTS", "BOTH_TEAMS_TO_SCORE", "GG_NG", "BOTH_TO_SCORE" ->
+                    evaluateBtts(sel, h, a);
 
-            case "OVER_UNDER" -> evaluateOverUnder(sel, h + a);
+            case "OVER_UNDER", "TOTAL_GOALS", "GOALS_OU", "O/U", "O_U" ->
+                    evaluateOverUnder(sel, h + a);
 
-            case "CORRECT_SCORE" -> {
-                String expected = h + "-" + a;
-                String r = expected.equals(sel.getSelection()) ? "WON" : "LOST";
-                log.debug("evaluateSelection: CORRECT_SCORE sel {} expected='{}' got='{}' → {}",
-                        sel.getId(), sel.getSelection(), expected, r);
-                yield r;
-            }
+            case "CORRECT_SCORE", "EXACT_SCORE", "CS", "SCORE" ->
+                    evaluateCorrectScore(sel.getSelection(), h, a, sel.getId().toString());
 
-            case "DOUBLE_CHANCE" -> evaluateDoubleChance(sel.getSelection(), h, a, sel.getId().toString());
-            case "HALF_TIME"     -> evaluateHalfTime(sel, match);
-            case "ASIAN_HANDICAP" -> evaluateAsianHandicap(sel, h, a);
+            case "DOUBLE_CHANCE", "DC" ->
+                    evaluateDoubleChance(sel.getSelection(), h, a, sel.getId().toString());
+
+            case "HALF_TIME", "HT_RESULT", "FIRST_HALF", "HT", "HALFTIME" ->
+                    evaluateHalfTime(sel, match);
+
+            case "ASIAN_HANDICAP", "AH", "HANDICAP", "ASIAN_HAND" ->
+                    evaluateAsianHandicap(sel, h, a);
 
             default -> {
-                log.warn("evaluateSelection: unknown market '{}' for sel {} — voiding",
-                        sel.getMarket(), sel.getId());
+                log.warn("evaluateSelection: unknown market '{}' (normalised='{}') for sel {} — voiding",
+                        sel.getMarket(), market, sel.getId());
                 yield "VOID";
             }
         };
-
-        log.debug("evaluateSelection: sel {} → {}", sel.getId(), result);
-        return result;
     }
 
     // ── 1X2 ──────────────────────────────────────────────────────────────
@@ -398,21 +307,9 @@ public class SettlementEngine {
         log.debug("evaluate1X2: sel {} normalised='{}' score={}-{}", selId, s, h, a);
 
         return switch (s) {
-            case "HOME", "HOME WIN" -> {
-                String r = h > a ? "WON" : "LOST";
-                log.debug("evaluate1X2: sel {} HOME → {}", selId, r);
-                yield r;
-            }
-            case "DRAW" -> {
-                String r = h == a ? "WON" : "LOST";
-                log.debug("evaluate1X2: sel {} DRAW → {}", selId, r);
-                yield r;
-            }
-            case "AWAY", "AWAY WIN" -> {
-                String r = a > h ? "WON" : "LOST";
-                log.debug("evaluate1X2: sel {} AWAY → {}", selId, r);
-                yield r;
-            }
+            case "HOME", "HOME WIN", "1", "H", "TEAM1", "HOMETEAM" -> h > a ? "WON" : "LOST";
+            case "DRAW", "X", "DRAW/X", "TIE", "LEVEL"             -> h == a ? "WON" : "LOST";
+            case "AWAY", "AWAY WIN", "2", "A", "TEAM2", "AWAYTEAM" -> a > h ? "WON" : "LOST";
             default -> {
                 log.warn("evaluate1X2: sel {} unrecognised selection '{}' — VOID", selId, selection);
                 yield "VOID";
@@ -420,43 +317,84 @@ public class SettlementEngine {
         };
     }
 
-    // ── Over / Under ─────────────────────────────────────────────────────
+    // ── Correct Score ─────────────────────────────────────────────────────
+
+    private String evaluateCorrectScore(String selection, int h, int a, String selId) {
+        if (selection == null || selection.isBlank()) {
+            log.warn("evaluateCorrectScore: sel {} null/blank selection — VOID", selId);
+            return "VOID";
+        }
+        // Normalise separator — accept "2-2", "2:2", "2 2", "2_2"
+        String normalised = selection.trim().replaceAll("[:\\s_]", "-");
+        String expected   = h + "-" + a;
+        String r = expected.equals(normalised) ? "WON" : "LOST";
+        log.debug("evaluateCorrectScore: sel {} expected='{}' got='{}' normalised='{}' → {}",
+                selId, expected, selection, normalised, r);
+        return r;
+    }
+
+    // ── BTTS ──────────────────────────────────────────────────────────────
+
+    private String evaluateBtts(BetSelection sel, int h, int a) {
+        String s = sel.getSelection() == null ? "" : sel.getSelection().trim().toLowerCase();
+        boolean bothScored = h > 0 && a > 0;
+        Boolean wantsBoth = switch (s) {
+            case "yes", "y", "true", "1", "both", "gg"  -> true;
+            case "no",  "n", "false", "0", "ng"          -> false;
+            default -> {
+                log.warn("evaluateBtts: sel {} unrecognised selection '{}' — VOID",
+                        sel.getId(), sel.getSelection());
+                yield null;
+            }
+        };
+        if (wantsBoth == null) return "VOID";
+        return wantsBoth == bothScored ? "WON" : "LOST";
+    }
+
+    // ── Over / Under ──────────────────────────────────────────────────────
 
     private String evaluateOverUnder(BetSelection sel, int totalGoals) {
-        String raw    = sel.getSelection().trim().toLowerCase();
-        boolean isOver = raw.startsWith("over");
+        String raw = sel.getSelection() == null ? "" : sel.getSelection().trim().toLowerCase();
 
-        double line;
-        try {
-            line = Double.parseDouble(raw.replaceAll("(?i)^(over|under)\\s*", ""));
-        } catch (NumberFormatException e) {
-            log.warn("evaluateOverUnder: cannot parse line from '{}' for sel {} — VOID",
-                    sel.getSelection(), sel.getId());
+        boolean isOver;
+        String numPart;
+
+        if (raw.startsWith("over") || raw.startsWith("o ") || raw.startsWith("+")) {
+            isOver  = true;
+            numPart = raw.replaceAll("(?i)^(over|o)\\s*|^\\+", "").trim();
+        } else if (raw.startsWith("under") || raw.startsWith("u ") || raw.startsWith("u")) {
+            isOver  = false;
+            numPart = raw.replaceAll("(?i)^(under|u)\\s*", "").trim();
+        } else {
+            log.warn("evaluateOverUnder: sel {} cannot determine over/under from '{}' — VOID",
+                    sel.getId(), sel.getSelection());
             return "VOID";
         }
 
-        log.debug("evaluateOverUnder: sel {} isOver={} line={} totalGoals={}",
-                sel.getId(), isOver, line, totalGoals);
-
-        if (line == Math.floor(line) && totalGoals == (int) line) {
-            log.debug("evaluateOverUnder: sel {} exact total on whole line — PUSH", sel.getId());
-            return "PUSH";
+        double line;
+        try {
+            line = Double.parseDouble(numPart);
+        } catch (NumberFormatException e) {
+            log.warn("evaluateOverUnder: sel {} cannot parse line from '{}' numPart='{}' — VOID",
+                    sel.getId(), sel.getSelection(), numPart);
+            return "VOID";
         }
 
-        String r = isOver == (totalGoals > line) ? "WON" : "LOST";
-        log.debug("evaluateOverUnder: sel {} → {}", sel.getId(), r);
-        return r;
+        if (line == Math.floor(line) && totalGoals == (int) line) return "PUSH";
+        return isOver == (totalGoals > line) ? "WON" : "LOST";
     }
 
     // ── Double Chance ─────────────────────────────────────────────────────
 
     private String evaluateDoubleChance(String selection, int h, int a, String selId) {
-        String s = selection == null ? "" : selection.trim().toUpperCase();
+        String s = selection == null ? "" : selection.trim().toUpperCase()
+                .replace("/", "")
+                .replace(" ", "");
         String r = switch (s) {
-            case "1X" -> h >= a ? "WON" : "LOST";
-            case "X2" -> a >= h ? "WON" : "LOST";
-            case "12" -> h != a ? "WON" : "LOST";
-            default   -> {
+            case "1X", "HX", "HOMEORDRAW", "HOMEORLEVEL" -> h >= a ? "WON" : "LOST";
+            case "X2", "XA", "DRAWORAWAY", "LEVELORAWAY" -> a >= h ? "WON" : "LOST";
+            case "12", "HA", "HOMEORAWAY"                -> h != a ? "WON" : "LOST";
+            default -> {
                 log.warn("evaluateDoubleChance: sel {} unrecognised selection '{}' — VOID", selId, selection);
                 yield "VOID";
             }
@@ -465,11 +403,20 @@ public class SettlementEngine {
         return r;
     }
 
-    // ── Half-Time ────────────────────────────────────────────────────────
+    // ── Half-Time ─────────────────────────────────────────────────────────
 
     private String evaluateHalfTime(BetSelection sel, com.speedbet.api.match.Match match) {
+        // Try all known metadata key variants
         Integer htHome = extractIntFromMetadata(match, "score_home_ht");
         Integer htAway = extractIntFromMetadata(match, "score_away_ht");
+        if (htHome == null) htHome = extractIntFromMetadata(match, "ht_home");
+        if (htAway == null) htAway = extractIntFromMetadata(match, "ht_away");
+        if (htHome == null) htHome = extractIntFromMetadata(match, "halftime_home");
+        if (htAway == null) htAway = extractIntFromMetadata(match, "halftime_away");
+        if (htHome == null) htHome = extractIntFromMetadata(match, "home_ht");
+        if (htAway == null) htAway = extractIntFromMetadata(match, "away_ht");
+        if (htHome == null) htHome = extractIntFromMetadata(match, "ht_score_home");
+        if (htAway == null) htAway = extractIntFromMetadata(match, "ht_score_away");
 
         if (htHome == null || htAway == null) {
             log.warn("evaluateHalfTime: missing ht metadata for match {} sel {} — VOID",
@@ -477,14 +424,11 @@ public class SettlementEngine {
             return "VOID";
         }
 
-        log.debug("evaluateHalfTime: sel {} match {} ht={}-{} selection='{}'",
-                sel.getId(), match.getId(), htHome, htAway, sel.getSelection());
-
         String s = sel.getSelection() == null ? "" : sel.getSelection().trim().toUpperCase();
         String r = switch (s) {
-            case "HOME", "HOME WIN" -> htHome > htAway  ? "WON" : "LOST";
-            case "DRAW"             -> htHome.equals(htAway) ? "WON" : "LOST";
-            case "AWAY", "AWAY WIN" -> htAway > htHome  ? "WON" : "LOST";
+            case "HOME", "HOME WIN", "1", "H" -> htHome > htAway       ? "WON" : "LOST";
+            case "DRAW", "X", "TIE"           -> htHome.equals(htAway) ? "WON" : "LOST";
+            case "AWAY", "AWAY WIN", "2", "A" -> htAway > htHome       ? "WON" : "LOST";
             default -> {
                 log.warn("evaluateHalfTime: sel {} unrecognised selection '{}' — VOID",
                         sel.getId(), sel.getSelection());
@@ -492,7 +436,8 @@ public class SettlementEngine {
             }
         };
 
-        log.debug("evaluateHalfTime: sel {} → {}", sel.getId(), r);
+        log.debug("evaluateHalfTime: sel {} ht={}-{} selection='{}' → {}",
+                sel.getId(), htHome, htAway, s, r);
         return r;
     }
 
@@ -513,35 +458,52 @@ public class SettlementEngine {
 
     private String evaluateAsianHandicap(BetSelection sel, int h, int a) {
         String raw = sel.getSelection() == null ? "" : sel.getSelection().trim();
+        String upper = raw.toUpperCase();
 
         boolean bettingHome;
         String rest;
-        if (raw.toUpperCase().startsWith("HOME")) {
+
+        if (upper.startsWith("HOME")) {
             bettingHome = true;
             rest = raw.substring(4).trim();
-        } else if (raw.toUpperCase().startsWith("AWAY")) {
+        } else if (upper.startsWith("AWAY")) {
             bettingHome = false;
             rest = raw.substring(4).trim();
+        } else if (upper.startsWith("H")) {
+            bettingHome = true;
+            rest = raw.substring(1).trim();
+        } else if (upper.startsWith("A")) {
+            bettingHome = false;
+            rest = raw.substring(1).trim();
+        } else if (upper.startsWith("1")) {
+            bettingHome = true;
+            rest = raw.substring(1).trim();
+        } else if (upper.startsWith("2")) {
+            bettingHome = false;
+            rest = raw.substring(1).trim();
         } else {
             log.warn("evaluateAsianHandicap: sel {} cannot parse side from '{}' — VOID", sel.getId(), raw);
             return "VOID";
         }
 
+        // Strip any leading colon or equals some feeds add e.g. "HOME: -1.5"
+        rest = rest.replaceAll("^[:=]\\s*", "");
+
         double line;
         try {
             line = Double.parseDouble(rest);
         } catch (NumberFormatException e) {
-            log.warn("evaluateAsianHandicap: sel {} cannot parse line from '{}' — VOID", sel.getId(), raw);
+            log.warn("evaluateAsianHandicap: sel {} cannot parse line from '{}' rest='{}' — VOID",
+                    sel.getId(), raw, rest);
             return "VOID";
         }
 
-        int    gd           = bettingHome ? (h - a) : (a - h);
+        int    gd            = bettingHome ? (h - a) : (a - h);
         double effectiveLine = bettingHome ? line : -line;
+        double frac          = Math.abs(effectiveLine % 1);
 
         log.debug("evaluateAsianHandicap: sel {} side={} line={} score={}-{} gd={} effectiveLine={}",
                 sel.getId(), bettingHome ? "HOME" : "AWAY", line, h, a, gd, effectiveLine);
-
-        double frac = Math.abs(effectiveLine % 1);
 
         String result;
         if (frac < 0.01) {
@@ -579,25 +541,21 @@ public class SettlementEngine {
         double lower = effectiveLine - 0.25;
         double upper = effectiveLine + 0.25;
 
-        log.debug("evaluateQuarterHandicap: sel {} effectiveLine={} gd={} sub-lines=[{}, {}]",
-                selId, effectiveLine, gd, lower, upper);
-
         String lowerResult = settleSingleLine(lower, gd, selId);
         String upperResult = settleSingleLine(upper, gd, selId);
 
-        log.debug("evaluateQuarterHandicap: sel {} lower={} upper={}", selId, lowerResult, upperResult);
+        log.debug("evaluateQuarterHandicap: sel {} sub-lines=[{},{}] results=[{},{}]",
+                selId, lower, upper, lowerResult, upperResult);
 
-        String combined = combineQuarterSubResults(lowerResult, upperResult);
-        log.debug("evaluateQuarterHandicap: sel {} combined → {}", selId, combined);
-        return combined;
+        return combineQuarterSubResults(lowerResult, upperResult);
     }
 
     private String settleSingleLine(double subLine, int gd, String selId) {
         double adjGD = gd + subLine;
         double frac  = Math.abs(subLine % 1);
 
-        if (frac < 0.01)                   return evaluateWholeHandicap(adjGD, selId + "-whole");
-        if (Math.abs(frac - 0.5) < 0.01)  return evaluateHalfHandicap(adjGD,  selId + "-half");
+        if (frac < 0.01)                  return evaluateWholeHandicap(adjGD, selId + "-whole");
+        if (Math.abs(frac - 0.5) < 0.01) return evaluateHalfHandicap(adjGD,  selId + "-half");
 
         log.warn("settleSingleLine: sel {} unexpected frac={} for subLine={} — VOID", selId, frac, subLine);
         return "VOID";
@@ -608,10 +566,8 @@ public class SettlementEngine {
 
         if (isWon(lower)  && isPush(upper)) return "HALF_WON";
         if (isPush(lower) && isWon(upper))  return "HALF_WON";
-
         if (isLost(lower) && isPush(upper)) return "HALF_LOST";
         if (isPush(lower) && isLost(upper)) return "HALF_LOST";
-
         if ((isWon(lower) && isLost(upper)) || (isLost(lower) && isWon(upper))) return "PUSH";
 
         log.warn("combineQuarterSubResults: unexpected combination lower={} upper={} — VOID", lower, upper);

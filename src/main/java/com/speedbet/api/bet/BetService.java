@@ -42,6 +42,11 @@ public class BetService {
             List<SelectionRequest> selections, UUID bookingCodeUsedId
     ) {}
 
+    @Transactional
+    public void saveSelectionsOnly(Bet bet) {
+        betRepo.save(bet);
+    }
+
     public record SelectionRequest(
             UUID matchId, String market, String selection, BigDecimal submittedOdds
     ) {}
