@@ -45,34 +45,24 @@ public class WithdrawalService {
 
     // ─────────────────────────────────────────────────────────────────────────
     // User submits a withdrawal request.
-    // 1. Guards: one pending at a time, min/max, daily limit, sufficient balance
-    // 2. Deducts amount from wallet (PESSIMISTIC_WRITE lock)
-    // 3. Creates WITHDRAW_HOLD transaction to record the reservation
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalRequest submitRequest(UUID userId, WithdrawalRequestDto req) {
 
-        // ── 1. One pending at a time ──────────────────────────────────────────
         boolean hasPending = withdrawalRepo.existsByUserIdAndStatusIn(
-                userId,
-                List.of(WithdrawalStatus.PENDING, WithdrawalStatus.APPROVED)
-        );
+                userId, List.of(WithdrawalStatus.PENDING, WithdrawalStatus.APPROVED));
         if (hasPending) {
             throw ApiException.badRequest("You already have a pending withdrawal. "
                     + "Please wait for it to be processed before submitting a new one.");
         }
 
-        // ── 2. Amount bounds ──────────────────────────────────────────────────
         if (req.getAmount().compareTo(minWithdrawalAmount) < 0) {
-            throw ApiException.badRequest(
-                    "Minimum withdrawal amount is " + minWithdrawalAmount);
+            throw ApiException.badRequest("Minimum withdrawal amount is " + minWithdrawalAmount);
         }
         if (req.getAmount().compareTo(maxWithdrawalAmount) > 0) {
-            throw ApiException.badRequest(
-                    "Maximum withdrawal amount is " + maxWithdrawalAmount);
+            throw ApiException.badRequest("Maximum withdrawal amount is " + maxWithdrawalAmount);
         }
 
-        // ── 3. Daily limit ────────────────────────────────────────────────────
         Instant startOfDay = Instant.now().truncatedTo(ChronoUnit.DAYS);
         BigDecimal todaySettled = withdrawalRepo
                 .sumAmountByUserIdAndStatusAndCreatedAtAfter(userId, WithdrawalStatus.SETTLED, startOfDay);
@@ -80,12 +70,10 @@ public class WithdrawalService {
 
         if (todaySettled.add(req.getAmount()).compareTo(dailyWithdrawalLimit) > 0) {
             BigDecimal remaining = dailyWithdrawalLimit.subtract(todaySettled);
-            throw ApiException.badRequest(
-                    "Daily withdrawal limit of " + dailyWithdrawalLimit
-                            + " exceeded. Remaining allowance today: " + remaining);
+            throw ApiException.badRequest("Daily withdrawal limit of " + dailyWithdrawalLimit
+                    + " exceeded. Remaining allowance today: " + remaining);
         }
 
-        // ── 4. Lock wallet and check balance ─────────────────────────────────
         var walletEntity = walletRepo.findByUserId(userId)
                 .orElseThrow(() -> ApiException.notFound("Wallet not found"));
         var wallet = em.find(Wallet.class, walletEntity.getId(), LockModeType.PESSIMISTIC_WRITE);
@@ -94,12 +82,10 @@ public class WithdrawalService {
             throw ApiException.unprocessable("Insufficient available balance");
         }
 
-        // ── 5. Deduct from wallet (this is what was missing before) ──────────
         BigDecimal newBalance = wallet.getBalance().subtract(req.getAmount(), MathContext.DECIMAL64);
         wallet.setBalance(newBalance);
         walletRepo.save(wallet);
 
-        // ── 6. Persist withdrawal request ─────────────────────────────────────
         var user = userRepo.findById(userId).orElseThrow();
         var request = WithdrawalRequest.builder()
                 .user(user)
@@ -114,29 +100,21 @@ public class WithdrawalService {
 
         request = withdrawalRepo.save(request);
 
-        // ── 7. Record WITHDRAW_HOLD transaction ───────────────────────────────
         txRepo.save(Transaction.builder()
                 .walletId(wallet.getId())
                 .kind(TxKind.WITHDRAW_HOLD)
                 .amount(req.getAmount().negate())
-                .balanceAfter(newBalance)           // consistent — balance already updated
+                .balanceAfter(newBalance)
                 .providerRef(request.getId().toString())
                 .metadata(Map.of("withdrawalRequestId", request.getId().toString()))
                 .build());
 
-        auditService.log(
-                user.getId(),
-                "WITHDRAWAL_REQUESTED",
-                "WithdrawalRequest",
-                request.getId(),
-                null,
-                Map.of(
+        auditService.log(user.getId(), "WITHDRAWAL_REQUESTED", "WithdrawalRequest", request.getId(),
+                null, Map.of(
                         "amount",   req.getAmount().toString(),
                         "method",   req.getMethod() != null ? req.getMethod() : "mobile_money",
-                        "currency", req.getCurrency() != null ? req.getCurrency() : "GHS"
-                ),
-                null
-        );
+                        "currency", req.getCurrency() != null ? req.getCurrency() : "GHS"),
+                null);
 
         log.info("Withdrawal request {} created for user {} — amount {} {}",
                 request.getId(), userId, req.getAmount(),
@@ -147,7 +125,6 @@ public class WithdrawalService {
 
     // ─────────────────────────────────────────────────────────────────────────
     // Admin approves a PENDING withdrawal.
-    // Wallet is already debited — just update the status.
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalRequest approve(UUID requestId, UUID adminId, String note) {
@@ -165,25 +142,15 @@ public class WithdrawalService {
         request.setReviewedAt(Instant.now());
         request = withdrawalRepo.save(request);
 
-        auditService.log(
-                adminId,
-                "WITHDRAWAL_APPROVED",
-                "WithdrawalRequest",
-                requestId,
-                null,
-                Map.of(
-                        "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()
-                ),
-                null
-        );
+        auditService.log(adminId, "WITHDRAWAL_APPROVED", "WithdrawalRequest", requestId,
+                null, Map.of("note", note != null ? note : "",
+                        "userId", request.getUser().getId().toString()), null);
 
         return request;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Admin rejects a PENDING withdrawal.
-    // Releases the held amount back to user wallet.
+    // Admin rejects a PENDING withdrawal — refunds wallet.
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalRequest reject(UUID requestId, UUID adminId, String note) {
@@ -201,7 +168,6 @@ public class WithdrawalService {
         request.setReviewedAt(Instant.now());
         request = withdrawalRepo.save(request);
 
-        // Release reserved amount back to wallet
         var wallet = em.find(Wallet.class,
                 walletRepo.findByUserId(request.getUser().getId()).orElseThrow().getId(),
                 LockModeType.PESSIMISTIC_WRITE);
@@ -216,31 +182,18 @@ public class WithdrawalService {
                 .amount(request.getAmount())
                 .balanceAfter(restoredBalance)
                 .providerRef(request.getId().toString())
-                .metadata(Map.of(
-                        "withdrawalRequestId", request.getId().toString(),
-                        "reason", "rejected"
-                ))
+                .metadata(Map.of("withdrawalRequestId", request.getId().toString(), "reason", "rejected"))
                 .build());
 
-        auditService.log(
-                adminId,
-                "WITHDRAWAL_REJECTED",
-                "WithdrawalRequest",
-                requestId,
-                null,
-                Map.of(
-                        "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()
-                ),
-                null
-        );
+        auditService.log(adminId, "WITHDRAWAL_REJECTED", "WithdrawalRequest", requestId,
+                null, Map.of("note", note != null ? note : "",
+                        "userId", request.getUser().getId().toString()), null);
 
         return request;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Super admin settles an APPROVED withdrawal.
-    // Converts the WITHDRAW_HOLD transaction to WITHDRAW (money left the platform).
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalRequest settle(UUID requestId, UUID superAdminId, String note) {
@@ -258,31 +211,20 @@ public class WithdrawalService {
         request.setSettledAt(Instant.now());
         request = withdrawalRepo.save(request);
 
-        // Convert WITHDRAW_HOLD → WITHDRAW (confirms funds physically sent)
         txRepo.findByProviderRef(request.getId().toString()).ifPresent(holdTx -> {
             holdTx.setKind(TxKind.WITHDRAW);
             txRepo.save(holdTx);
         });
 
-        auditService.log(
-                superAdminId,
-                "WITHDRAWAL_SETTLED",
-                "WithdrawalRequest",
-                requestId,
-                null,
-                Map.of(
-                        "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()
-                ),
-                null
-        );
+        auditService.log(superAdminId, "WITHDRAWAL_SETTLED", "WithdrawalRequest", requestId,
+                null, Map.of("note", note != null ? note : "",
+                        "userId", request.getUser().getId().toString()), null);
 
         return request;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Super admin marks an APPROVED withdrawal as failed.
-    // Releases the held amount back to user wallet.
+    // Super admin marks an APPROVED withdrawal as failed — refunds wallet.
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalRequest markFailed(UUID requestId, UUID superAdminId, String note) {
@@ -300,7 +242,6 @@ public class WithdrawalService {
         request.setSettledAt(Instant.now());
         request = withdrawalRepo.save(request);
 
-        // Release reserved amount back to wallet
         var wallet = em.find(Wallet.class,
                 walletRepo.findByUserId(request.getUser().getId()).orElseThrow().getId(),
                 LockModeType.PESSIMISTIC_WRITE);
@@ -315,24 +256,12 @@ public class WithdrawalService {
                 .amount(request.getAmount())
                 .balanceAfter(restoredBalance)
                 .providerRef(request.getId().toString())
-                .metadata(Map.of(
-                        "withdrawalRequestId", request.getId().toString(),
-                        "reason", "failed"
-                ))
+                .metadata(Map.of("withdrawalRequestId", request.getId().toString(), "reason", "failed"))
                 .build());
 
-        auditService.log(
-                superAdminId,
-                "WITHDRAWAL_FAILED",
-                "WithdrawalRequest",
-                requestId,
-                null,
-                Map.of(
-                        "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()
-                ),
-                null
-        );
+        auditService.log(superAdminId, "WITHDRAWAL_FAILED", "WithdrawalRequest", requestId,
+                null, Map.of("note", note != null ? note : "",
+                        "userId", request.getUser().getId().toString()), null);
 
         return request;
     }
@@ -341,45 +270,53 @@ public class WithdrawalService {
     // Queries
     // ─────────────────────────────────────────────────────────────────────────
 
+    @Transactional(readOnly = true)
     public Page<WithdrawalRequest> getUserWithdrawals(UUID userId, Pageable pageable) {
         return withdrawalRepo.findByUserIdOrderByCreatedAtDesc(userId, pageable);
     }
 
-    public Page<WithdrawalRequest> getAllWithdrawals(WithdrawalStatus status, Pageable pageable) {
-        if (status != null) {
-            return withdrawalRepo.findByStatusOrderByCreatedAtDesc(status, pageable);
-        }
-        // Use the sort-baked derived method instead of bare findAll(pageable)
-        return withdrawalRepo.findAllByOrderByCreatedAtDesc(pageable);
+    /**
+     * Marked @Transactional so the Hibernate session stays open while Jackson
+     * serializes the result — prevents the "could not initialize proxy - no Session"
+     * LazyInitializationException that was causing the 500.
+     */
+    @Transactional(readOnly = true)
+    public Page<WithdrawalDto> getAllWithdrawals(WithdrawalStatus status, Pageable pageable) {
+        Page<WithdrawalRequest> page = (status != null)
+                ? withdrawalRepo.findByStatusOrderByCreatedAtDesc(status, pageable)
+                : withdrawalRepo.findAllByOrderByCreatedAtDesc(pageable);
+
+        // Map to DTO inside the transaction while the session is still open.
+        // This eagerly reads all lazy associations before the session closes.
+        return page.map(WithdrawalDto::from);
     }
 
+    @Transactional(readOnly = true)
     public WithdrawalRequest getById(UUID id) {
         return withdrawalRepo.findById(id)
                 .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
     }
 
+    @Transactional(readOnly = true)
     public WithdrawalRequest getByIdAndUser(UUID id, UUID userId) {
         return withdrawalRepo.findByIdAndUserId(id, userId)
                 .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Stats — now with real amounts (add these queries to your repository)
+    // Stats
     // ─────────────────────────────────────────────────────────────────────────
 
     public Map<String, Object> getAdminStats() {
         long pending  = withdrawalRepo.countByStatus(WithdrawalStatus.PENDING);
         long approved = withdrawalRepo.countByStatus(WithdrawalStatus.APPROVED);
-
         BigDecimal totalPendingAmount  = withdrawalRepo.sumAmountByStatus(WithdrawalStatus.PENDING);
         BigDecimal totalApprovedAmount = withdrawalRepo.sumAmountByStatus(WithdrawalStatus.APPROVED);
-
         return Map.of(
                 "pending",             pending,
                 "approved",            approved,
                 "totalPendingAmount",  totalPendingAmount  != null ? totalPendingAmount  : BigDecimal.ZERO,
-                "totalApprovedAmount", totalApprovedAmount != null ? totalApprovedAmount : BigDecimal.ZERO
-        );
+                "totalApprovedAmount", totalApprovedAmount != null ? totalApprovedAmount : BigDecimal.ZERO);
     }
 
     public Map<String, Object> getSuperAdminStats() {
@@ -387,17 +324,14 @@ public class WithdrawalService {
         long approvedCount = withdrawalRepo.countByStatus(WithdrawalStatus.APPROVED);
         long settledCount  = withdrawalRepo.countByStatus(WithdrawalStatus.SETTLED);
         long failedCount   = withdrawalRepo.countByStatus(WithdrawalStatus.FAILED);
-
         BigDecimal totalSettledAmount = withdrawalRepo.sumAmountByStatus(WithdrawalStatus.SETTLED);
         BigDecimal totalPendingAmount = withdrawalRepo.sumAmountByStatus(WithdrawalStatus.PENDING);
-
         return Map.of(
                 "pendingCount",       pendingCount,
                 "approvedCount",      approvedCount,
                 "settledCount",       settledCount,
                 "failedCount",        failedCount,
                 "totalSettledAmount", totalSettledAmount != null ? totalSettledAmount : BigDecimal.ZERO,
-                "totalPendingAmount", totalPendingAmount != null ? totalPendingAmount : BigDecimal.ZERO
-        );
+                "totalPendingAmount", totalPendingAmount != null ? totalPendingAmount : BigDecimal.ZERO);
     }
 }

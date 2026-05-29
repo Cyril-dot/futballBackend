@@ -58,8 +58,14 @@ public class WithdrawalController {
 
     // ==================== ADMIN ENDPOINTS ====================
 
+    /**
+     * Returns WithdrawalDto (not the raw entity) to avoid the
+     * "could not initialize proxy - no Session" LazyInitializationException
+     * that occurs when Jackson tries to serialize lazy User associations
+     * after the Hibernate session has closed.
+     */
     @GetMapping("/admin/all")
-    public ResponseEntity<ApiResponse<Page<WithdrawalRequest>>> getAllWithdrawalsForAdmin(
+    public ResponseEntity<ApiResponse<Page<WithdrawalDto>>> getAllWithdrawalsForAdmin(
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size,
             @RequestParam(required = false) WithdrawalStatus status,
@@ -67,13 +73,9 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Admin access required");
         }
-
-        // Always supply an explicit sort — passing an unsorted Pageable to
-        // findAll() or findByStatus() blows up when the DB can't infer an order.
         Pageable pageable = PageRequest.of(page, size,
                 Sort.by(Sort.Direction.DESC, "createdAt"));
-
-        Page<WithdrawalRequest> withdrawals = withdrawalService.getAllWithdrawals(status, pageable);
+        Page<WithdrawalDto> withdrawals = withdrawalService.getAllWithdrawals(status, pageable);
         return ResponseEntity.ok(ApiResponse.ok(withdrawals));
     }
 
