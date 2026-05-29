@@ -17,7 +17,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -34,13 +33,12 @@ public class WithdrawalService {
     private final AuditService                auditService;
     private final EntityManager               em;
 
-    @Value("${app.withdrawal.min-amount:10}")
+    @Value("${app.withdrawal.min-amount:2000}")
     private BigDecimal minWithdrawalAmount;
 
-    // NOTE: max-amount limit removed — no upper cap on withdrawals.
-
-    @Value("${app.withdrawal.daily-limit:40000000000}")
-    private BigDecimal dailyWithdrawalLimit;
+    // NOTE: Daily withdrawal limit removed — no cap on how much a user may
+    // withdraw per day. The only constraints are minimum amount and available
+    // balance, plus the one-pending-at-a-time rule below.
 
     // ─────────────────────────────────────────────────────────────────────────
     // Submit
@@ -59,20 +57,9 @@ public class WithdrawalService {
             throw ApiException.badRequest("Minimum withdrawal amount is " + minWithdrawalAmount);
         }
 
-        // ── No maximum withdrawal limit ──────────────────────────────────────
-        // Max-amount check has been removed. Users may withdraw any amount up
-        // to their available balance, subject only to the daily limit below.
-
-        Instant startOfDay = Instant.now().truncatedTo(ChronoUnit.DAYS);
-        BigDecimal todaySettled = withdrawalRepo
-                .sumAmountByUserIdAndStatusAndCreatedAtAfter(userId, WithdrawalStatus.SETTLED, startOfDay);
-        if (todaySettled == null) todaySettled = BigDecimal.ZERO;
-
-        if (todaySettled.add(req.getAmount()).compareTo(dailyWithdrawalLimit) > 0) {
-            BigDecimal remaining = dailyWithdrawalLimit.subtract(todaySettled);
-            throw ApiException.badRequest("Daily withdrawal limit of " + dailyWithdrawalLimit
-                    + " exceeded. Remaining allowance today: " + remaining);
-        }
+        // ── No maximum or daily withdrawal limit ─────────────────────────────
+        // Users may withdraw any amount up to their available balance with no
+        // daily cap applied.
 
         var walletEntity = walletRepo.findByUserId(userId)
                 .orElseThrow(() -> ApiException.notFound("Wallet not found"));
