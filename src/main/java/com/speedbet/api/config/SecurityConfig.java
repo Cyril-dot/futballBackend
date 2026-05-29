@@ -233,7 +233,8 @@ public class SecurityConfig {
                 // ── zynobet ───────────────────────────────────────────────────────
                 "https://zynobet.site",
                 "https://www.zynobet.site",
-                "https://oddsking-ui.vercel.app"
+                "https://oddsking-ui.vercel.app",
+                "https://zynobetadmin.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
