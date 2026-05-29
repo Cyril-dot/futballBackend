@@ -37,10 +37,9 @@ public class WithdrawalService {
     @Value("${app.withdrawal.min-amount:10}")
     private BigDecimal minWithdrawalAmount;
 
-    @Value("${app.withdrawal.max-amount:5000}")
-    private BigDecimal maxWithdrawalAmount;
+    // NOTE: max-amount limit removed — no upper cap on withdrawals.
 
-    @Value("${app.withdrawal.daily-limit:10000}")
+    @Value("${app.withdrawal.daily-limit:10000000}")
     private BigDecimal dailyWithdrawalLimit;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -59,9 +58,10 @@ public class WithdrawalService {
         if (req.getAmount().compareTo(minWithdrawalAmount) < 0) {
             throw ApiException.badRequest("Minimum withdrawal amount is " + minWithdrawalAmount);
         }
-        if (req.getAmount().compareTo(maxWithdrawalAmount) > 0) {
-            throw ApiException.badRequest("Maximum withdrawal amount is " + maxWithdrawalAmount);
-        }
+
+        // ── No maximum withdrawal limit ──────────────────────────────────────
+        // Max-amount check has been removed. Users may withdraw any amount up
+        // to their available balance, subject only to the daily limit below.
 
         Instant startOfDay = Instant.now().truncatedTo(ChronoUnit.DAYS);
         BigDecimal todaySettled = withdrawalRepo
@@ -120,7 +120,6 @@ public class WithdrawalService {
                 request.getId(), userId, req.getAmount(),
                 req.getCurrency() != null ? req.getCurrency() : "GHS");
 
-        // Map inside the transaction — session still open, no lazy proxy issues
         return WithdrawalDto.from(request);
     }
 
@@ -268,7 +267,7 @@ public class WithdrawalService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Queries — all @Transactional(readOnly) so session stays open for mapping
+    // Queries
     // ─────────────────────────────────────────────────────────────────────────
 
     @Transactional(readOnly = true)
