@@ -39,7 +39,7 @@ public class WithdrawalService {
 
     // NOTE: max-amount limit removed — no upper cap on withdrawals.
 
-    @Value("${app.withdrawal.daily-limit:10000000}")
+    @Value("${app.withdrawal.daily-limit:40000000000}")
     private BigDecimal dailyWithdrawalLimit;
 
     // ─────────────────────────────────────────────────────────────────────────
