@@ -349,7 +349,8 @@ public class WithdrawalService {
         if (status != null) {
             return withdrawalRepo.findByStatusOrderByCreatedAtDesc(status, pageable);
         }
-        return withdrawalRepo.findAll(pageable);
+        // Use the sort-baked derived method instead of bare findAll(pageable)
+        return withdrawalRepo.findAllByOrderByCreatedAtDesc(pageable);
     }
 
     public WithdrawalRequest getById(UUID id) {

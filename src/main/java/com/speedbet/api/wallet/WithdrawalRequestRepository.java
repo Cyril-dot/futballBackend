@@ -16,7 +16,7 @@ import java.util.UUID;
 @Repository
 public interface WithdrawalRequestRepository extends JpaRepository<WithdrawalRequest, UUID> {
 
-    // ── Pagination ────────────────────────────────────────────────────────────
+    // ── Pagination ─────────────────────────────────────────────────────────────
 
     Page<WithdrawalRequest> findByUserIdOrderByCreatedAtDesc(UUID userId, Pageable pageable);
 
@@ -24,11 +24,18 @@ public interface WithdrawalRequestRepository extends JpaRepository<WithdrawalReq
 
     Page<WithdrawalRequest> findByAdminIdOrderByCreatedAtDesc(UUID adminId, Pageable pageable);
 
-    // ── Lookup ────────────────────────────────────────────────────────────────
+    /**
+     * Admin "all withdrawals" — sort is baked into the method name so it never
+     * relies on the Pageable's sort surviving the JPA/Hibernate query chain.
+     * This replaces the bare findAll(pageable) call that was causing the 500.
+     */
+    Page<WithdrawalRequest> findAllByOrderByCreatedAtDesc(Pageable pageable);
+
+    // ── Lookup ─────────────────────────────────────────────────────────────────
 
     Optional<WithdrawalRequest> findByIdAndUserId(UUID id, UUID userId);
 
-    // ── Existence ─────────────────────────────────────────────────────────────
+    // ── Existence ──────────────────────────────────────────────────────────────
 
     @Query("SELECT CASE WHEN COUNT(w) > 0 THEN true ELSE false END FROM WithdrawalRequest w " +
             "WHERE w.user.id = :userId AND w.status IN :statuses")
@@ -36,7 +43,7 @@ public interface WithdrawalRequestRepository extends JpaRepository<WithdrawalReq
             @Param("userId")   UUID userId,
             @Param("statuses") List<WithdrawalStatus> statuses);
 
-    // ── Counts ────────────────────────────────────────────────────────────────
+    // ── Counts ─────────────────────────────────────────────────────────────────
 
     long countByStatus(WithdrawalStatus status);
 
@@ -45,20 +52,11 @@ public interface WithdrawalRequestRepository extends JpaRepository<WithdrawalReq
             @Param("userId") UUID userId,
             @Param("status") WithdrawalStatus status);
 
-    // ── Aggregates ────────────────────────────────────────────────────────────
+    // ── Aggregates ─────────────────────────────────────────────────────────────
 
-    /**
-     * Sum of amounts for a given status (e.g. PENDING, SETTLED).
-     * Returns null when there are no matching rows — callers should treat null as ZERO.
-     */
     @Query("SELECT SUM(w.amount) FROM WithdrawalRequest w WHERE w.status = :status")
     BigDecimal sumAmountByStatus(@Param("status") WithdrawalStatus status);
 
-    /**
-     * Sum of amounts for a given user + status since a given instant.
-     * Used to enforce the per-user daily withdrawal limit.
-     * Returns null when there are no matching rows — callers should treat null as ZERO.
-     */
     @Query("""
         SELECT SUM(w.amount)
         FROM WithdrawalRequest w
