@@ -10,6 +10,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
@@ -41,16 +42,9 @@ public class WithdrawalController {
             @RequestParam(defaultValue = "20") int size,
             @RequestParam(required = false) WithdrawalStatus status,
             @AuthenticationPrincipal User user) {
-        Pageable pageable = PageRequest.of(page, size);
-        Page<WithdrawalRequest> withdrawals;
-        
-        if (status != null) {
-            // Filter by status - would need to add this method to service
-            withdrawals = withdrawalService.getUserWithdrawals(user.getId(), pageable);
-        } else {
-            withdrawals = withdrawalService.getUserWithdrawals(user.getId(), pageable);
-        }
-        
+        Pageable pageable = PageRequest.of(page, size,
+                Sort.by(Sort.Direction.DESC, "createdAt"));
+        Page<WithdrawalRequest> withdrawals = withdrawalService.getUserWithdrawals(user.getId(), pageable);
         return ResponseEntity.ok(ApiResponse.ok(withdrawals));
     }
 
@@ -73,10 +67,13 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Admin access required");
         }
-        
-        Pageable pageable = PageRequest.of(page, size);
+
+        // Always supply an explicit sort — passing an unsorted Pageable to
+        // findAll() or findByStatus() blows up when the DB can't infer an order.
+        Pageable pageable = PageRequest.of(page, size,
+                Sort.by(Sort.Direction.DESC, "createdAt"));
+
         Page<WithdrawalRequest> withdrawals = withdrawalService.getAllWithdrawals(status, pageable);
-        
         return ResponseEntity.ok(ApiResponse.ok(withdrawals));
     }
 
@@ -86,7 +83,6 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Admin access required");
         }
-        
         var stats = withdrawalService.getAdminStats();
         return ResponseEntity.ok(ApiResponse.ok(stats));
     }
@@ -99,10 +95,8 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Admin access required");
         }
-        
         var note = req.getOrDefault("note", "");
         var request = withdrawalService.approve(id, user.getId(), note);
-        
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal approved"));
     }
 
@@ -114,10 +108,8 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Admin access required");
         }
-        
         var note = req.getOrDefault("note", "");
         var request = withdrawalService.reject(id, user.getId(), note);
-        
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal rejected"));
     }
 
@@ -131,10 +123,8 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Super admin access required");
         }
-        
         var note = req.getOrDefault("note", "");
         var request = withdrawalService.settle(id, user.getId(), note);
-        
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal settled"));
     }
 
@@ -146,10 +136,8 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Super admin access required");
         }
-        
         var note = req.getOrDefault("note", "");
         var request = withdrawalService.markFailed(id, user.getId(), note);
-        
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal marked as failed"));
     }
 
@@ -159,7 +147,6 @@ public class WithdrawalController {
         if (user.getRole() != UserRole.SUPER_ADMIN) {
             throw ApiException.forbidden("Super admin access required");
         }
-        
         var stats = withdrawalService.getSuperAdminStats();
         return ResponseEntity.ok(ApiResponse.ok(stats));
     }

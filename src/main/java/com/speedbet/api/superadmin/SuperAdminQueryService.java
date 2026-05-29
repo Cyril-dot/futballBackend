@@ -12,8 +12,10 @@ import com.speedbet.api.wallet.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -65,11 +67,38 @@ public class SuperAdminQueryService {
 
     // ─── All Users (paginated + search) ──────────────────────────────────────
 
+    /**
+     * Uses JPA Specifications so null params are simply omitted from the WHERE
+     * clause — avoids the PostgreSQL enum-cast error that plagued the old
+     * @Query("... :role IS NULL OR u.role = :role ...") approach with Hibernate.
+     */
     public Page<SuperAdminDtos.UserSummaryDto> listUsers(
             String search, UserRole role, Pageable pageable) {
         log.info("listUsers: search='{}' role={}", search, role);
-        return userRepo.findAllFiltered(role, search, pageable)
-                .map(this::toUserSummary);
+
+        Specification<User> spec = Specification.where(null);
+
+        if (role != null) {
+            spec = spec.and((root, q, cb) -> cb.equal(root.get("role"), role));
+        }
+
+        if (search != null && !search.isBlank()) {
+            String pattern = "%" + search.toLowerCase() + "%";
+            spec = spec.and((root, q, cb) -> cb.or(
+                    cb.like(cb.lower(root.get("email")),     pattern),
+                    cb.like(cb.lower(root.get("firstName")), pattern),
+                    cb.like(cb.lower(root.get("lastName")),  pattern)
+            ));
+        }
+
+        // Always sort by createdAt desc — callers don't supply a sort, and
+        // letting Pageable default to "unsorted" can break on some DBs.
+        Pageable p = PageRequest.of(
+                pageable.getPageNumber(),
+                pageable.getPageSize(),
+                Sort.by(Sort.Direction.DESC, "createdAt"));
+
+        return userRepo.findAll(spec, p).map(this::toUserSummary);
     }
 
     // ─── Single User Detail ───────────────────────────────────────────────────
@@ -168,22 +197,14 @@ public class SuperAdminQueryService {
 
     // ─── Platform-wide Transactions (paginated + filtered) ───────────────────
 
-    /**
-     * Uses JPA Specifications (TransactionSpecs.filtered) instead of a native
-     * query, so null parameters are simply omitted from the WHERE clause rather
-     * than sent to PostgreSQL as untyped NULLs — this is the definitive fix for
-     * the "could not determine data type of parameter $N" error.
-     */
     public Page<SuperAdminDtos.TransactionDto> listTransactions(
             TxKind kind, String status, UUID walletId,
             Instant from, Instant to, Pageable pageable) {
         log.info("listTransactions: kind={} status={} walletId={}", kind, status, walletId);
 
-        // Pageable from the controller already carries sort; if not, default to
-        // createdAt desc so the frontend always sees newest first.
         Pageable p = pageable.getSort().isSorted()
                 ? pageable
-                : org.springframework.data.domain.PageRequest.of(
+                : PageRequest.of(
                 pageable.getPageNumber(),
                 pageable.getPageSize(),
                 Sort.by(Sort.Direction.DESC, "createdAt"));
@@ -201,17 +222,11 @@ public class SuperAdminQueryService {
 
     // ─── Affiliate Withdrawal History (all statuses) ──────────────────────────
 
-    /**
-     * Always rebuilds the Pageable with a sort on `requestedAt` —
-     * AffiliateWithdrawalRequest has no `createdAt` field, so any inbound
-     * pageable carrying that sort would blow up with a PropertyReferenceException.
-     */
     public Page<com.speedbet.api.affiliate.AffiliateWithdrawalRequest> listWithdrawals(
             AffiliateWithdrawalStatus status, Pageable pageable) {
         log.info("listWithdrawals: status={}", status);
 
-        // Strip any caller-supplied sort and replace with the correct field name.
-        Pageable p = org.springframework.data.domain.PageRequest.of(
+        Pageable p = PageRequest.of(
                 pageable.getPageNumber(),
                 pageable.getPageSize(),
                 Sort.by(Sort.Direction.DESC, "requestedAt"));
