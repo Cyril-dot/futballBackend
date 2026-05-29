@@ -97,6 +97,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * ─── Moolre API base URL (hardcoded) ─────────────────────────────────────────
  *   https://api.moolre.com
  *
+ * ─── Phone number format ─────────────────────────────────────────────────────
+ *   Moolre expects the phone with a leading 0 (e.g. "0244123456").
+ *   Do NOT send the 233 country-code prefix — Moolre rejects it.
+ *   The frontend must collect the number in 0XXXXXXXXX format and send it as-is.
+ *
  * ─── application.properties keys needed ──────────────────────────────────────
  *   app.moolre.api-user          → env: MOOLRE_API_USER
  *   app.moolre.public-key        → env: MOOLRE_PUBLIC_KEY
@@ -158,7 +163,7 @@ public class MoolreController {
      *
      * Required body fields:
      *   amount  – GHS amount to deposit (e.g. "300")
-     *   phone   – customer's MoMo number (e.g. "0244123456" or "233244123456")
+     *   phone   – customer's MoMo number in 0XXXXXXXXX format (e.g. "0244123456")
      *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
      *
      * Response (always HTTP 200 on valid request):
@@ -307,7 +312,7 @@ public class MoolreController {
      * Initiates a Moolre USSD direct charge for the GHS 200 admin upgrade fee.
      *
      * Required body fields:
-     *   phone   – customer's MoMo number
+     *   phone   – customer's MoMo number in 0XXXXXXXXX format
      *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
      *
      * Response (always HTTP 200 on valid request):
@@ -615,22 +620,10 @@ public class MoolreController {
     // ─── Moolre API helpers ───────────────────────────────────────────────────
 
     /**
-     * Normalises a Ghanaian phone number to the 233XXXXXXXXX format Moolre expects.
-     *   "0244123456"    → "233244123456"
-     *   "233244123456"  → "233244123456"  (already correct)
-     *   "+233244123456" → "233244123456"
-     */
-    private static String normalisePhone(String phone) {
-        if (phone == null) return phone;
-        String p = phone.trim().replaceAll("\\s+", "");
-        if (p.startsWith("+233")) return p.substring(1);          // +233... → 233...
-        if (p.startsWith("233"))  return p;                        // already correct
-        if (p.startsWith("0"))    return "233" + p.substring(1);  // 0... → 233...
-        return p;
-    }
-
-    /**
      * Calls Moolre POST /open/transact/payment to initiate a USSD direct charge.
+     *
+     * Phone must be in 0XXXXXXXXX format (e.g. "0244123456"). Moolre rejects
+     * the 233 country-code prefix — pass the number through as-is from the frontend.
      *
      * When otpCode is non-null, the `otpcode` field is included in the request body.
      * Per Moolre docs, OTP submission re-calls the same /open/transact/payment
@@ -655,9 +648,6 @@ public class MoolreController {
     private Map<String, Object> moolreDirectCharge(
             BigDecimal amount, String phone, String network, String externalRef, String otpCode) {
 
-        // Normalise phone to 233XXXXXXXXX format
-        String normalisedPhone = normalisePhone(phone);
-
         String channel = switch (network.toUpperCase()) {
             case "MTN"        -> CHANNEL_MTN;
             case "VODAFONE"   -> CHANNEL_VODAFONE;
@@ -670,7 +660,7 @@ public class MoolreController {
         body.put("type",          1);
         body.put("channel",       channel);
         body.put("currency",      "GHS");
-        body.put("payer",         normalisedPhone);
+        body.put("payer",         phone);
         body.put("amount",        amount.toPlainString());
         body.put("externalref",   externalRef);
         body.put("accountnumber", accountNumber);
@@ -679,8 +669,8 @@ public class MoolreController {
             log.info("moolreDirectCharge: including otpcode for externalRef='{}'", externalRef);
         }
 
-        log.info("moolreDirectCharge: calling /open/transact/payment — channel='{}' phone='{}' (normalised='{}') amount='{}' externalRef='{}' hasOtp={}",
-                channel, phone, normalisedPhone, amount, externalRef, otpCode != null && !otpCode.isBlank());
+        log.info("moolreDirectCharge: calling /open/transact/payment — channel='{}' phone='{}' amount='{}' externalRef='{}' hasOtp={}",
+                channel, phone, amount, externalRef, otpCode != null && !otpCode.isBlank());
 
         String rawBody = webClientBuilder.build()
                 .post().uri(MOOLRE_BASE_URL + "/open/transact/payment")
@@ -759,8 +749,7 @@ public class MoolreController {
             log.info("moolreDirectCharge: OTP verified ('{}') — triggering USSD push (step B) for externalRef='{}'",
                     message, externalRef);
             // Recursive call without otpcode — this triggers the actual USSD push.
-            // Use normalisedPhone so the phone is already in 233XXXXXXXXX format.
-            return moolreDirectCharge(amount, normalisedPhone, network, externalRef, null);
+            return moolreDirectCharge(amount, phone, network, externalRef, null);
         }
 
         // ── Action required (MTN SMS verification step) — OTP not yet submitted.
@@ -768,7 +757,7 @@ public class MoolreController {
             // Cache charge params so /otp can re-call with same body + otpcode
             if (otpCode == null || otpCode.isBlank()) {
                 pendingCharges.put(externalRef,
-                        new PendingCharge(amount, normalisedPhone, network, externalRef));
+                        new PendingCharge(amount, phone, network, externalRef));
                 log.info("moolreDirectCharge: cached pending charge for externalRef='{}'", externalRef);
             }
             log.warn("moolreDirectCharge: action-required message status='{}' message='{}'", status, message);
