@@ -44,10 +44,10 @@ public class WithdrawalService {
     private BigDecimal dailyWithdrawalLimit;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // User submits a withdrawal request.
+    // Submit
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
-    public WithdrawalRequest submitRequest(UUID userId, WithdrawalRequestDto req) {
+    public WithdrawalDto submitRequest(UUID userId, WithdrawalRequestDto req) {
 
         boolean hasPending = withdrawalRepo.existsByUserIdAndStatusIn(
                 userId, List.of(WithdrawalStatus.PENDING, WithdrawalStatus.APPROVED));
@@ -120,14 +120,15 @@ public class WithdrawalService {
                 request.getId(), userId, req.getAmount(),
                 req.getCurrency() != null ? req.getCurrency() : "GHS");
 
-        return request;
+        // Map inside the transaction — session still open, no lazy proxy issues
+        return WithdrawalDto.from(request);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Admin approves a PENDING withdrawal.
+    // Approve
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
-    public WithdrawalRequest approve(UUID requestId, UUID adminId, String note) {
+    public WithdrawalDto approve(UUID requestId, UUID adminId, String note) {
         var request = withdrawalRepo.findById(requestId)
                 .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
 
@@ -146,14 +147,14 @@ public class WithdrawalService {
                 null, Map.of("note", note != null ? note : "",
                         "userId", request.getUser().getId().toString()), null);
 
-        return request;
+        return WithdrawalDto.from(request);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Admin rejects a PENDING withdrawal — refunds wallet.
+    // Reject
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
-    public WithdrawalRequest reject(UUID requestId, UUID adminId, String note) {
+    public WithdrawalDto reject(UUID requestId, UUID adminId, String note) {
         var request = withdrawalRepo.findById(requestId)
                 .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
 
@@ -189,14 +190,14 @@ public class WithdrawalService {
                 null, Map.of("note", note != null ? note : "",
                         "userId", request.getUser().getId().toString()), null);
 
-        return request;
+        return WithdrawalDto.from(request);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Super admin settles an APPROVED withdrawal.
+    // Settle
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
-    public WithdrawalRequest settle(UUID requestId, UUID superAdminId, String note) {
+    public WithdrawalDto settle(UUID requestId, UUID superAdminId, String note) {
         var request = withdrawalRepo.findById(requestId)
                 .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
 
@@ -220,14 +221,14 @@ public class WithdrawalService {
                 null, Map.of("note", note != null ? note : "",
                         "userId", request.getUser().getId().toString()), null);
 
-        return request;
+        return WithdrawalDto.from(request);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Super admin marks an APPROVED withdrawal as failed — refunds wallet.
+    // Mark failed
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
-    public WithdrawalRequest markFailed(UUID requestId, UUID superAdminId, String note) {
+    public WithdrawalDto markFailed(UUID requestId, UUID superAdminId, String note) {
         var request = withdrawalRepo.findById(requestId)
                 .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
 
@@ -263,44 +264,39 @@ public class WithdrawalService {
                 null, Map.of("note", note != null ? note : "",
                         "userId", request.getUser().getId().toString()), null);
 
-        return request;
+        return WithdrawalDto.from(request);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Queries
+    // Queries — all @Transactional(readOnly) so session stays open for mapping
     // ─────────────────────────────────────────────────────────────────────────
 
     @Transactional(readOnly = true)
-    public Page<WithdrawalRequest> getUserWithdrawals(UUID userId, Pageable pageable) {
-        return withdrawalRepo.findByUserIdOrderByCreatedAtDesc(userId, pageable);
+    public Page<WithdrawalDto> getUserWithdrawals(UUID userId, Pageable pageable) {
+        return withdrawalRepo.findByUserIdOrderByCreatedAtDesc(userId, pageable)
+                .map(WithdrawalDto::from);
     }
 
-    /**
-     * Marked @Transactional so the Hibernate session stays open while Jackson
-     * serializes the result — prevents the "could not initialize proxy - no Session"
-     * LazyInitializationException that was causing the 500.
-     */
     @Transactional(readOnly = true)
     public Page<WithdrawalDto> getAllWithdrawals(WithdrawalStatus status, Pageable pageable) {
         Page<WithdrawalRequest> page = (status != null)
                 ? withdrawalRepo.findByStatusOrderByCreatedAtDesc(status, pageable)
                 : withdrawalRepo.findAllByOrderByCreatedAtDesc(pageable);
-
-        // Map to DTO inside the transaction while the session is still open.
-        // This eagerly reads all lazy associations before the session closes.
         return page.map(WithdrawalDto::from);
     }
 
     @Transactional(readOnly = true)
-    public WithdrawalRequest getById(UUID id) {
-        return withdrawalRepo.findById(id)
-                .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
+    public WithdrawalDto getById(UUID id) {
+        return WithdrawalDto.from(
+                withdrawalRepo.findById(id)
+                        .orElseThrow(() -> ApiException.notFound("Withdrawal request not found")));
     }
 
     @Transactional(readOnly = true)
-    public WithdrawalRequest getByIdAndUser(UUID id, UUID userId) {
-        return withdrawalRepo.findByIdAndUserId(id, userId)
-                .orElseThrow(() -> ApiException.notFound("Withdrawal request not found"));
+    public WithdrawalDto getByIdAndUser(UUID id, UUID userId) {
+        return WithdrawalDto.from(
+                withdrawalRepo.findByIdAndUserId(id, userId)
+                        .orElseThrow(() -> ApiException.notFound("Withdrawal request not found")));
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -29,41 +29,35 @@ public class WithdrawalController {
     // ==================== USER ENDPOINTS ====================
 
     @PostMapping
-    public ResponseEntity<ApiResponse<WithdrawalRequest>> submitWithdrawal(
+    public ResponseEntity<ApiResponse<WithdrawalDto>> submitWithdrawal(
             @Valid @RequestBody WithdrawalRequestDto req,
             @AuthenticationPrincipal User user) {
-        var request = withdrawalService.submitRequest(user.getId(), req);
+        WithdrawalDto request = withdrawalService.submitRequest(user.getId(), req);
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal request submitted"));
     }
 
     @GetMapping
-    public ResponseEntity<ApiResponse<Page<WithdrawalRequest>>> getMyWithdrawals(
+    public ResponseEntity<ApiResponse<Page<WithdrawalDto>>> getMyWithdrawals(
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size,
             @RequestParam(required = false) WithdrawalStatus status,
             @AuthenticationPrincipal User user) {
         Pageable pageable = PageRequest.of(page, size,
                 Sort.by(Sort.Direction.DESC, "createdAt"));
-        Page<WithdrawalRequest> withdrawals = withdrawalService.getUserWithdrawals(user.getId(), pageable);
+        Page<WithdrawalDto> withdrawals = withdrawalService.getUserWithdrawals(user.getId(), pageable);
         return ResponseEntity.ok(ApiResponse.ok(withdrawals));
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<ApiResponse<WithdrawalRequest>> getWithdrawal(
+    public ResponseEntity<ApiResponse<WithdrawalDto>> getWithdrawal(
             @PathVariable UUID id,
             @AuthenticationPrincipal User user) {
-        var request = withdrawalService.getByIdAndUser(id, user.getId());
+        WithdrawalDto request = withdrawalService.getByIdAndUser(id, user.getId());
         return ResponseEntity.ok(ApiResponse.ok(request));
     }
 
     // ==================== ADMIN ENDPOINTS ====================
 
-    /**
-     * Returns WithdrawalDto (not the raw entity) to avoid the
-     * "could not initialize proxy - no Session" LazyInitializationException
-     * that occurs when Jackson tries to serialize lazy User associations
-     * after the Hibernate session has closed.
-     */
     @GetMapping("/admin/all")
     public ResponseEntity<ApiResponse<Page<WithdrawalDto>>> getAllWithdrawalsForAdmin(
             @RequestParam(defaultValue = "0") int page,
@@ -90,7 +84,7 @@ public class WithdrawalController {
     }
 
     @PostMapping("/admin/{id}/approve")
-    public ResponseEntity<ApiResponse<WithdrawalRequest>> approveWithdrawal(
+    public ResponseEntity<ApiResponse<WithdrawalDto>> approveWithdrawal(
             @PathVariable UUID id,
             @RequestBody Map<String, String> req,
             @AuthenticationPrincipal User user) {
@@ -98,12 +92,12 @@ public class WithdrawalController {
             throw ApiException.forbidden("Admin access required");
         }
         var note = req.getOrDefault("note", "");
-        var request = withdrawalService.approve(id, user.getId(), note);
+        WithdrawalDto request = withdrawalService.approve(id, user.getId(), note);
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal approved"));
     }
 
     @PostMapping("/admin/{id}/reject")
-    public ResponseEntity<ApiResponse<WithdrawalRequest>> rejectWithdrawal(
+    public ResponseEntity<ApiResponse<WithdrawalDto>> rejectWithdrawal(
             @PathVariable UUID id,
             @RequestBody Map<String, String> req,
             @AuthenticationPrincipal User user) {
@@ -111,14 +105,14 @@ public class WithdrawalController {
             throw ApiException.forbidden("Admin access required");
         }
         var note = req.getOrDefault("note", "");
-        var request = withdrawalService.reject(id, user.getId(), note);
+        WithdrawalDto request = withdrawalService.reject(id, user.getId(), note);
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal rejected"));
     }
 
     // ==================== SUPER ADMIN ENDPOINTS ====================
 
     @PostMapping("/super-admin/{id}/settle")
-    public ResponseEntity<ApiResponse<WithdrawalRequest>> settleWithdrawal(
+    public ResponseEntity<ApiResponse<WithdrawalDto>> settleWithdrawal(
             @PathVariable UUID id,
             @RequestBody Map<String, String> req,
             @AuthenticationPrincipal User user) {
@@ -126,12 +120,12 @@ public class WithdrawalController {
             throw ApiException.forbidden("Super admin access required");
         }
         var note = req.getOrDefault("note", "");
-        var request = withdrawalService.settle(id, user.getId(), note);
+        WithdrawalDto request = withdrawalService.settle(id, user.getId(), note);
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal settled"));
     }
 
     @PostMapping("/super-admin/{id}/mark-failed")
-    public ResponseEntity<ApiResponse<WithdrawalRequest>> markWithdrawalFailed(
+    public ResponseEntity<ApiResponse<WithdrawalDto>> markWithdrawalFailed(
             @PathVariable UUID id,
             @RequestBody Map<String, String> req,
             @AuthenticationPrincipal User user) {
@@ -139,7 +133,7 @@ public class WithdrawalController {
             throw ApiException.forbidden("Super admin access required");
         }
         var note = req.getOrDefault("note", "");
-        var request = withdrawalService.markFailed(id, user.getId(), note);
+        WithdrawalDto request = withdrawalService.markFailed(id, user.getId(), note);
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal marked as failed"));
     }
 
