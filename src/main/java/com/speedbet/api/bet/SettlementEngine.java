@@ -11,6 +11,7 @@ import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
 import java.util.List;
+import java.util.UUID;
 
 /**
  * SettlementEngine — settles bets across all SpeedBet markets:
@@ -66,6 +67,14 @@ import java.util.List;
  *   or skipped due to a race condition). This is the primary safety net that
  *   prevents the issue where bets placed before a match finishes are never
  *   settled because the match was already marked settled when the engine ran.
+ *
+ *  FIX 5 — settleOneBet(): multi-leg accumulator fix. Previously, the
+ *   allSettled check used "PENDING".equals(s.getResult()) across ALL selections,
+ *   meaning legs from other not-yet-finished matches (still result=PENDING in DB)
+ *   would always cause the bet to defer and never pay out. The fix restricts the
+ *   check to only legs whose match is either the current match being settled OR
+ *   already fully settled — so a multi-leg bet correctly resolves once its last
+ *   outstanding match finishes.
  */
 @Slf4j
 @Component
@@ -268,8 +277,20 @@ public class SettlementEngine {
             return;
         }
 
+        // ── FIX 5: Multi-leg accumulator fix ─────────────────────────────────
+        // Previously this checked ALL selections for "PENDING", which meant legs
+        // from other not-yet-finished matches (still PENDING in the DB) would
+        // always cause the bet to defer, so multi-leg bets were never settled.
+        //
+        // The fix: only consider a leg "outstanding" if its match is neither the
+        // current match nor already fully settled. Legs from finished+settled
+        // matches will have a non-PENDING result stored in the DB; legs from the
+        // current match just had their result set above. Only legs from genuinely
+        // still-live matches should keep the bet deferred.
         boolean allSettled = bet.getSelections().stream()
+                .filter(s -> s.getMatchId().equals(match.getId()) || isMatchSettled(s.getMatchId()))
                 .noneMatch(s -> "PENDING".equals(s.getResult()));
+
         if (!allSettled) {
             log.debug("settleOneBet: bet {} — not all legs settled yet, deferring payout", bet.getId());
             return;
@@ -298,6 +319,26 @@ public class SettlementEngine {
         log.info("settleOneBet: bet {} → {} effectiveOdds={} payout={}",
                 bet.getId(), finalStatus, effectiveOdds, payout);
         betService.settleBet(bet, finalStatus, payout);
+    }
+
+    // ── Helper: check if a match is already fully settled ─────────────────
+
+    /**
+     * FIX 5 helper: Returns true if the given matchId refers to a match that has
+     * already been marked as settled (i.e. settledAt is non-null). Used by settleOneBet()
+     * to determine whether a selection from another match should block payout on a multi-leg bet.
+     *
+     * matchService.getById() requires a String and throws ApiException (not an Optional)
+     * if not found, so we catch and default to false.
+     */
+    private boolean isMatchSettled(UUID matchId) {
+        try {
+            com.speedbet.api.match.Match m = matchService.getById(matchId.toString());
+            return m.getSettledAt() != null;
+        } catch (Exception e) {
+            log.warn("isMatchSettled: could not look up matchId={} — treating as unsettled", matchId);
+            return false;
+        }
     }
 
     // ── Market router ─────────────────────────────────────────────────────
