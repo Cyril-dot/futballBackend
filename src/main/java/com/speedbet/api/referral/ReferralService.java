@@ -22,16 +22,23 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class ReferralService {
 
-    private static final String     CHARSET                    = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    private static final SecureRandom RANDOM                   = new SecureRandom();
+    private static final String       CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    private static final SecureRandom RANDOM  = new SecureRandom();
 
     // ── Commission defaults ───────────────────────────────────────────────────
     /** Commission rate for regular (non-admin) affiliate links. */
-    private static final BigDecimal DEFAULT_USER_COMMISSION    = BigDecimal.valueOf(2);
+    private static final BigDecimal DEFAULT_USER_COMMISSION  = BigDecimal.valueOf(2);
 
-    /** Commission rate applied immediately after an admin upgrade, before the
-     *  Super Admin finalises it via the onboarding chat. */
-    private static final BigDecimal DEFAULT_ADMIN_COMMISSION   = BigDecimal.valueOf(65);
+    /**
+     * Default commission rate (%) applied immediately after an admin upgrade,
+     * before the Super Admin finalises it via the onboarding chat.
+     *
+     * Rate: 70% — the admin earns 70% of the platform commission on every
+     * deposit made by users they referred.
+     * Super Admin can adjust this per-admin via AdminUpgradeChatService.setCommission
+     * → updateCommissionRate().
+     */
+    private static final BigDecimal DEFAULT_ADMIN_COMMISSION = BigDecimal.valueOf(70);
 
     private final ReferralLinkRepository linkRepo;
     private final ReferralRepository     referralRepo;
@@ -92,8 +99,8 @@ public class ReferralService {
                 "REF-" + userId + "-" + System.currentTimeMillis(),
                 Map.of("userId", userId.toString(), "stake", stake.toString()));
 
-        log.info("attributeCommission: GHS {} credited to adminId={} for userId={}",
-                commission, link.getAdminId(), userId);
+        log.info("attributeCommission: GHS {} credited to adminId={} for userId={} at {}%",
+                commission, link.getAdminId(), userId, link.getCommissionPercent());
     }
 
     // ─── Link Management ──────────────────────────────────────────────────────
@@ -124,7 +131,7 @@ public class ReferralService {
             throw new IllegalArgumentException(
                     "commissionPercent must be provided explicitly. " +
                             "Use createUserLink() for regular users (2%) or " +
-                            "createAdminUpgradeLink() for admins (60%).");
+                            "createAdminUpgradeLink() for admins (70%).");
         }
 
         log.info("createLink: adminId={} label='{}' commission={}% expiresAt={}",
@@ -147,12 +154,12 @@ public class ReferralService {
     /**
      * Called by UserService.upgradeToAdmin() after role promotion.
      *
-     * 1. Creates a new 60% referral link for this admin.
+     * 1. Creates a new 70% referral link for this admin.
      * 2. Migrates ALL existing referrals (from their old user links) to the
-     *    new link so their referred users immediately earn them 60%.
+     *    new link so their referred users immediately earn them 70%.
      * 3. Deactivates all old links.
      *
-     * The Super Admin may later adjust the 60% rate via the onboarding chat
+     * The Super Admin may later adjust the 70% rate via the onboarding chat
      * (AdminUpgradeChatService.setCommission → updateCommissionRate).
      */
     @Transactional
@@ -162,13 +169,13 @@ public class ReferralService {
         ReferralLink newLink = createLink(
                 adminId,
                 "Admin upgrade link",
-                DEFAULT_ADMIN_COMMISSION,   // ← 60%, explicit constant
+                DEFAULT_ADMIN_COMMISSION,   // ← 70%, explicit constant
                 null
         );
         log.info("createAdminUpgradeLink: new {}% linkId={} created for adminId={}",
                 DEFAULT_ADMIN_COMMISSION, newLink.getId(), adminId);
 
-        // Migrate existing referrals so commission rate takes effect immediately
+        // Migrate existing referrals so the 70% commission rate takes effect immediately
         List<Referral> existingReferrals = referralRepo.findByAdminId(adminId);
         for (Referral referral : existingReferrals) {
             referral.setLinkId(newLink.getId());
@@ -198,6 +205,9 @@ public class ReferralService {
      * finalises the onboarding rate via the upgrade chat. Finds all active links
      * for this admin (normally exactly one after the upgrade flow) and updates
      * their commissionPercent.
+     *
+     * The new rate takes effect immediately — the next call to
+     * attributeCommission() for any referred user of this admin will use it.
      *
      * Throws 404 if no active link exists — which should never happen in the
      * normal flow since upgradeToAdmin always calls createAdminUpgradeLink first.

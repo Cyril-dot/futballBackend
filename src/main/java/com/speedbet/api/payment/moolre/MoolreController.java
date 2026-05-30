@@ -57,6 +57,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *     POST /api/user/upgrade-to-admin/moolre/init
  *     • Same USSD direct flow but amount is fixed at GHS 200 and promotes
  *       the user to ADMIN on successful payment.
+ *     • New admin's commission rate is initialised at 70% (set inside
+ *       UserService.upgradeToAdmin). Super Admin can adjust via onboarding chat.
  *     • Also returns actionRequired flag when applicable.
  *
  *  4. Payment Verification (manual fallback / polling)
@@ -71,6 +73,14 @@ import java.util.concurrent.ConcurrentHashMap;
  *     • Moolre POSTs here after every successful payment.
  *     • Verified by matching the `secret` field in the payload.
  *     • /verify above is the fallback for missed or delayed webhooks.
+ *
+ * ─── Commission structure ─────────────────────────────────────────────────────
+ *   Every deposit triggers ReferralService.attributeCommission(), which credits
+ *   the referring admin's affiliate wallet based on their stored commission rate.
+ *   Default admin commission rate: 70% (ADMIN_COMMISSION_RATE constant below).
+ *   The rate is stored on the Referral entity and set during upgradeToAdmin().
+ *   Super Admin can negotiate a different rate via the onboarding chat created
+ *   after a successful admin upgrade payment.
  *
  * ─── OTP flow (per official Moolre docs) ─────────────────────────────────────
  *   There is NO separate /authorize endpoint.  The OTP is submitted by re-calling
@@ -120,6 +130,15 @@ public class MoolreController {
     private static final BigDecimal ADMIN_UPGRADE_FEE    = BigDecimal.valueOf(200);
     private static final String     UPGRADE_INTENT_ADMIN = "adminupgrade";
     private static final String     DEPOSIT_INTENT       = "deposit";
+
+    /**
+     * Commission rate applied to every deposit for affiliate attribution.
+     * Admins earn 70% of the platform commission on each referred deposit.
+     * The actual per-admin rate is stored on the Referral entity (set during
+     * upgradeToAdmin) and resolved inside ReferralService.attributeCommission().
+     * This constant is for logging/documentation purposes only.
+     */
+    private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
 
     // Moolre txstatus codes
     private static final int TX_SUCCESS = 1;
@@ -172,6 +191,9 @@ public class MoolreController {
      *     "actionRequired": false,   // true → user must enter SMS code via /otp first
      *     "message":        "..."
      *   }
+     *
+     * On success, Moolre fires a webhook which triggers handleDeposit → wallet
+     * credit + commission attribution at the admin's 70% rate.
      */
     @PostMapping("/api/wallet/deposit/moolre/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
@@ -282,15 +304,10 @@ public class MoolreController {
         log.info("submitOtp: userId='{}' externalRef='{}'", user.getId(), ref);
 
         try {
-            // Per Moolre docs: re-call /open/transact/payment with same params + otpcode.
-            // pending.network() is the original network string ("MTN" / "VODAFONE" / "AIRTELTIGO").
-            // moolreDirectCharge will detect the OTP-verified response and automatically
-            // make the follow-up call (step B) to push the USSD prompt.
             moolreDirectCharge(pending.amount(), pending.phone(), pending.network(), ref, otp.toString().trim());
             // Remove from cache — USSD prompt has been triggered
             pendingCharges.remove(ref);
         } catch (ActionRequiredException ex) {
-            // Should not happen after OTP submission, but handle gracefully
             log.warn("submitOtp: unexpected actionRequired after OTP for externalRef='{}' — {}", ref, ex.getMessage());
             throw ApiException.badRequest("OTP verification failed: " + ex.getMessage());
         } catch (RuntimeException ex) {
@@ -310,6 +327,12 @@ public class MoolreController {
 
     /**
      * Initiates a Moolre USSD direct charge for the GHS 200 admin upgrade fee.
+     *
+     * On successful payment:
+     *   • User is promoted to ADMIN
+     *   • Their referral link is created with a 70% commission rate (set inside
+     *     UserService.upgradeToAdmin)
+     *   • An onboarding chat is opened with Super Admin to confirm/adjust the rate
      *
      * Required body fields:
      *   phone   – customer's MoMo number in 0XXXXXXXXX format
@@ -379,6 +402,9 @@ public class MoolreController {
      * Manually verifies a Moolre payment by its externalref and credits the
      * wallet if successful. Idempotent — safe to poll.
      *
+     * On deposit success: credits user wallet + attributes 70% commission to
+     * referring admin via ReferralService.attributeCommission().
+     *
      * Required body fields:
      *   externalref – the reference returned by /init
      */
@@ -441,7 +467,7 @@ public class MoolreController {
             )));
         }
 
-        // txstatus = 1 — credit wallet
+        // txstatus = 1 — credit wallet and attribute commission
         var valueStr = resolveAmount(data, ref);
         var amount   = new BigDecimal(valueStr);
         var intent   = parts[0];
@@ -555,6 +581,21 @@ public class MoolreController {
 
     // ─── Private — wallet handlers ────────────────────────────────────────────
 
+    /**
+     * Credits the depositing user's wallet, then attributes commission to
+     * their referring admin.
+     *
+     * Commission structure:
+     *   The referring admin earns a percentage of every deposit made by users
+     *   they referred. The rate is stored on the Referral entity and defaults
+     *   to 70% of the platform commission (ADMIN_COMMISSION_RATE). Resolution
+     *   is handled entirely inside ReferralService.attributeCommission() —
+     *   this method just triggers it.
+     *
+     * Flow:
+     *   deposit amount → walletService.credit (user wallet)
+     *                  → referralService.attributeCommission (admin affiliate wallet)
+     */
     private boolean handleDeposit(UUID userId, String ref, BigDecimal amount) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}'", userId, amount, ref);
         try {
@@ -569,11 +610,17 @@ public class MoolreController {
             throw ex;
         }
 
+        // ── Attribute commission to referring admin based on commission structure ──
+        // The admin's rate (default 70%) is resolved from the Referral entity inside
+        // ReferralService. No rate logic lives here — just trigger attribution.
         try {
             referralService.attributeCommission(userId, amount);
-            log.info("handleDeposit: commission attributed for userId='{}' deposit='{}'", userId, amount);
+            log.info("handleDeposit: commission attributed for userId='{}' deposit='{}' adminRate={}",
+                    userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {
-            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate", userId, ex);
+            // Never block a deposit because of a commission failure
+            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate",
+                    userId, ex);
         }
 
         return true;
@@ -583,6 +630,21 @@ public class MoolreController {
         return handleDeposit(userId, ref, amount);
     }
 
+    /**
+     * Handles an admin upgrade payment.
+     *
+     * Steps:
+     *   1. Validates amount >= GHS 200
+     *   2. Promotes user to ADMIN + initialises their referral link at 70% commission
+     *      (rate is set inside UserService.upgradeToAdmin)
+     *   3. Records an audit transaction (Moolre collected the funds externally)
+     *   4. Creates onboarding chat with Super Admin to confirm/adjust the 70% rate
+     *
+     * Commission structure note:
+     *   Super Admin may negotiate a custom rate during the onboarding chat. Any
+     *   adjustment must be applied directly to the Referral entity — the rate
+     *   stored there is what ReferralService.attributeCommission() uses.
+     */
     private boolean handleAdminUpgrade(UUID userId, String ref, BigDecimal amount) {
         log.info("handleAdminUpgrade: userId='{}' amount={} ref='{}'", userId, amount, ref);
 
@@ -593,8 +655,10 @@ public class MoolreController {
         }
 
         try {
+            // upgradeToAdmin sets the new admin's commission rate to 70% on the Referral entity
             userService.upgradeToAdmin(userId, ref);
-            log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN ref='{}'", userId, ref);
+            log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN with {}% commission ref='{}'",
+                    userId, ADMIN_COMMISSION_RATE.multiply(BigDecimal.valueOf(100)).toPlainString(), ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("handleAdminUpgrade: duplicate ref='{}' — skipping", ref);
@@ -603,10 +667,12 @@ public class MoolreController {
             throw ex;
         }
 
+        // Audit record — Moolre collected GHS 200 externally, no wallet debit needed
         walletService.recordExternalDebit(userId, amount, TxKind.ADMIN_UPGRADE_FEE, ref,
                 Map.of("provider", "moolre", "reference", ref));
         log.info("handleAdminUpgrade: audit tx recorded for userId='{}' ref='{}'", userId, ref);
 
+        // Create onboarding chat so Super Admin can confirm/adjust the 70% commission rate
         adminUpgradeChatService.createUpgradeChat(userId);
         log.info("handleAdminUpgrade: upgrade chat created for userId='{}'", userId);
 
@@ -748,7 +814,6 @@ public class MoolreController {
         if (!message.isBlank() && isOtpVerifiedMessage(message)) {
             log.info("moolreDirectCharge: OTP verified ('{}') — triggering USSD push (step B) for externalRef='{}'",
                     message, externalRef);
-            // Recursive call without otpcode — this triggers the actual USSD push.
             return moolreDirectCharge(amount, phone, network, externalRef, null);
         }
 

@@ -39,6 +39,15 @@ public class PaystackController {
     private static final int    ADMIN_UPGRADE_FEE_PESEWAS = 20_000; // GHS 200 × 100
     private static final String UPGRADE_INTENT_ADMIN      = "admin";
 
+    /**
+     * Commission rate applied to every deposit for affiliate attribution.
+     * Admins earn 70% of the configured platform commission on each referred deposit.
+     * The actual per-admin rate is stored on the Referral entity (set during
+     * upgradeToAdmin) and resolved inside ReferralService.attributeCommission().
+     * This constant is for logging/documentation purposes only.
+     */
+    private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
+
     private final WalletService           walletService;
     private final UserService             userService;
     private final AdminUpgradeChatService adminUpgradeChatService;
@@ -68,9 +77,6 @@ public class PaystackController {
 
         log.info("initDeposit: userId='{}' amount={} pesewas={}", user.getId(), amount, amountPesewas);
 
-        // FIX: paystackInit now throws on error instead of silently swallowing it.
-        // The full Paystack response { status, data: { authorization_url, reference } }
-        // is returned directly so the frontend can unwrap it.
         var response = paystackInit(
                 user.getEmail(),
                 amountPesewas,
@@ -186,7 +192,17 @@ public class PaystackController {
 
     /**
      * Credits the depositing user's wallet, then attributes commission
-     * to their referrer (if they were referred) based on the deposit amount.
+     * to their referrer (if they were referred).
+     *
+     * Commission structure:
+     *   The referring admin earns a percentage of every deposit made by users
+     *   they referred. The rate is stored on the Referral entity and defaults
+     *   to 70% of the platform commission. Resolution is handled entirely inside
+     *   ReferralService.attributeCommission() — this method just triggers it.
+     *
+     * Flow:
+     *   deposit amount → walletService.credit (user wallet)
+     *                  → referralService.attributeCommission (admin affiliate wallet)
      */
     private void handleDeposit(UUID userId, String ref, BigDecimal amount) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}'", userId, amount, ref);
@@ -203,11 +219,13 @@ public class PaystackController {
             throw ex;
         }
 
-        // ── Attribute commission to referrer on every deposit ──
+        // ── Attribute commission to referring admin based on commission structure ──
+        // The admin's rate (default 70%) is resolved from the Referral entity inside
+        // ReferralService. No rate logic lives here — just trigger attribution.
         try {
             referralService.attributeCommission(userId, amount);
-            log.info("handleDeposit: commission attributed for userId='{}' deposit='{}'",
-                    userId, amount);
+            log.info("handleDeposit: commission attributed for userId='{}' deposit='{}' adminRate={}",
+                    userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {
             // Never block a deposit because of a commission failure
             log.error("handleDeposit: commission attribution failed for userId='{}' — investigate",
@@ -217,10 +235,17 @@ public class PaystackController {
 
     /**
      * Handles an admin upgrade payment.
-     * 1. Validates amount >= GHS 200
-     * 2. Promotes user to ADMIN + creates their 60% referral link
-     * 3. Records an audit transaction (Paystack already collected the funds)
-     * 4. Creates onboarding chat with Super Admin for commission negotiation
+     *
+     * Steps:
+     *   1. Validates amount >= GHS 200
+     *   2. Promotes user to ADMIN + initialises their referral link at 70% commission
+     *   3. Records an audit transaction (Paystack already collected the funds externally)
+     *   4. Creates onboarding chat with Super Admin for commission confirmation
+     *
+     * Commission structure note:
+     *   The new admin's default commission rate is set to 70% inside
+     *   UserService.upgradeToAdmin(). Super Admin can adjust the rate via the
+     *   onboarding chat created in step 4.
      */
     private void handleAdminUpgrade(UUID userId, String ref, BigDecimal amount) {
         log.info("handleAdminUpgrade: userId='{}' amount={} ref='{}'", userId, amount, ref);
@@ -233,8 +258,10 @@ public class PaystackController {
         }
 
         try {
+            // upgradeToAdmin sets the new admin's commission rate to 70% on the Referral entity
             userService.upgradeToAdmin(userId, ref);
-            log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN ref='{}'", userId, ref);
+            log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN with {}% commission ref='{}'",
+                    userId, ADMIN_COMMISSION_RATE.multiply(BigDecimal.valueOf(100)).toPlainString(), ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("handleAdminUpgrade: duplicate ref='{}' — skipping", ref);
@@ -248,7 +275,7 @@ public class PaystackController {
                 Map.of("provider", "paystack", "reference", ref));
         log.info("handleAdminUpgrade: audit tx recorded for userId='{}' ref='{}'", userId, ref);
 
-        // Create onboarding chat so Super Admin can negotiate final commission rate
+        // Create onboarding chat so Super Admin can confirm/adjust the 70% commission rate
         adminUpgradeChatService.createUpgradeChat(userId);
         log.info("handleAdminUpgrade: upgrade chat created for userId='{}'", userId);
     }
@@ -259,9 +286,8 @@ public class PaystackController {
      * Calls Paystack /transaction/initialize and returns the FULL response map:
      *   { "status": true, "message": "...", "data": { "authorization_url": "...", "reference": "..." } }
      *
-     * FIX: replaced .onErrorReturn(...) with .onErrorMap(...) so real Paystack errors
-     * (4xx/5xx, network timeouts, bad secret key) are surfaced as exceptions instead
-     * of being silently swallowed and returned as a 200 with status=false.
+     * Errors (4xx/5xx, network timeouts, bad secret key) are surfaced as
+     * exceptions rather than silently returning status=false.
      *
      * The frontend unwraps the nested `data` object itself:
      *   const inner = raw?.data ?? raw;
@@ -284,8 +310,6 @@ public class PaystackController {
                         "metadata",     metadata
                 ))
                 .retrieve()
-                // FIX: surface HTTP error responses (e.g. 401 bad secret key, 422 validation)
-                // as a proper exception with the response body included in the message.
                 .onStatus(
                         status -> status.isError(),
                         clientResponse -> clientResponse.bodyToMono(String.class)
@@ -297,7 +321,6 @@ public class PaystackController {
                                 })
                 )
                 .bodyToMono(Map.class)
-                // FIX: surface network/timeout errors instead of swallowing them
                 .onErrorMap(
                         ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
                         ex -> {
@@ -311,11 +334,9 @@ public class PaystackController {
             throw new RuntimeException("Paystack returned an empty response.");
         }
 
-        // Log the status Paystack gave us (true = success, false = their own error)
         log.info("paystackInit: Paystack status='{}' message='{}'",
                 result.get("status"), result.get("message"));
 
-        // If Paystack itself says status=false, surface that as an error
         if (Boolean.FALSE.equals(result.get("status"))) {
             var message = result.getOrDefault("message", "Paystack declined the request").toString();
             log.error("paystackInit: Paystack status=false — {}", message);
