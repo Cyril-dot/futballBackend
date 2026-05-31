@@ -203,6 +203,7 @@ public class SecurityConfig {
         return hierarchy;
     }
 
+
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         var config = new CorsConfiguration();
@@ -213,31 +214,44 @@ public class SecurityConfig {
                 "http://localhost:4173",
                 "http://localhost:3000",
                 "http://localhost:8081",
+
                 "https://speedbet.site",
                 "https://www.speedbet.site",
+
                 "https://futball-gamma.vercel.app",
                 "https://futballadmin.vercel.app",
+
                 "https://poikiloblastic-leeanne-gazeless.ngrok-free.dev",
+
                 "https://www.futball.site",
+
                 "https://superbet.vercel.app",
-                // ── nxtbet ────────────────────────────────────────────────────────
+
+                // ── nxtbet ────────────────────────────────────────────
                 "https://nxtbet.site",
                 "https://www.nxtbet.site",
-                // ── bett75 ────────────────────────────────────────────────────────
+                "https://nxtbetadmin.vercel.app",
+
+                // ── bett75 ────────────────────────────────────────────
                 "https://bett75.com",
                 "https://www.bett75.com",
                 "https://bet75.vercel.app",
                 "https://bet75-ui-1.vercel.app",
-                "https://nxtbetadmin.vercel.app",
                 "https://bet75admin.vercel.app",
-                // ── zynobet ───────────────────────────────────────────────────────
+
+                // ── zynobet ───────────────────────────────────────────
                 "https://zynobet.site",
                 "https://www.zynobet.site",
                 "https://oddsking-ui.vercel.app",
                 "https://zynobetadmin.vercel.app",
-                // ── bet (new) ─────────────────────────────────────────────────────
+
+                // ── bet (new) ─────────────────────────────────────────
                 "https://bet-sooty-omega.vercel.app",
-                "https://bet-ej8t5pu7e-cyril-dots-projects.vercel.app"
+                "https://bet-ej8t5pu7e-cyril-dots-projects.vercel.app",
+
+                // ── bbet360 ───────────────────────────────────────────
+                "https://bbet360.site",
+                "https://www.bbet360.site"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
@@ -245,7 +259,14 @@ public class SecurityConfig {
         }
 
         config.setAllowedOrigins(origins);
-        config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+        config.setAllowedMethods(List.of(
+                "GET",
+                "POST",
+                "PUT",
+                "PATCH",
+                "DELETE",
+                "OPTIONS"
+        ));
         config.setAllowedHeaders(List.of("*"));
         config.setExposedHeaders(List.of("Authorization"));
         config.setAllowCredentials(true);
@@ -253,9 +274,10 @@ public class SecurityConfig {
 
         var source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", config);
+
         return source;
     }
-    
+
     
     @Bean
     public AuthenticationProvider authenticationProvider() {
