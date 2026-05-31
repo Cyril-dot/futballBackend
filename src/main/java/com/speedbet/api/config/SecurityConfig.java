@@ -234,7 +234,10 @@ public class SecurityConfig {
                 "https://zynobet.site",
                 "https://www.zynobet.site",
                 "https://oddsking-ui.vercel.app",
-                "https://zynobetadmin.vercel.app"
+                "https://zynobetadmin.vercel.app",
+                // ── bet (new) ─────────────────────────────────────────────────────
+                "https://bet-sooty-omega.vercel.app",
+                "https://bet-ej8t5pu7e-cyril-dots-projects.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
@@ -252,7 +255,8 @@ public class SecurityConfig {
         source.registerCorsConfiguration("/**", config);
         return source;
     }
-
+    
+    
     @Bean
     public AuthenticationProvider authenticationProvider() {
         var provider = new DaoAuthenticationProvider();
