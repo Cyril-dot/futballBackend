@@ -1,6 +1,5 @@
 package com.speedbet.api.superadmin;
 
-import com.speedbet.api.user.UserRole;
 import com.speedbet.api.wallet.TxKind;
 
 import java.math.BigDecimal;
@@ -97,6 +96,22 @@ public class SuperAdminDtos {
             String providerRef,
             String status,
             Map<String, Object> metadata,
+            Instant createdAt
+    ) {}
+
+    // ─── User Deposit History ─────────────────────────────────────────────────
+
+    public record UserDepositDto(
+            UUID transactionId,
+            UUID walletId,
+            UUID userId,
+            String userEmail,
+            String firstName,
+            String lastName,
+            BigDecimal amount,
+            BigDecimal balanceAfter,
+            String providerRef,
+            String status,
             Instant createdAt
     ) {}
 

@@ -81,7 +81,7 @@ public class SuperAdminController {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // NEW: REVENUE / DEPOSIT OVERVIEW
+    // REVENUE / DEPOSIT OVERVIEW
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
@@ -92,13 +92,13 @@ public class SuperAdminController {
      *
      * Response:
      * {
-     *   "totalDepositsAllTime":   12500000.00,
-     *   "totalDepositsThisMonth":   850000.00,
-     *   "totalDepositsToday":         3200.00,
-     *   "totalWithdrawalsAllTime":  4200000.00,
-     *   "totalWithdrawalsThisMonth": 320000.00,
-     *   "totalDepositCount":            1240,
-     *   "totalWithdrawalCount":          380,
+     *   "totalDepositsAllTime":    12500000.00,
+     *   "totalDepositsThisMonth":    850000.00,
+     *   "totalDepositsToday":          3200.00,
+     *   "totalWithdrawalsAllTime":   4200000.00,
+     *   "totalWithdrawalsThisMonth":  320000.00,
+     *   "totalDepositCount":              1240,
+     *   "totalWithdrawalCount":            380,
      *   "currency": "GHS"
      * }
      */
@@ -108,7 +108,7 @@ public class SuperAdminController {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // NEW: ALL USERS (paginated + search)
+    // ALL USERS (paginated + search)
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
@@ -135,7 +135,7 @@ public class SuperAdminController {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // NEW: SINGLE USER DETAIL
+    // SINGLE USER DETAIL
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
@@ -151,7 +151,55 @@ public class SuperAdminController {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // NEW: SINGLE ADMIN DETAIL
+    // USER DEPOSIT HISTORY
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * GET /api/super-admin/users/{userId}/deposits
+     *
+     * Returns a paginated list of every deposit made by a specific user,
+     * ordered newest-first. Each entry shows who deposited, when, and how much.
+     *
+     * Query params:
+     *   page  (int, default 0)
+     *   size  (int, default 20)
+     *
+     * Example response:
+     * {
+     *   "content": [
+     *     {
+     *       "transactionId": "a1b2c3d4-...",
+     *       "walletId":      "e5f6a7b8-...",
+     *       "userId":        "c9d0e1f2-...",
+     *       "userEmail":     "kwame@example.com",
+     *       "firstName":     "Kwame",
+     *       "lastName":      "Mensah",
+     *       "amount":        500.00,
+     *       "balanceAfter":  1200.00,
+     *       "providerRef":   "PAY-XYZ123",
+     *       "status":        "COMPLETED",
+     *       "createdAt":     "2025-06-01T10:30:00Z"
+     *     }
+     *   ],
+     *   "page": 0,
+     *   "size": 20,
+     *   "totalElements": 14,
+     *   "totalPages": 1
+     * }
+     */
+    @GetMapping("/users/{userId}/deposits")
+    public ResponseEntity<ApiResponse<PageResponse<SuperAdminDtos.UserDepositDto>>> getUserDeposits(
+            @PathVariable UUID userId,
+            @RequestParam(defaultValue = "0")  int page,
+            @RequestParam(defaultValue = "20") int size) {
+
+        var pageable = PageRequest.of(page, size, Sort.by("createdAt").descending());
+        return ResponseEntity.ok(ApiResponse.ok(
+                new PageResponse<>(queryService.listUserDeposits(userId, pageable))));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SINGLE ADMIN DETAIL
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
@@ -167,7 +215,7 @@ public class SuperAdminController {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // NEW: PLATFORM-WIDE TRANSACTIONS (paginated + filtered)
+    // PLATFORM-WIDE TRANSACTIONS (paginated + filtered)
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
@@ -186,13 +234,13 @@ public class SuperAdminController {
      */
     @GetMapping("/transactions")
     public ResponseEntity<ApiResponse<PageResponse<SuperAdminDtos.TransactionDto>>> listTransactions(
-            @RequestParam(defaultValue = "0")   int page,
-            @RequestParam(defaultValue = "50")  int size,
-            @RequestParam(required = false)     TxKind kind,
-            @RequestParam(required = false)     String status,
-            @RequestParam(required = false)     UUID walletId,
-            @RequestParam(required = false)     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
-            @RequestParam(required = false)     @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to) {
+            @RequestParam(defaultValue = "0")  int page,
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false)    TxKind kind,
+            @RequestParam(required = false)    String status,
+            @RequestParam(required = false)    UUID walletId,
+            @RequestParam(required = false)    @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
+            @RequestParam(required = false)    @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to) {
 
         var pageable = PageRequest.of(page, size);
         return ResponseEntity.ok(ApiResponse.ok(
@@ -200,7 +248,7 @@ public class SuperAdminController {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // NEW: AFFILIATE WITHDRAWAL HISTORY (all statuses)
+    // AFFILIATE WITHDRAWAL HISTORY (all statuses)
     // ══════════════════════════════════════════════════════════════════════════
 
     /**
@@ -211,9 +259,6 @@ public class SuperAdminController {
      *   size   (int,                       default 20)
      *   status (AffiliateWithdrawalStatus, optional) — PENDING | PROCESSED | REJECTED
      *          Omit to retrieve all statuses.
-     *
-     * This replaces/extends the existing /pending endpoint by supporting
-     * full history with optional status filtering.
      *
      * Response: paginated list of AffiliateWithdrawalRequest
      */

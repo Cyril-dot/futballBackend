@@ -2,8 +2,6 @@ package com.speedbet.api.affiliate;
 
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
-import com.speedbet.api.wallet.TxKind;
-import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -18,6 +16,11 @@ import java.util.UUID;
 /**
  * Super-admin endpoints for processing affiliate withdrawal requests.
  * Only SUPER_ADMIN role can access these.
+ *
+ * IMPORTANT — balance separation:
+ *   These withdrawals represent COMMISSION earnings, not the user's main wallet.
+ *   Rejecting a withdrawal reverses the amount back to the commission balance
+ *   (via AffiliateCommissionService), NOT the main wallet (WalletService).
  */
 @Slf4j
 @RestController
@@ -27,7 +30,7 @@ import java.util.UUID;
 public class WithdrawalAdminController {
 
     private final AffiliateWithdrawalRepository withdrawalRepo;
-    private final WalletService walletService;
+    private final AffiliateCommissionService commissionService;   // ← commission balance, NOT wallet
 
     /** List all PENDING affiliate withdrawal requests. */
     @GetMapping("/pending")
@@ -36,7 +39,10 @@ public class WithdrawalAdminController {
                 withdrawalRepo.findByStatus(AffiliateWithdrawalStatus.PENDING)));
     }
 
-    /** Mark an affiliate withdrawal as processed (bank/MoMo transfer completed). */
+    /**
+     * Mark an affiliate withdrawal as processed (bank/MoMo transfer completed by ops team).
+     * Commission balance was already zeroed at payout-request creation time.
+     */
     @PostMapping("/{id}/process")
     public ResponseEntity<ApiResponse<AffiliateWithdrawalRequest>> process(@PathVariable UUID id) {
         log.info("process: affiliateWithdrawalId={}", id);
@@ -51,7 +57,12 @@ public class WithdrawalAdminController {
         return ResponseEntity.ok(ApiResponse.ok(withdrawalRepo.save(withdrawal)));
     }
 
-    /** Reject an affiliate withdrawal and re-credit the user's wallet. */
+    /**
+     * Reject a withdrawal and return the commission amount back to the affiliate's
+     * COMMISSION balance (not their main wallet — these are two separate ledgers).
+     *
+     * The commission funds will then be swept again in the next daily payout run.
+     */
     @PostMapping("/{id}/reject")
     public ResponseEntity<ApiResponse<AffiliateWithdrawalRequest>> reject(
             @PathVariable UUID id,
@@ -63,19 +74,19 @@ public class WithdrawalAdminController {
         if (withdrawal.getStatus() != AffiliateWithdrawalStatus.PENDING)
             throw ApiException.badRequest("Withdrawal is not PENDING");
 
-        walletService.credit(
+        // ── Reverse into COMMISSION balance, not main wallet ──────────────────
+        // The original debit was against the affiliate's commission ledger.
+        // Reversing to the main wallet would incorrectly inflate the user's
+        // spendable balance with funds they earned as referral commission.
+        commissionService.reverseCommissionPayout(
                 withdrawal.getUserId(),
-                withdrawal.getAmount(),
-                TxKind.WITHDRAWAL_REFUND,
-                "REFUND-" + withdrawal.getReference(),
-                Map.of("reason", "affiliate_withdrawal_rejected",
-                        "originalRef", withdrawal.getReference()));
+                withdrawal.getAmount());
 
         withdrawal.setStatus(AffiliateWithdrawalStatus.REJECTED);
         withdrawal.setRejectReason(body.getOrDefault("reason", "No reason provided"));
         withdrawal.setProcessedAt(Instant.now());
 
-        log.info("reject: wallet re-credited userId={} amount={}",
+        log.info("reject: commission balance re-credited userId={} amount={} (NOT main wallet)",
                 withdrawal.getUserId(), withdrawal.getAmount());
 
         return ResponseEntity.ok(ApiResponse.ok(withdrawalRepo.save(withdrawal)));

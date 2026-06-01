@@ -110,7 +110,7 @@ public class SuperAdminQueryService {
         Wallet wallet = walletRepo.findByUserId(userId)
                 .orElseThrow(() -> ApiException.notFound("Wallet not found"));
 
-        long txCount             = txRepo.countByWalletId(wallet.getId());
+        long txCount                 = txRepo.countByWalletId(wallet.getId());
         BigDecimal walletDeposits    = txRepo.sumByKindSince(wallet.getId(), TxKind.DEPOSIT,  Instant.EPOCH);
         BigDecimal walletWithdrawals = txRepo.sumByKindSince(wallet.getId(), TxKind.WITHDRAW, Instant.EPOCH);
 
@@ -138,6 +138,44 @@ public class SuperAdminQueryService {
                 createdAt,
                 walletDto
         );
+    }
+
+    // ─── User Deposit History ─────────────────────────────────────────────────
+
+    /**
+     * Returns a paginated list of all DEPOSIT transactions for a given user,
+     * newest first. Each row includes user identity so the frontend doesn't
+     * need a separate user-lookup call.
+     */
+    public Page<SuperAdminDtos.UserDepositDto> listUserDeposits(UUID userId, Pageable pageable) {
+        log.info("listUserDeposits: userId='{}'", userId);
+
+        User user = userRepo.findById(userId)
+                .orElseThrow(() -> ApiException.notFound("User not found"));
+
+        Wallet wallet = walletRepo.findByUserId(userId)
+                .orElseThrow(() -> ApiException.notFound("Wallet not found"));
+
+        Pageable p = PageRequest.of(
+                pageable.getPageNumber(),
+                pageable.getPageSize(),
+                Sort.by(Sort.Direction.DESC, "createdAt"));
+
+        return txRepo
+                .findByWalletIdAndKindOrderByCreatedAtDesc(wallet.getId(), TxKind.DEPOSIT, p)
+                .map(tx -> new SuperAdminDtos.UserDepositDto(
+                        tx.getId(),
+                        tx.getWalletId(),
+                        user.getId(),
+                        user.getEmail(),
+                        user.getFirstName(),
+                        user.getLastName(),
+                        tx.getAmount(),
+                        tx.getBalanceAfter(),
+                        tx.getProviderRef(),
+                        tx.getStatus(),
+                        tx.getCreatedAt()
+                ));
     }
 
     // ─── Single Admin Detail ──────────────────────────────────────────────────
@@ -205,9 +243,9 @@ public class SuperAdminQueryService {
         Pageable p = pageable.getSort().isSorted()
                 ? pageable
                 : PageRequest.of(
-                pageable.getPageNumber(),
-                pageable.getPageSize(),
-                Sort.by(Sort.Direction.DESC, "createdAt"));
+                        pageable.getPageNumber(),
+                        pageable.getPageSize(),
+                        Sort.by(Sort.Direction.DESC, "createdAt"));
 
         return txRepo.findAll(TransactionSpecs.filtered(kind, status, walletId, from, to), p)
                 .map(tx -> {

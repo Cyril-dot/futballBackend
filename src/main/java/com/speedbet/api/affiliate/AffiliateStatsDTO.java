@@ -3,18 +3,22 @@ package com.speedbet.api.affiliate;
 import java.math.BigDecimal;
 
 /**
- * Aggregate affiliate stats returned to the user dashboard.
+ * Aggregate affiliate stats returned by GET /api/admin/affiliate/stats
  *
- * @param totalReferrals      Total number of users referred
- * @param lifetimeStake       Sum of all deposits made by referred users
- * @param lifetimeCommission  Total commission earned (credited to wallet)
- * @param availableBalance    Current withdrawable wallet balance
- * @param currency            Wallet currency (e.g. "GHS")
+ * commissionBalance  — current un-paid commission sitting in the commission ledger.
+ *                      This is NOT the admin's main wallet balance.
+ *                      Paid out daily by AffiliateDailyPayoutScheduler.
+ *
+ * totalEarnedLifetime  — all commission ever earned (paid out + current balance)
+ * totalPaidOutLifetime — all commission successfully paid out to date
  */
-record AffiliateStatsDTO(
-        int totalReferrals,
-        BigDecimal lifetimeStake,
-        BigDecimal lifetimeCommission,
-        BigDecimal availableBalance,
-        String currency
+public record AffiliateStatsDTO(
+        int          totalReferrals,
+        BigDecimal   lifetimeStake,
+        BigDecimal   lifetimeCommission,
+        BigDecimal   commissionBalance,      // current un-paid commission (NOT wallet balance)
+        BigDecimal   totalEarnedLifetime,    // all-time earned
+        BigDecimal   totalPaidOutLifetime,   // all-time paid out
+        String       currency,
+        String       lastPayoutAt            // ISO string or empty string if never paid out
 ) {}
