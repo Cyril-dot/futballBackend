@@ -471,9 +471,7 @@ public class BaseballMatchService {
     @Transactional
     @CacheEvict(value = {"mlbTodayMatches"}, allEntries = true)
     public int finishStaleLiveMatches(Instant cutoff) {
-        List<Match> stale = matchRepo.findStaleLive(cutoff).stream()
-                .filter(m -> SPORT.equalsIgnoreCase(m.getSport()))
-                .toList();
+        List<Match> stale = matchRepo.findStaleLiveBySport(SPORT, cutoff, MatchSource.ADMIN_CREATED);
         if (stale.isEmpty()) return 0;
         log.info("finishStaleLiveMatches (MLB): force-finishing {} stale match(es)", stale.size());
         for (Match m : stale) {
