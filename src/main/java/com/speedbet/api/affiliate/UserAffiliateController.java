@@ -6,7 +6,6 @@ import com.speedbet.api.referral.ReferralLink;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.referral.ReferredUserDTO;
 import com.speedbet.api.user.User;
-import com.speedbet.api.wallet.WalletService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotBlank;
@@ -33,7 +32,6 @@ public class UserAffiliateController {
 
     private final ReferralService referralService;
     private final UserAffiliateService userAffiliateService;
-    private final WalletService walletService;
 
     // ─── Links ───────────────────────────────────────────────────────────────
 
@@ -60,7 +58,7 @@ public class UserAffiliateController {
     // ─── Stats ───────────────────────────────────────────────────────────────
 
     @GetMapping("/stats")
-    public ResponseEntity<ApiResponse<AffiliateStatsDTO>> getStats(
+    public ResponseEntity<ApiResponse<UserAffiliateStatsDTO>> getStats(
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(
                 userAffiliateService.getStats(user.getId())));
@@ -69,7 +67,6 @@ public class UserAffiliateController {
     @GetMapping("/referred-users")
     public ResponseEntity<ApiResponse<List<ReferredUserDTO>>> getReferredUsers(
             @AuthenticationPrincipal User user) {
-        // FIX: renamed from getReferredUserDTOsForAdmin → getReferredUserDTOs in ReferralService
         return ResponseEntity.ok(ApiResponse.ok(
                 referralService.getReferredUserDTOs(user.getId())));
     }
@@ -98,7 +95,7 @@ public class UserAffiliateController {
     @GetMapping("/balance")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getBalance(
             @AuthenticationPrincipal User user) {
-        AffiliateStatsDTO stats = userAffiliateService.getStats(user.getId());
+        UserAffiliateStatsDTO stats = userAffiliateService.getStats(user.getId());
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "balance", stats.availableBalance(),
                 "currency", stats.currency()

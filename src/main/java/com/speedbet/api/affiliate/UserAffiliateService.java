@@ -33,7 +33,7 @@ public class UserAffiliateService {
      * Aggregate affiliate stats for a user.
      * Sums across all referrals tied to any link owned by this user.
      */
-    public AffiliateStatsDTO getStats(UUID userId) {
+    public UserAffiliateStatsDTO getStats(UUID userId) {
         log.info("getStats: userId={}", userId);
 
         List<Referral> referrals = referralRepo.findByAdminId(userId);
@@ -48,7 +48,7 @@ public class UserAffiliateService {
 
         var wallet = walletService.getWallet(userId);
 
-        return new AffiliateStatsDTO(
+        return new UserAffiliateStatsDTO(
                 referrals.size(),
                 totalStake,
                 totalCommission,
