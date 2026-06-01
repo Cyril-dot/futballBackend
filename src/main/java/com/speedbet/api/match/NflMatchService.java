@@ -600,7 +600,7 @@ public class NflMatchService {
     @Transactional
     @CacheEvict(value = {"nflTodayMatches"}, allEntries = true)
     public int finishStaleLiveMatches(Instant cutoff) {
-        List<Match> stale = matchRepo.findStaleLiveBySport(SPORT, cutoff);
+        List<Match> stale = matchRepo.findStaleLiveBySport(SPORT, cutoff, MatchSource.ADMIN_CREATED);
         if (stale.isEmpty()) return 0;
         log.info("finishStaleLiveMatches (NFL): force-finishing {} stale match(es)", stale.size());
         for (Match m : stale) {

@@ -540,10 +540,13 @@ public class MmaMatchService {
     @Transactional
     @CacheEvict(value = {"mmaMatches"}, allEntries = true)
     public int finishStaleLiveMatches(Instant cutoff) {
-        List<Match> stale = matchRepo.findStaleLiveBySport(SPORT, cutoff);
+        List<Match> stale = matchRepo.findStaleLiveBySport(SPORT, cutoff, MatchSource.ADMIN_CREATED);
         if (stale.isEmpty()) return 0;
         log.info("MMA finishStaleLiveMatches: force-finishing {} stale match(es)", stale.size());
-        for (Match m : stale) { m.setStatus("FINISHED"); matchRepo.save(m); }
+        for (Match m : stale) {
+            m.setStatus("FINISHED");
+            matchRepo.save(m);
+        }
         return stale.size();
     }
 

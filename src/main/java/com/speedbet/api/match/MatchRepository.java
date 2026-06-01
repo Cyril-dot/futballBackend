@@ -56,13 +56,19 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
     List<Match> findUpcomingScheduled(@Param("from") Instant from,
                                       @Param("to")   Instant to);
 
+    /**
+     * Returns stale LIVE matches whose kickoff was before the given cutoff,
+     * excluding ADMIN_CREATED matches — those must only be finished manually
+     * by the admin via AdminMatchService.updateStatus().
+     */
     @Query("""
             SELECT m FROM Match m
             WHERE m.status = 'LIVE'
               AND (m.kickoffAt IS NULL OR m.kickoffAt < :cutoff)
+              AND m.source <> :excludeSource
             """)
-    List<Match> findStaleLive(@Param("cutoff") Instant cutoff);
-
+    List<Match> findStaleLive(@Param("cutoff") Instant cutoff,
+                              @Param("excludeSource") MatchSource excludeSource);
 
     @Query("""
         SELECT m FROM Match m
@@ -95,7 +101,7 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
     default List<Match> findByStatusAndSport(Sport sport, String status) {
         return findByStatusAndSport(sport != null ? sport.key() : null, status);
     }
-    // MatchRepository.java
+
     @Query("""
         SELECT m FROM Match m
         WHERE m.sport = :sport
@@ -136,14 +142,21 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
                                              @Param("from")  Instant from,
                                              @Param("to")    Instant to);
 
+    /**
+     * Returns stale LIVE matches for a specific sport whose kickoff was before
+     * the given cutoff, excluding ADMIN_CREATED matches — those must only be
+     * finished manually by the admin via AdminMatchService.updateStatus().
+     */
     @Query("""
             SELECT m FROM Match m
             WHERE m.sport = :sport
               AND m.status = 'LIVE'
               AND (m.kickoffAt IS NULL OR m.kickoffAt < :cutoff)
+              AND m.source <> :excludeSource
             """)
     List<Match> findStaleLiveBySport(@Param("sport") String sport,
-                                     @Param("cutoff") Instant cutoff);
+                                     @Param("cutoff") Instant cutoff,
+                                     @Param("excludeSource") MatchSource excludeSource);
 
     @Query("""
             SELECT m FROM Match m

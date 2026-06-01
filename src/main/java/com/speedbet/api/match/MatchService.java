@@ -1287,7 +1287,7 @@ public class MatchService {
 
     @Transactional
     public int finishStaleLiveMatches(Instant cutoff) {
-        List<Match> stale = matchRepo.findStaleLiveBySport("football", cutoff);
+        List<Match> stale = matchRepo.findStaleLiveBySport("football", cutoff, MatchSource.ADMIN_CREATED);
         if (stale.isEmpty()) return 0;
         log.info("finishStaleLiveMatches: force-finishing {} stale football match(es)", stale.size());
         for (Match m : stale) { m.setStatus("FINISHED"); matchRepo.save(m); }
@@ -1298,7 +1298,7 @@ public class MatchService {
 
     @Transactional
     public int finishStaleLiveMatches(Instant cutoff, String sport) {
-        List<Match> stale = matchRepo.findStaleLiveBySport(sport, cutoff);
+        List<Match> stale = matchRepo.findStaleLiveBySport(sport, cutoff, MatchSource.ADMIN_CREATED);
         if (stale.isEmpty()) return 0;
         log.info("finishStaleLiveMatches(sport='{}'): force-finishing {} stale match(es)", sport, stale.size());
         for (Match m : stale) { m.setStatus("FINISHED"); matchRepo.save(m); }
