@@ -28,8 +28,9 @@ public class BankDepositDtos {
         @Size(max = 256, message = "Sender account name must be ≤ 256 characters")
         private String senderAccountName;   // optional
 
-        @Size(max = 512, message = "Screenshot URL must be ≤ 512 characters")
-        private String screenshotUrl;       // optional for now; set after upload
+        // No @Size constraint — frontend sends a compressed base64 JPEG data-URL
+        // (~40–120 KB of text). The column is TEXT / LONGTEXT on the DB side.
+        private String screenshotUrl;       // optional
 
         @Size(max = 1000, message = "Note must be ≤ 1,000 characters")
         private String userNote;            // optional
