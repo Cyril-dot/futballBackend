@@ -251,7 +251,10 @@ public class SecurityConfig {
 
                 // ── bbet360 ───────────────────────────────────────────
                 "https://bbet360.site",
-                "https://www.bbet360.site"
+                "https://www.bbet360.site",
+
+                // ── bet360admin ───────────────────────────────────────
+                "https://bet360admin.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
@@ -277,7 +280,6 @@ public class SecurityConfig {
 
         return source;
     }
-
     
     @Bean
     public AuthenticationProvider authenticationProvider() {
