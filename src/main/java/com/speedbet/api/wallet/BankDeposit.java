@@ -15,16 +15,26 @@ import java.util.UUID;
  * then either APPROVES (credits the wallet) or REJECTS it.
  *
  * Lifecycle:  PENDING → APPROVED | REJECTED
+ *
+ * NOTE on screenshotUrl:
+ *   The frontend compresses the payment screenshot to a JPEG via Canvas and
+ *   sends it as a base64 data-URL (~40–120 KB of text) directly in the JSON
+ *   body — no separate upload endpoint is used. The column must therefore be
+ *   TEXT / LONGTEXT (MySQL) or TEXT (PostgreSQL) rather than VARCHAR(512).
+ *
+ *   Run the matching DB migration before deploying:
+ *     MySQL/MariaDB : ALTER TABLE bank_deposits MODIFY COLUMN screenshot_url LONGTEXT;
+ *     PostgreSQL    : ALTER TABLE bank_deposits ALTER COLUMN screenshot_url TYPE TEXT;
  */
 @Entity
 @Table(
-    name = "bank_deposits",
-    indexes = {
-        @Index(name = "idx_bkd_user_id",     columnList = "user_id"),
-        @Index(name = "idx_bkd_reference",   columnList = "transfer_reference", unique = true),
-        @Index(name = "idx_bkd_status",      columnList = "status"),
-        @Index(name = "idx_bkd_reviewed_by", columnList = "reviewed_by")
-    }
+        name = "bank_deposits",
+        indexes = {
+                @Index(name = "idx_bkd_user_id",     columnList = "user_id"),
+                @Index(name = "idx_bkd_reference",   columnList = "transfer_reference", unique = true),
+                @Index(name = "idx_bkd_status",      columnList = "status"),
+                @Index(name = "idx_bkd_reviewed_by", columnList = "reviewed_by")
+        }
 )
 @Getter @Setter @Builder @NoArgsConstructor @AllArgsConstructor
 public class BankDeposit {
@@ -59,11 +69,25 @@ public class BankDeposit {
     @Column(name = "sender_account_name", length = 256)
     private String senderAccountName;
 
-    /** URL / storage key for the uploaded payment screenshot */
-    @Column(name = "screenshot_url", length = 512)
+    /**
+     * Payment screenshot sent as a compressed base64 JPEG data-URL by the
+     * frontend (e.g. "data:image/jpeg;base64,/9j/4AAQ…").
+     *
+     * Stored as TEXT / LONGTEXT — NOT VARCHAR — because base64-encoded images
+     * are typically 40–120 KB of characters, far exceeding any VARCHAR limit.
+     *
+     * columnDefinition = "TEXT" maps to:
+     *   MySQL / MariaDB  →  TEXT     (65 535 bytes)  — use LONGTEXT if >64 KB
+     *   PostgreSQL       →  TEXT     (unlimited)
+     *   H2 (tests)       →  TEXT     (unlimited)
+     *
+     * For MySQL, prefer LONGTEXT to be safe with larger screenshots:
+     *   @Column(name = "screenshot_url", columnDefinition = "LONGTEXT")
+     */
+    @Column(name = "screenshot_url", columnDefinition = "TEXT")
     private String screenshotUrl;
 
-    /** Optional note from the user */
+    /** Optional free-text note from the user */
     @Column(name = "user_note", length = 1000)
     private String userNote;
 
