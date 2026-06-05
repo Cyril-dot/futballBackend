@@ -65,6 +65,18 @@ public class EmailService {
             Map.entry("MZ", "MZN"), Map.entry("AO", "AOA"), Map.entry("BW", "BWP")
     );
 
+    /**
+     * Resolves the real public IP from a raw value that may contain a proxy chain
+     * (e.g. X-Forwarded-For: "203.0.113.5, 10.0.0.1").
+     * Always call this before detectIpInfo() when the IP comes from an HTTP header.
+     */
+    public String resolvePublicIp(String rawIp) {
+        if (rawIp == null || rawIp.isBlank()) return null;
+        // X-Forwarded-For may be a comma-separated list; the first entry is the client IP
+        String first = rawIp.split(",")[0].trim();
+        return first.isBlank() ? null : first;
+    }
+
     public IpInfo detectIpInfo(String ipAddress) {
         if (ipAddress == null || ipAddress.isBlank()) return IpInfo.unknown();
 
@@ -108,7 +120,7 @@ public class EmailService {
 
     public void sendVerificationEmail(String toEmail, String firstName, UUID userId, String token, String ipAddress) {
         String verificationUrl = String.format("%s/auth/verify-email?token=%s&userId=%s", frontendUrl, token, userId);
-        IpInfo ipInfo = detectIpInfo(ipAddress);
+        IpInfo ipInfo = detectIpInfo(resolvePublicIp(ipAddress));
         sendEmail(toEmail, "Verify your email address", buildVerificationEmailHtml(firstName, verificationUrl, ipInfo));
     }
 
@@ -118,7 +130,7 @@ public class EmailService {
 
     public void sendPasswordResetEmail(String toEmail, String firstName, UUID userId, String token, String ipAddress) {
         String resetUrl = String.format("%s/auth/reset-password?token=%s&userId=%s", frontendUrl, token, userId);
-        IpInfo ipInfo = detectIpInfo(ipAddress);
+        IpInfo ipInfo = detectIpInfo(resolvePublicIp(ipAddress));
         sendEmail(toEmail, "Reset your password", buildPasswordResetEmailHtml(firstName, resetUrl, ipInfo));
     }
 
@@ -135,7 +147,7 @@ public class EmailService {
     public void sendWithdrawalConfirmedEmail(
             String adminEmail, String adminFirstName, String withdrawalId,
             BigDecimal amount, String currency, LocalDateTime processedAt, String ipAddress) {
-        IpInfo ipInfo = detectIpInfo(ipAddress);
+        IpInfo ipInfo = detectIpInfo(resolvePublicIp(ipAddress));
         sendEmail(adminEmail, "Withdrawal approved",
                 buildWithdrawalConfirmedHtml(adminFirstName, withdrawalId, amount, currency, processedAt, ipInfo));
     }
@@ -149,7 +161,7 @@ public class EmailService {
     public void sendWithdrawalRejectedEmail(
             String adminEmail, String adminFirstName, String withdrawalId,
             BigDecimal amount, String currency, String reason, LocalDateTime processedAt, String ipAddress) {
-        IpInfo ipInfo = detectIpInfo(ipAddress);
+        IpInfo ipInfo = detectIpInfo(resolvePublicIp(ipAddress));
         sendEmail(adminEmail, "Withdrawal request declined",
                 buildWithdrawalRejectedHtml(adminFirstName, withdrawalId, amount, currency, reason, processedAt, ipInfo));
     }
@@ -310,12 +322,17 @@ public class EmailService {
             String firstName, String withdrawalId,
             BigDecimal amount, String currency,
             LocalDateTime processedAt, IpInfo ip) {
-        String fmtAmount = String.format("%s %,.2f", currency, amount);
+
+        // Use detected currency from IP if the passed-in currency is missing/generic
+        String displayCurrency = (currency != null && !currency.isBlank()) ? currency : ip.currency();
+        String fmtAmount = String.format("%s %,.2f", displayCurrency, amount);
         String fmtDate   = processedAt != null ? processedAt.format(DT_FMT) : "—";
         String dashboard = frontendUrl + "/admin/withdrawals";
+
         String body = String.format("""
             <p class="greeting">Withdrawal approved</p>
-            <p class="body-text">Hi %s, your withdrawal has been processed successfully. The funds are on their way.</p>
+            <p class="body-text">Hi %s, your withdrawal has been processed successfully.
+            Your funds will be added to your wallet within the next <strong>5 minutes</strong>. Thank you!</p>
             <table class="detail-table">
                 <tr><td class="lbl">Reference</td><td class="val">%s</td></tr>
                 <tr><td class="lbl">Amount</td><td class="val green">%s</td></tr>
@@ -324,11 +341,15 @@ public class EmailService {
                 <tr><td class="lbl">Country</td><td class="val">%s</td></tr>
                 <tr><td class="lbl">Currency</td><td class="val">%s</td></tr>
             </table>
-            <div class="info-box success">Funds typically arrive within <strong>1–3 business days</strong> depending on your bank or mobile money provider.</div>
+            <div class="info-box success">Your funds will be available in your wallet within <strong>5 minutes</strong>.</div>
             <div class="btn-row"><a href="%s" class="btn">View in dashboard</a></div>
             <p style="font-size:12px;color:#bbb;">Questions? Reply to this email quoting the reference above.</p>
             %s
-            """, firstName, withdrawalId, fmtAmount, fmtDate, ip.countryName(), ip.currency(), dashboard, ipSnippet(ip));
+            """,
+                firstName, withdrawalId, fmtAmount, fmtDate,
+                ip.countryName(), ip.currency(),
+                dashboard, ipSnippet(ip));
+
         return wrap("#1a6640", "Your withdrawal has been approved.", body);
     }
 
@@ -336,10 +357,13 @@ public class EmailService {
             String firstName, String withdrawalId,
             BigDecimal amount, String currency,
             String reason, LocalDateTime processedAt, IpInfo ip) {
-        String fmtAmount  = String.format("%s %,.2f", currency, amount);
+
+        String displayCurrency = (currency != null && !currency.isBlank()) ? currency : ip.currency();
+        String fmtAmount  = String.format("%s %,.2f", displayCurrency, amount);
         String fmtDate    = processedAt != null ? processedAt.format(DT_FMT) : "—";
         String reasonText = (reason != null && !reason.isBlank()) ? reason : "No specific reason provided.";
         String dashboard  = frontendUrl + "/admin/withdrawals";
+
         String body = String.format("""
             <p class="greeting">Withdrawal declined</p>
             <p class="body-text">Hi %s, unfortunately your withdrawal request could not be processed. Your funds have been returned to your wallet balance.</p>
@@ -356,7 +380,11 @@ public class EmailService {
             <div class="btn-row"><a href="%s" class="btn">View in dashboard</a></div>
             <p style="font-size:12px;color:#bbb;">If you believe this is a mistake, reply to this email with the reference above.</p>
             %s
-            """, firstName, withdrawalId, fmtAmount, fmtDate, ip.countryName(), ip.currency(), reasonText, dashboard, ipSnippet(ip));
+            """,
+                firstName, withdrawalId, fmtAmount, fmtDate,
+                ip.countryName(), ip.currency(),
+                reasonText, dashboard, ipSnippet(ip));
+
         return wrap("#8b1a1a", "Your withdrawal request was declined.", body);
     }
 }
