@@ -11,26 +11,26 @@ import java.util.Properties;
 @Configuration
 public class EmailConfig {
 
-    @Value("${app.email.gmail-address}")
-    private String gmailAddress;
+    @Value("${app.email.smtp-login}")
+    private String smtpLogin;
 
-    @Value("${app.email.gmail-app-password}")
-    private String gmailAppPassword;
+    @Value("${app.email.smtp-secret}")
+    private String smtpSecret;
 
     @Bean
     public JavaMailSender javaMailSender() {
         JavaMailSenderImpl mailSender = new JavaMailSenderImpl();
 
-        mailSender.setHost("smtp.gmail.com");
-        mailSender.setPort(465);
-        mailSender.setUsername(gmailAddress);   // ← was missing
-        mailSender.setPassword(gmailAppPassword); // ← was missing
+        mailSender.setHost("smtp-relay.brevo.com");
+        mailSender.setPort(587);
+        mailSender.setUsername(smtpLogin);
+        mailSender.setPassword(smtpSecret);
 
         Properties props = mailSender.getJavaMailProperties();
         props.put("mail.transport.protocol",     "smtp");
         props.put("mail.smtp.auth",              "true");
-        props.put("mail.smtp.ssl.enable",        "true");
-        props.put("mail.smtp.starttls.enable",   "false");
+        props.put("mail.smtp.starttls.enable",   "true");
+        props.put("mail.smtp.ssl.enable",        "false");
         props.put("mail.smtp.connectiontimeout", "5000");
         props.put("mail.smtp.timeout",           "5000");
 
