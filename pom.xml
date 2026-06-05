@@ -133,6 +133,17 @@
       <version>3.0.0</version>
     </dependency>
 
+    <!-- Add this to your pom.xml <dependencies> block -->
+    <!-- Provides JavaMailSender, MimeMessage, MimeMessageHelper -->
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-mail</artifactId>
+    </dependency>
+
+    <!-- If you are using Gradle instead, add to build.gradle: -->
+    <!-- implementation 'org.springframework.boot:spring-boot-starter-mail' -->
+
     <!-- Lombok -->
     <dependency>
       <groupId>org.projectlombok</groupId>

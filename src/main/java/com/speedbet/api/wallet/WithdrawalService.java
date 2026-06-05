@@ -17,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -32,13 +33,10 @@ public class WithdrawalService {
     private final UserRepository              userRepo;
     private final AuditService                auditService;
     private final EntityManager               em;
+    private final WithdrawalEmailService      withdrawalEmailService; // ← ADDED
 
     @Value("${app.withdrawal.min-amount:2000}")
     private BigDecimal minWithdrawalAmount;
-
-    // NOTE: Daily withdrawal limit removed — no cap on how much a user may
-    // withdraw per day. The only constraints are minimum amount and available
-    // balance, plus the one-pending-at-a-time rule below.
 
     // ─────────────────────────────────────────────────────────────────────────
     // Submit
@@ -56,10 +54,6 @@ public class WithdrawalService {
         if (req.getAmount().compareTo(minWithdrawalAmount) < 0) {
             throw ApiException.badRequest("Minimum withdrawal amount is " + minWithdrawalAmount);
         }
-
-        // ── No maximum or daily withdrawal limit ─────────────────────────────
-        // Users may withdraw any amount up to their available balance with no
-        // daily cap applied.
 
         var walletEntity = walletRepo.findByUserId(userId)
                 .orElseThrow(() -> ApiException.notFound("Wallet not found"));
@@ -111,7 +105,7 @@ public class WithdrawalService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Approve
+    // Approve  ← email sent here
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalDto approve(UUID requestId, UUID adminId, String note) {
@@ -130,14 +124,29 @@ public class WithdrawalService {
         request = withdrawalRepo.save(request);
 
         auditService.log(adminId, "WITHDRAWAL_APPROVED", "WithdrawalRequest", requestId,
-                null, Map.of("note", note != null ? note : "",
-                        "userId", request.getUser().getId().toString()), null);
+                null, Map.of(
+                        "note",   note != null ? note : "",
+                        "userId", request.getUser().getId().toString()),
+                null);
+
+        // ── Notify the admin whose withdrawal was approved ───────────────────
+        // We email the user who submitted the withdrawal (request.getUser()),
+        // which in your flow is always an admin-role user.
+        var withdrawalUser = request.getUser();
+        withdrawalEmailService.notifyConfirmed(
+                withdrawalUser.getEmail(),
+                withdrawalUser.getFirstName(),
+                request.getId().toString(),
+                request.getAmount(),
+                request.getCurrency(),
+                LocalDateTime.now()
+        );
 
         return WithdrawalDto.from(request);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Reject
+    // Reject  ← email sent here
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto reject(UUID requestId, UUID adminId, String note) {
@@ -169,12 +178,28 @@ public class WithdrawalService {
                 .amount(request.getAmount())
                 .balanceAfter(restoredBalance)
                 .providerRef(request.getId().toString())
-                .metadata(Map.of("withdrawalRequestId", request.getId().toString(), "reason", "rejected"))
+                .metadata(Map.of(
+                        "withdrawalRequestId", request.getId().toString(),
+                        "reason", "rejected"))
                 .build());
 
         auditService.log(adminId, "WITHDRAWAL_REJECTED", "WithdrawalRequest", requestId,
-                null, Map.of("note", note != null ? note : "",
-                        "userId", request.getUser().getId().toString()), null);
+                null, Map.of(
+                        "note",   note != null ? note : "",
+                        "userId", request.getUser().getId().toString()),
+                null);
+
+        // ── Notify the admin whose withdrawal was rejected ───────────────────
+        var withdrawalUser = request.getUser();
+        withdrawalEmailService.notifyRejected(
+                withdrawalUser.getEmail(),
+                withdrawalUser.getFirstName(),
+                request.getId().toString(),
+                request.getAmount(),
+                request.getCurrency(),
+                note,                  // passed through as the rejection reason
+                LocalDateTime.now()
+        );
 
         return WithdrawalDto.from(request);
     }
@@ -204,8 +229,10 @@ public class WithdrawalService {
         });
 
         auditService.log(superAdminId, "WITHDRAWAL_SETTLED", "WithdrawalRequest", requestId,
-                null, Map.of("note", note != null ? note : "",
-                        "userId", request.getUser().getId().toString()), null);
+                null, Map.of(
+                        "note",   note != null ? note : "",
+                        "userId", request.getUser().getId().toString()),
+                null);
 
         return WithdrawalDto.from(request);
     }
@@ -243,12 +270,16 @@ public class WithdrawalService {
                 .amount(request.getAmount())
                 .balanceAfter(restoredBalance)
                 .providerRef(request.getId().toString())
-                .metadata(Map.of("withdrawalRequestId", request.getId().toString(), "reason", "failed"))
+                .metadata(Map.of(
+                        "withdrawalRequestId", request.getId().toString(),
+                        "reason", "failed"))
                 .build());
 
         auditService.log(superAdminId, "WITHDRAWAL_FAILED", "WithdrawalRequest", requestId,
-                null, Map.of("note", note != null ? note : "",
-                        "userId", request.getUser().getId().toString()), null);
+                null, Map.of(
+                        "note",   note != null ? note : "",
+                        "userId", request.getUser().getId().toString()),
+                null);
 
         return WithdrawalDto.from(request);
     }
