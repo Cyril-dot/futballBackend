@@ -30,7 +30,7 @@ public class EmailService {
     @Value("${app.email.from-name:Notifications}")
     private String fromName;
 
-    @Value("${app.email.gmail-address}")
+    @Value("${app.email.from-address}")
     private String fromAddress;
 
     @Value("${app.email.frontend-url:http://localhost:5173}")
