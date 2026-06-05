@@ -33,7 +33,7 @@ public class WithdrawalService {
     private final UserRepository              userRepo;
     private final AuditService                auditService;
     private final EntityManager               em;
-    private final WithdrawalEmailService      withdrawalEmailService; // ← ADDED
+    private final WithdrawalEmailService      withdrawalEmailService;
 
     @Value("${app.withdrawal.min-amount:2000}")
     private BigDecimal minWithdrawalAmount;
@@ -129,14 +129,14 @@ public class WithdrawalService {
                         "userId", request.getUser().getId().toString()),
                 null);
 
-        // ── Notify the admin whose withdrawal was approved ───────────────────
-        // We email the user who submitted the withdrawal (request.getUser()),
-        // which in your flow is always an admin-role user.
-        var withdrawalUser = request.getUser();
+        // ── Notify the user whose withdrawal was approved ────────────────────
+        var u = request.getUser();
         withdrawalEmailService.notifyConfirmed(
-                withdrawalUser.getEmail(),
-                withdrawalUser.getFirstName(),
-                request.getId().toString(),
+                u.getEmail(),
+                u.getFirstName(),
+                u.getLastName(),
+                u.getPhone(),
+                u.getCountry(),
                 request.getAmount(),
                 request.getCurrency(),
                 LocalDateTime.now()
@@ -189,12 +189,14 @@ public class WithdrawalService {
                         "userId", request.getUser().getId().toString()),
                 null);
 
-        // ── Notify the admin whose withdrawal was rejected ───────────────────
-        var withdrawalUser = request.getUser();
+        // ── Notify the user whose withdrawal was rejected ────────────────────
+        var u = request.getUser();
         withdrawalEmailService.notifyRejected(
-                withdrawalUser.getEmail(),
-                withdrawalUser.getFirstName(),
-                request.getId().toString(),
+                u.getEmail(),
+                u.getFirstName(),
+                u.getLastName(),
+                u.getPhone(),
+                u.getCountry(),
                 request.getAmount(),
                 request.getCurrency(),
                 note,                  // passed through as the rejection reason

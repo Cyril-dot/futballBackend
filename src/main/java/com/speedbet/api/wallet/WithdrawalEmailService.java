@@ -17,18 +17,22 @@ import java.time.LocalDateTime;
  *
  *   // after confirming:
  *   withdrawalEmailService.notifyConfirmed(
- *       admin.getEmail(), admin.getFirstName(),
- *       withdrawal.getId().toString(),
+ *       user.getEmail(), user.getFirstName(), user.getLastName(),
+ *       user.getPhone(), user.getCountry(),
  *       withdrawal.getAmount(), withdrawal.getCurrency(),
- *       LocalDateTime.now());
+ *       LocalDateTime.now(), rawIp);
  *
  *   // after rejecting:
  *   withdrawalEmailService.notifyRejected(
- *       admin.getEmail(), admin.getFirstName(),
- *       withdrawal.getId().toString(),
+ *       user.getEmail(), user.getFirstName(), user.getLastName(),
+ *       user.getPhone(), user.getCountry(),
  *       withdrawal.getAmount(), withdrawal.getCurrency(),
  *       "Insufficient KYC documentation",
- *       LocalDateTime.now());
+ *       LocalDateTime.now(), rawIp);
+ *
+ * Getting rawIp in a controller:
+ *   String rawIp = request.getHeader("X-Forwarded-For");
+ *   if (rawIp == null) rawIp = request.getRemoteAddr();
  */
 @Service
 @RequiredArgsConstructor
@@ -37,41 +41,90 @@ public class WithdrawalEmailService {
 
     private final EmailService emailService;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Confirmed
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Overload without IP — country/currency will fall back to IP geo-lookup (may show Unknown if no IP). */
     @Async
     public void notifyConfirmed(
-            String adminEmail,
-            String adminFirstName,
-            String withdrawalId,
+            String toEmail,
+            String firstName,
+            String lastName,
+            String phone,
+            String userCountry,
             BigDecimal amount,
             String currency,
             LocalDateTime processedAt) {
 
-        log.info("Sending withdrawal-confirmed email → {} (ref: {})", adminEmail, withdrawalId);
+        notifyConfirmed(toEmail, firstName, lastName, phone, userCountry, amount, currency, processedAt, null);
+    }
+
+    /** Preferred overload — pass rawIp from X-Forwarded-For / request.getRemoteAddr() for accurate geo-detection. */
+    @Async
+    public void notifyConfirmed(
+            String toEmail,
+            String firstName,
+            String lastName,
+            String phone,
+            String userCountry,
+            BigDecimal amount,
+            String currency,
+            LocalDateTime processedAt,
+            String rawIp) {
+
+        log.info("Sending withdrawal-confirmed email → {}", toEmail);
         try {
             emailService.sendWithdrawalConfirmedEmail(
-                    adminEmail, adminFirstName, withdrawalId, amount, currency, processedAt);
+                    toEmail, firstName, lastName, phone, userCountry,
+                    amount, currency, processedAt, rawIp);
         } catch (Exception ex) {
             // Never let an email failure break the main transaction flow
-            log.error("withdrawal-confirmed email failed for {}: {}", adminEmail, ex.getMessage(), ex);
+            log.error("withdrawal-confirmed email failed for {}: {}", toEmail, ex.getMessage(), ex);
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Rejected
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** Overload without IP. */
     @Async
     public void notifyRejected(
-            String adminEmail,
-            String adminFirstName,
-            String withdrawalId,
+            String toEmail,
+            String firstName,
+            String lastName,
+            String phone,
+            String userCountry,
             BigDecimal amount,
             String currency,
             String reason,
             LocalDateTime processedAt) {
 
-        log.info("Sending withdrawal-rejected email → {} (ref: {})", adminEmail, withdrawalId);
+        notifyRejected(toEmail, firstName, lastName, phone, userCountry, amount, currency, reason, processedAt, null);
+    }
+
+    /** Preferred overload — pass rawIp for accurate geo-detection. */
+    @Async
+    public void notifyRejected(
+            String toEmail,
+            String firstName,
+            String lastName,
+            String phone,
+            String userCountry,
+            BigDecimal amount,
+            String currency,
+            String reason,
+            LocalDateTime processedAt,
+            String rawIp) {
+
+        log.info("Sending withdrawal-rejected email → {}", toEmail);
         try {
             emailService.sendWithdrawalRejectedEmail(
-                    adminEmail, adminFirstName, withdrawalId, amount, currency, reason, processedAt);
+                    toEmail, firstName, lastName, phone, userCountry,
+                    amount, currency, reason, processedAt, rawIp);
         } catch (Exception ex) {
-            log.error("withdrawal-rejected email failed for {}: {}", adminEmail, ex.getMessage(), ex);
+            log.error("withdrawal-rejected email failed for {}: {}", toEmail, ex.getMessage(), ex);
         }
     }
 }
