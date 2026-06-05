@@ -72,7 +72,6 @@ public class EmailService {
      */
     public String resolvePublicIp(String rawIp) {
         if (rawIp == null || rawIp.isBlank()) return null;
-        // X-Forwarded-For may be a comma-separated list; the first entry is the client IP
         String first = rawIp.split(",")[0].trim();
         return first.isBlank() ? null : first;
     }
@@ -101,7 +100,7 @@ public class EmailService {
             String countryCode = node.path("countryCode").asText("XX").toUpperCase();
             String currency    = COUNTRY_TO_CURRENCY.getOrDefault(countryCode, "USD");
 
-            log.info("IP {} → country={} ({}), currency={}", ipAddress, countryName, countryCode, currency);
+            log.info("IP {} -> country={} ({}), currency={}", ipAddress, countryName, countryCode, currency);
             return new IpInfo(countryName, countryCode, currency, ipAddress);
 
         } catch (Exception e) {
@@ -136,34 +135,48 @@ public class EmailService {
 
     // ─────────────────────────────────────────────────────────────────────────
     // Withdrawal emails
+    // Caller should pass: toEmail, firstName, lastName, phone, userCountry (from User entity),
+    // amount, currency, processedAt, and optionally the raw IP string from X-Forwarded-For.
+    //
+    // Example (in your withdrawal service/controller):
+    //   String rawIp = request.getHeader("X-Forwarded-For");
+    //   if (rawIp == null) rawIp = request.getRemoteAddr();
+    //   emailService.sendWithdrawalConfirmedEmail(
+    //       user.getEmail(), user.getFirstName(), user.getLastName(),
+    //       user.getPhone(), user.getCountry(),
+    //       amount, currency, processedAt, rawIp);
     // ─────────────────────────────────────────────────────────────────────────
 
     public void sendWithdrawalConfirmedEmail(
-            String adminEmail, String adminFirstName, String withdrawalId,
+            String toEmail, String firstName, String lastName,
+            String phone, String userCountry,
             BigDecimal amount, String currency, LocalDateTime processedAt) {
-        sendWithdrawalConfirmedEmail(adminEmail, adminFirstName, withdrawalId, amount, currency, processedAt, null);
+        sendWithdrawalConfirmedEmail(toEmail, firstName, lastName, phone, userCountry, amount, currency, processedAt, null);
     }
 
     public void sendWithdrawalConfirmedEmail(
-            String adminEmail, String adminFirstName, String withdrawalId,
+            String toEmail, String firstName, String lastName,
+            String phone, String userCountry,
             BigDecimal amount, String currency, LocalDateTime processedAt, String ipAddress) {
         IpInfo ipInfo = detectIpInfo(resolvePublicIp(ipAddress));
-        sendEmail(adminEmail, "Withdrawal approved",
-                buildWithdrawalConfirmedHtml(adminFirstName, withdrawalId, amount, currency, processedAt, ipInfo));
+        sendEmail(toEmail, "Withdrawal approved",
+                buildWithdrawalConfirmedHtml(firstName, lastName, toEmail, phone, userCountry, amount, currency, processedAt, ipInfo));
     }
 
     public void sendWithdrawalRejectedEmail(
-            String adminEmail, String adminFirstName, String withdrawalId,
+            String toEmail, String firstName, String lastName,
+            String phone, String userCountry,
             BigDecimal amount, String currency, String reason, LocalDateTime processedAt) {
-        sendWithdrawalRejectedEmail(adminEmail, adminFirstName, withdrawalId, amount, currency, reason, processedAt, null);
+        sendWithdrawalRejectedEmail(toEmail, firstName, lastName, phone, userCountry, amount, currency, reason, processedAt, null);
     }
 
     public void sendWithdrawalRejectedEmail(
-            String adminEmail, String adminFirstName, String withdrawalId,
+            String toEmail, String firstName, String lastName,
+            String phone, String userCountry,
             BigDecimal amount, String currency, String reason, LocalDateTime processedAt, String ipAddress) {
         IpInfo ipInfo = detectIpInfo(resolvePublicIp(ipAddress));
-        sendEmail(adminEmail, "Withdrawal request declined",
-                buildWithdrawalRejectedHtml(adminFirstName, withdrawalId, amount, currency, reason, processedAt, ipInfo));
+        sendEmail(toEmail, "Withdrawal request declined",
+                buildWithdrawalRejectedHtml(firstName, lastName, toEmail, phone, userCountry, amount, currency, reason, processedAt, ipInfo));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -177,9 +190,9 @@ public class EmailService {
             headers.set("api-key", brevoApiKey);
 
             String body = objectMapper.writeValueAsString(Map.of(
-                    "sender",   Map.of("name", fromName, "email", fromAddress),
-                    "to",       new Object[]{ Map.of("email", to) },
-                    "subject",  subject,
+                    "sender",      Map.of("name", fromName, "email", fromAddress),
+                    "to",          new Object[]{ Map.of("email", to) },
+                    "subject",     subject,
                     "htmlContent", htmlContent
             ));
 
@@ -278,9 +291,14 @@ public class EmailService {
         if ("XX".equals(ip.countryCode())) return "";
         return String.format("""
             <div class="ip-snippet">
-                Location detected &nbsp;&middot;&nbsp; %s &nbsp;&middot;&nbsp; Currency: %s &nbsp;&middot;&nbsp; IP: %s
+                Location detected &nbsp;&middot;&nbsp; %s &nbsp;&middot;&nbsp; IP: %s
             </div>
-            """, ip.countryName(), ip.currency(), ip.ipAddress());
+            """, ip.countryName(), ip.ipAddress());
+    }
+
+    /** Returns a non-blank string or a fallback dash. */
+    private String orDash(String val) {
+        return (val != null && !val.isBlank()) ? val : "—";
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -319,71 +337,99 @@ public class EmailService {
     }
 
     private String buildWithdrawalConfirmedHtml(
-            String firstName, String withdrawalId,
+            String firstName, String lastName, String email, String phone, String userCountry,
             BigDecimal amount, String currency,
             LocalDateTime processedAt, IpInfo ip) {
 
-        // Use detected currency from IP if the passed-in currency is missing/generic
+        String fullName      = orDash(firstName) + (lastName != null && !lastName.isBlank() ? " " + lastName : "");
         String displayCurrency = (currency != null && !currency.isBlank()) ? currency : ip.currency();
-        String fmtAmount = String.format("%s %,.2f", displayCurrency, amount);
-        String fmtDate   = processedAt != null ? processedAt.format(DT_FMT) : "—";
-        String dashboard = frontendUrl + "/admin/withdrawals";
+        String fmtAmount     = String.format("%s %,.2f", displayCurrency, amount);
+        String fmtDate       = processedAt != null ? processedAt.format(DT_FMT) : "—";
+        // Prefer country from User entity; fall back to IP-detected country
+        String displayCountry = (userCountry != null && !userCountry.isBlank()) ? userCountry : ip.countryName();
+        String dashboard     = frontendUrl + "/admin/withdrawals";
+
+        // Only show country row if we actually have one
+        String countryRow = !"—".equals(displayCountry) && !"Unknown".equals(displayCountry)
+                ? String.format("<tr><td class=\"lbl\">Country</td><td class=\"val\">%s</td></tr>", displayCountry)
+                : "";
 
         String body = String.format("""
             <p class="greeting">Withdrawal approved</p>
             <p class="body-text">Hi %s, your withdrawal has been processed successfully.
             Your funds will be added to your wallet within the next <strong>5 minutes</strong>. Thank you!</p>
             <table class="detail-table">
-                <tr><td class="lbl">Reference</td><td class="val">%s</td></tr>
+                <tr><td class="lbl">Name</td><td class="val">%s</td></tr>
+                <tr><td class="lbl">Email</td><td class="val">%s</td></tr>
+                <tr><td class="lbl">Phone</td><td class="val">%s</td></tr>
+                %s
                 <tr><td class="lbl">Amount</td><td class="val green">%s</td></tr>
                 <tr><td class="lbl">Status</td><td class="val green">Approved</td></tr>
                 <tr><td class="lbl">Processed</td><td class="val">%s</td></tr>
-                <tr><td class="lbl">Country</td><td class="val">%s</td></tr>
-                <tr><td class="lbl">Currency</td><td class="val">%s</td></tr>
             </table>
             <div class="info-box success">Your funds will be available in your wallet within <strong>5 minutes</strong>.</div>
             <div class="btn-row"><a href="%s" class="btn">View in dashboard</a></div>
-            <p style="font-size:12px;color:#bbb;">Questions? Reply to this email quoting the reference above.</p>
+            <p style="font-size:12px;color:#bbb;">Questions? Reply to this email.</p>
             %s
             """,
-                firstName, withdrawalId, fmtAmount, fmtDate,
-                ip.countryName(), ip.currency(),
-                dashboard, ipSnippet(ip));
+                firstName,
+                fullName,
+                orDash(email),
+                orDash(phone),
+                countryRow,
+                fmtAmount,
+                fmtDate,
+                dashboard,
+                ipSnippet(ip));
 
         return wrap("#1a6640", "Your withdrawal has been approved.", body);
     }
 
     private String buildWithdrawalRejectedHtml(
-            String firstName, String withdrawalId,
-            BigDecimal amount, String currency,
-            String reason, LocalDateTime processedAt, IpInfo ip) {
+            String firstName, String lastName, String email, String phone, String userCountry,
+            BigDecimal amount, String currency, String reason,
+            LocalDateTime processedAt, IpInfo ip) {
 
+        String fullName       = orDash(firstName) + (lastName != null && !lastName.isBlank() ? " " + lastName : "");
         String displayCurrency = (currency != null && !currency.isBlank()) ? currency : ip.currency();
-        String fmtAmount  = String.format("%s %,.2f", displayCurrency, amount);
-        String fmtDate    = processedAt != null ? processedAt.format(DT_FMT) : "—";
-        String reasonText = (reason != null && !reason.isBlank()) ? reason : "No specific reason provided.";
-        String dashboard  = frontendUrl + "/admin/withdrawals";
+        String fmtAmount      = String.format("%s %,.2f", displayCurrency, amount);
+        String fmtDate        = processedAt != null ? processedAt.format(DT_FMT) : "—";
+        String displayCountry = (userCountry != null && !userCountry.isBlank()) ? userCountry : ip.countryName();
+        String reasonText     = (reason != null && !reason.isBlank()) ? reason : "No specific reason provided.";
+        String dashboard      = frontendUrl + "/admin/withdrawals";
+
+        String countryRow = !"—".equals(displayCountry) && !"Unknown".equals(displayCountry)
+                ? String.format("<tr><td class=\"lbl\">Country</td><td class=\"val\">%s</td></tr>", displayCountry)
+                : "";
 
         String body = String.format("""
             <p class="greeting">Withdrawal declined</p>
             <p class="body-text">Hi %s, unfortunately your withdrawal request could not be processed. Your funds have been returned to your wallet balance.</p>
             <table class="detail-table">
-                <tr><td class="lbl">Reference</td><td class="val">%s</td></tr>
+                <tr><td class="lbl">Name</td><td class="val">%s</td></tr>
+                <tr><td class="lbl">Email</td><td class="val">%s</td></tr>
+                <tr><td class="lbl">Phone</td><td class="val">%s</td></tr>
+                %s
                 <tr><td class="lbl">Amount</td><td class="val red">%s</td></tr>
                 <tr><td class="lbl">Status</td><td class="val red">Declined</td></tr>
                 <tr><td class="lbl">Processed</td><td class="val">%s</td></tr>
-                <tr><td class="lbl">Country</td><td class="val">%s</td></tr>
-                <tr><td class="lbl">Currency</td><td class="val">%s</td></tr>
             </table>
             <div class="info-box danger"><strong>Reason:</strong>&nbsp; %s</div>
             <div class="info-box neutral">Your wallet balance has been <strong>fully refunded</strong>. You may submit a new withdrawal request after resolving the issue above.</div>
             <div class="btn-row"><a href="%s" class="btn">View in dashboard</a></div>
-            <p style="font-size:12px;color:#bbb;">If you believe this is a mistake, reply to this email with the reference above.</p>
+            <p style="font-size:12px;color:#bbb;">If you believe this is a mistake, reply to this email.</p>
             %s
             """,
-                firstName, withdrawalId, fmtAmount, fmtDate,
-                ip.countryName(), ip.currency(),
-                reasonText, dashboard, ipSnippet(ip));
+                firstName,
+                fullName,
+                orDash(email),
+                orDash(phone),
+                countryRow,
+                fmtAmount,
+                fmtDate,
+                reasonText,
+                dashboard,
+                ipSnippet(ip));
 
         return wrap("#8b1a1a", "Your withdrawal request was declined.", body);
     }
