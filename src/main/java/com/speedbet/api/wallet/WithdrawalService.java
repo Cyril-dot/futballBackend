@@ -83,7 +83,7 @@ public class WithdrawalService {
 
         request = withdrawalRepo.save(request);
 
-        txRepo.save(Transaction.builder()
+        Transaction holdTx = txRepo.save(Transaction.builder()
                 .walletId(wallet.getId())
                 .kind(TxKind.WITHDRAW_HOLD)
                 .amount(req.getAmount().negate())
@@ -147,12 +147,28 @@ public class WithdrawalService {
                 now
         ));
 
+        // ── Resolve wallet balance after the hold deduction ───────────────────
+        BigDecimal walletBalance = walletRepo.findByUserId(u.getId())
+                .map(Wallet::getBalance)
+                .orElse(null);
+
+        // ── Fee is GHS 0.00 for MoMo withdrawals (no platform fee deducted) ──
+        BigDecimal fee = BigDecimal.ZERO;
+
+        // ── Transaction ID and reference from the saved withdrawal request ────
+        String transactionId = savedRequest.getId().toString();
+        String reference     = String.valueOf(savedRequest.getId().hashCode() & 0x7FFFFFFF); // short numeric ref
+
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
         String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
         withdrawalSmsService.notifyWithdrawalConfirmed(
                 smsTarget,
                 u.getFirstName(),
                 savedRequest.getAmount(),
+                fee,
+                walletBalance,
+                transactionId,
+                reference,
                 now
         );
 
@@ -182,6 +198,7 @@ public class WithdrawalService {
                 walletRepo.findByUserId(savedRequest.getUser().getId()).orElseThrow().getId(),
                 LockModeType.PESSIMISTIC_WRITE);
 
+        // ── Restore the held amount back to the wallet ────────────────────────
         BigDecimal restoredBalance = wallet.getBalance().add(savedRequest.getAmount(), MathContext.DECIMAL64);
         wallet.setBalance(restoredBalance);
         walletRepo.save(wallet);
@@ -220,13 +237,21 @@ public class WithdrawalService {
                 now
         ));
 
+        // ── Transaction ID and reference from the saved withdrawal request ────
+        String transactionId = savedRequest.getId().toString();
+        String reference     = String.valueOf(savedRequest.getId().hashCode() & 0x7FFFFFFF);
+
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
+        // restoredBalance is the wallet balance AFTER the refund — correct to show
         String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
         withdrawalSmsService.notifyWithdrawalRejected(
                 smsTarget,
                 u.getFirstName(),
                 savedRequest.getAmount(),
                 note,
+                restoredBalance,
+                transactionId,
+                reference,
                 now
         );
 
