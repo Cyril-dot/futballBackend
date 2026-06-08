@@ -15,7 +15,7 @@ import java.net.URI;
 public class ArkeselSmsService {
 
     private final ArkeselSmsConfig smsConfig;
-    private final RestTemplate     restTemplate;
+    private final RestTemplate     restTemplate;  
 
     /**
      * Send a plain text SMS via Arkesel V1.
