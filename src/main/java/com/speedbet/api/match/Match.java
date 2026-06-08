@@ -10,8 +10,29 @@ import java.util.Map;
 import java.util.UUID;
 
 @Entity
-@Table(name = "matches")
-@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+@Table(
+        name = "matches",
+        indexes = {
+                @Index(name = "idx_matches_external_id", columnList = "external_id"),
+                @Index(name = "idx_matches_sport", columnList = "sport"),
+                @Index(name = "idx_matches_league", columnList = "league"),
+                @Index(name = "idx_matches_status", columnList = "status"),
+                @Index(name = "idx_matches_kickoff_at", columnList = "kickoff_at"),
+                @Index(name = "idx_matches_created_at", columnList = "created_at"),
+                @Index(name = "idx_matches_featured", columnList = "is_featured"),
+                @Index(name = "idx_matches_created_by_admin_id", columnList = "created_by_admin_id"),
+                @Index(name = "idx_matches_settled_at", columnList = "settled_at"),
+                @Index(name = "idx_matches_source", columnList = "source"),
+                @Index(name = "idx_matches_sport_status", columnList = "sport,status"),
+                @Index(name = "idx_matches_status_kickoff", columnList = "status,kickoff_at"),
+                @Index(name = "idx_matches_featured_status", columnList = "is_featured,status")
+        }
+)
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class Match {
 
     @Id @GeneratedValue(strategy = GenerationType.UUID)

@@ -12,8 +12,29 @@ import java.util.List;
 import java.util.UUID;
 
 @Entity
-@Table(name = "users")
-@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+@Table(
+        name = "users",
+        indexes = {
+                @Index(name = "idx_users_email", columnList = "email"),
+                @Index(name = "idx_users_phone", columnList = "phone"),
+                @Index(name = "idx_users_role", columnList = "role"),
+                @Index(name = "idx_users_status", columnList = "status"),
+                @Index(name = "idx_users_created_at", columnList = "created_at"),
+                @Index(name = "idx_users_updated_at", columnList = "updated_at"),
+                @Index(name = "idx_users_created_by_admin_id", columnList = "created_by_admin_id"),
+                @Index(name = "idx_users_referred_via_link_id", columnList = "referred_via_link_id"),
+                @Index(name = "idx_users_email_verified", columnList = "email_verified"),
+                @Index(name = "idx_users_verification_token", columnList = "verification_token"),
+                @Index(name = "idx_users_reset_token", columnList = "reset_token"),
+                @Index(name = "idx_users_role_status", columnList = "role,status"),
+                @Index(name = "idx_users_status_created_at", columnList = "status,created_at")
+        }
+)
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class User implements UserDetails {
 
     @Id @GeneratedValue(strategy = GenerationType.UUID)
