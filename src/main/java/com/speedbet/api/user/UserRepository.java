@@ -20,6 +20,9 @@ public interface UserRepository extends JpaRepository<User, UUID>,
     List<User> findAllByRole(UserRole role);
     long countByRole(UserRole role);
 
+    // Used by WithdrawalService to email all admins on approve/reject
+    List<User> findByRoleIn(List<UserRole> roles);
+
     // findAllFiltered is no longer needed — SuperAdminQueryService
     // now uses Specification<User> instead of calling this method.
     // You can safely delete it, or leave it — it just won't be called.

@@ -3,6 +3,7 @@ package com.speedbet.api.wallet;
 import com.speedbet.api.audit.AuditService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.user.UserRepository;
+import com.speedbet.api.user.UserRole;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
 import lombok.RequiredArgsConstructor;
@@ -34,6 +35,7 @@ public class WithdrawalService {
     private final AuditService                auditService;
     private final EntityManager               em;
     private final WithdrawalEmailService      withdrawalEmailService;
+    private final WithdrawalSmsService        withdrawalSmsService;
 
     @Value("${app.withdrawal.min-amount:2000}")
     private BigDecimal minWithdrawalAmount;
@@ -105,7 +107,7 @@ public class WithdrawalService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Approve  ← email sent here
+    // Approve  ← admins get email, user gets SMS
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalDto approve(UUID requestId, UUID adminId, String note) {
@@ -121,32 +123,44 @@ public class WithdrawalService {
         request.setAdmin(admin);
         request.setAdminNote(note);
         request.setReviewedAt(Instant.now());
-        request = withdrawalRepo.save(request);
+        final WithdrawalRequest savedRequest = withdrawalRepo.save(request);
 
         auditService.log(adminId, "WITHDRAWAL_APPROVED", "WithdrawalRequest", requestId,
                 null, Map.of(
                         "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()),
+                        "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        // ── Notify the user whose withdrawal was approved ────────────────────
-        var u = request.getUser();
-        withdrawalEmailService.notifyConfirmed(
-                u.getEmail(),
+        final var u   = savedRequest.getUser();
+        final LocalDateTime now = LocalDateTime.now();
+
+        // ── Email → all ADMIN and SUPER_ADMIN users ──────────────────────────
+        var admins = userRepo.findByRoleIn(List.of(UserRole.ADMIN, UserRole.SUPER_ADMIN));
+        admins.forEach(a -> withdrawalEmailService.notifyConfirmed(
+                a.getEmail(),
+                a.getFirstName(),
+                a.getLastName(),
+                a.getPhone(),
+                a.getCountry(),
+                savedRequest.getAmount(),
+                savedRequest.getCurrency(),
+                now
+        ));
+
+        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
+        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
+        withdrawalSmsService.notifyWithdrawalConfirmed(
+                smsTarget,
                 u.getFirstName(),
-                u.getLastName(),
-                u.getPhone(),
-                u.getCountry(),
-                request.getAmount(),
-                request.getCurrency(),
-                LocalDateTime.now()
+                savedRequest.getAmount(),
+                now
         );
 
-        return WithdrawalDto.from(request);
+        return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Reject  ← email sent here
+    // Reject  ← admins get email, user gets SMS
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto reject(UUID requestId, UUID adminId, String note) {
@@ -162,48 +176,61 @@ public class WithdrawalService {
         request.setAdmin(admin);
         request.setAdminNote(note);
         request.setReviewedAt(Instant.now());
-        request = withdrawalRepo.save(request);
+        final WithdrawalRequest savedRequest = withdrawalRepo.save(request);
 
         var wallet = em.find(Wallet.class,
-                walletRepo.findByUserId(request.getUser().getId()).orElseThrow().getId(),
+                walletRepo.findByUserId(savedRequest.getUser().getId()).orElseThrow().getId(),
                 LockModeType.PESSIMISTIC_WRITE);
 
-        BigDecimal restoredBalance = wallet.getBalance().add(request.getAmount(), MathContext.DECIMAL64);
+        BigDecimal restoredBalance = wallet.getBalance().add(savedRequest.getAmount(), MathContext.DECIMAL64);
         wallet.setBalance(restoredBalance);
         walletRepo.save(wallet);
 
         txRepo.save(Transaction.builder()
                 .walletId(wallet.getId())
                 .kind(TxKind.WITHDRAW_RELEASE)
-                .amount(request.getAmount())
+                .amount(savedRequest.getAmount())
                 .balanceAfter(restoredBalance)
-                .providerRef(request.getId().toString())
+                .providerRef(savedRequest.getId().toString())
                 .metadata(Map.of(
-                        "withdrawalRequestId", request.getId().toString(),
+                        "withdrawalRequestId", savedRequest.getId().toString(),
                         "reason", "rejected"))
                 .build());
 
         auditService.log(adminId, "WITHDRAWAL_REJECTED", "WithdrawalRequest", requestId,
                 null, Map.of(
                         "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()),
+                        "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        // ── Notify the user whose withdrawal was rejected ────────────────────
-        var u = request.getUser();
-        withdrawalEmailService.notifyRejected(
-                u.getEmail(),
+        final var u   = savedRequest.getUser();
+        final LocalDateTime now = LocalDateTime.now();
+
+        // ── Email → all ADMIN and SUPER_ADMIN users ──────────────────────────
+        var admins = userRepo.findByRoleIn(List.of(UserRole.ADMIN, UserRole.SUPER_ADMIN));
+        admins.forEach(a -> withdrawalEmailService.notifyRejected(
+                a.getEmail(),
+                a.getFirstName(),
+                a.getLastName(),
+                a.getPhone(),
+                a.getCountry(),
+                savedRequest.getAmount(),
+                savedRequest.getCurrency(),
+                note,
+                now
+        ));
+
+        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
+        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
+        withdrawalSmsService.notifyWithdrawalRejected(
+                smsTarget,
                 u.getFirstName(),
-                u.getLastName(),
-                u.getPhone(),
-                u.getCountry(),
-                request.getAmount(),
-                request.getCurrency(),
-                note,                  // passed through as the rejection reason
-                LocalDateTime.now()
+                savedRequest.getAmount(),
+                note,
+                now
         );
 
-        return WithdrawalDto.from(request);
+        return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -348,5 +375,21 @@ public class WithdrawalService {
                 "failedCount",        failedCount,
                 "totalSettledAmount", totalSettledAmount != null ? totalSettledAmount : BigDecimal.ZERO,
                 "totalPendingAmount", totalPendingAmount != null ? totalPendingAmount : BigDecimal.ZERO);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * For mobile-money withdrawals the accountNumber IS the MoMo number, so
+     * that's the right place to send the confirmation SMS. Falls back to the
+     * user's profile phone if accountNumber is blank.
+     */
+    private String resolvePhoneForSms(String accountNumber, String profilePhone) {
+        if (accountNumber != null && !accountNumber.isBlank()) {
+            return accountNumber;
+        }
+        return profilePhone;
     }
 }
