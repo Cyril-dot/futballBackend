@@ -22,4 +22,7 @@ public class ArkeselSmsConfig {
 
     /** Set to true locally to skip real delivery (sandbox not available in V1 — just log) */
     private boolean sandbox = false;
+
+    //sms active
+
 }
