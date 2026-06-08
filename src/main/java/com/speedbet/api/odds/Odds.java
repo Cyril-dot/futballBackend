@@ -15,12 +15,24 @@ import java.util.UUID;
                         name = "uq_odds_match_market_selection",
                         columnNames = {"match_id", "market", "selection"}
                 )
+        },
+        indexes = {
+                @Index(name = "idx_odds_match_id", columnList = "match_id"),
+                @Index(name = "idx_odds_market", columnList = "market"),
+                @Index(name = "idx_odds_selection", columnList = "selection"),
+                @Index(name = "idx_odds_match_market", columnList = "match_id, market"),
+                @Index(name = "idx_odds_captured_at", columnList = "captured_at")
         }
 )
-@Getter @Setter @NoArgsConstructor @AllArgsConstructor @Builder
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
 public class Odds {
 
-    @Id @GeneratedValue(strategy = GenerationType.UUID)
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
     @Column(name = "match_id", nullable = false)
