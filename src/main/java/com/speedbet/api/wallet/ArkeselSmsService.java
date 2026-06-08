@@ -1,4 +1,4 @@
-package com.speedbet.api.sms;
+package com.speedbet.api.wallet;
 
 import com.speedbet.api.config.ArkeselSmsConfig;
 import lombok.RequiredArgsConstructor;
@@ -7,7 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
 
-import java.util.Map;
+import java.net.URI;
 
 @Service
 @RequiredArgsConstructor
@@ -21,7 +21,7 @@ public class ArkeselSmsService {
      * Send a plain text SMS via Arkesel V1.
      * V1 uses a GET request with query parameters.
      *
-     * @param phoneNumber recipient in international format e.g. 233XXXXXXXXX
+     * @param phoneNumber recipient – local (0XXXXXXXXX) or international (233XXXXXXXXX), both accepted
      * @param message     SMS body (160 chars = 1 page)
      */
     public void sendSms(String phoneNumber, String message) {
@@ -30,33 +30,56 @@ public class ArkeselSmsService {
             return;
         }
 
+        String normalised = normaliseGhanaNumber(phoneNumber);
+
         if (smsConfig.isSandbox()) {
-            log.info("[SANDBOX] SMS to {} | Message: {}", phoneNumber, message);
+            log.info("[SANDBOX] SMS to {} (normalised from {}) | Message: {}", normalised, phoneNumber, message);
             return;
         }
 
         try {
-            String url = UriComponentsBuilder
+            URI uri = UriComponentsBuilder
                     .fromHttpUrl(smsConfig.getBaseUrl() + "/sms/api")
                     .queryParam("action",  "send-sms")
                     .queryParam("api_key", smsConfig.getApiKey())
-                    .queryParam("to",      phoneNumber)
+                    .queryParam("to",      normalised)
                     .queryParam("from",    smsConfig.getSenderId())
                     .queryParam("sms",     message)
-                    .build()
-                    .toUriString();
+                    .build(true)   // true = values already encoded – avoids double-encoding spaces in message
+                    .toUri();
 
-            String response = restTemplate.getForObject(url, String.class);
+            log.info("Arkesel request → to={} from={}", normalised, smsConfig.getSenderId());
 
-            if (response != null && response.toLowerCase().contains("ok")) {
-                log.info("SMS sent successfully to {} via Arkesel V1", phoneNumber);
+            String response = restTemplate.getForObject(uri, String.class);
+
+            log.info("Arkesel raw response for {}: {}", normalised, response);
+
+            if (response != null && response.toUpperCase().contains("OK")) {
+                log.info("SMS sent successfully to {} via Arkesel V1", normalised);
             } else {
-                log.error("Arkesel SMS V1 failed for {} – response: {}", phoneNumber, response);
+                log.error("Arkesel SMS V1 failed for {} – response: {}", normalised, response);
             }
 
         } catch (Exception e) {
             // Never let SMS failure crash the main withdrawal flow
-            log.error("Arkesel SMS V1 exception for {}: {}", phoneNumber, e.getMessage(), e);
+            log.error("Arkesel SMS V1 exception for {}: {}", normalised, e.getMessage(), e);
         }
+    }
+
+    /**
+     * Normalises a Ghana phone number to international format without '+'.
+     * 0XXXXXXXXX  → 233XXXXXXXXX
+     * 233XXXXXXXXX → unchanged
+     * +233XXXXXXXXX → 233XXXXXXXXX
+     */
+    private String normaliseGhanaNumber(String phone) {
+        String digits = phone.trim().replaceAll("[\\s\\-()]", "");
+        if (digits.startsWith("+")) {
+            digits = digits.substring(1);
+        }
+        if (digits.startsWith("0")) {
+            digits = "233" + digits.substring(1);
+        }
+        return digits;
     }
 }
