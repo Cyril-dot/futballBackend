@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 
 @Service
 @RequiredArgsConstructor
@@ -18,9 +17,6 @@ public class WithdrawalSmsService {
 
     @Value("${app.site.name:OddsKingBet}")
     private String siteName;
-
-    private static final DateTimeFormatter FORMATTER =
-            DateTimeFormatter.ofPattern("dd MMM yyyy, hh:mm a");
 
     public void notifyWithdrawalConfirmed(
             String phoneNumber,
@@ -43,11 +39,9 @@ public class WithdrawalSmsService {
             return;
         }
 
+        // Kept under 160 chars to fit in a single SMS page
         String message = String.format(
-                "Dear %s,\n\n" +
-                        "Your withdrawal request of GHS %s has been successfully processed and approved. " +
-                        "The funds have been sent to your registered Mobile Money account and should reflect shortly.\n\n" +
-                        "Thank you for choosing %s.",
+                "Dear %s, your withdrawal of GHS %s has been approved and sent to your MoMo account. Thank you for choosing %s.",
                 firstName != null ? firstName : "Customer",
                 amount.toPlainString(),
                 siteName
@@ -88,22 +82,16 @@ public class WithdrawalSmsService {
             return;
         }
 
-        String reasonLine = (reason != null && !reason.isBlank())
-                ? "\nReason: " + reason + "."
-                : "";
+        // Kept concise; reason appended only if present, total stays near 160 chars
+        String reasonPart = (reason != null && !reason.isBlank()) ? " Reason: " + reason + "." : "";
 
-        log.debug("notifyWithdrawalRejected: reasonLine='{}' (raw reason='{}')", reasonLine, reason);
+        log.debug("notifyWithdrawalRejected: reasonPart='{}' (raw reason='{}')", reasonPart, reason);
 
         String message = String.format(
-                "Dear %s,\n\n" +
-                        "Your withdrawal request of GHS %s could not be processed at this time.%s " +
-                        "The full amount has been returned to your %s wallet balance.\n\n" +
-                        "For assistance, please contact our support team.\n\n" +
-                        "Thank you for choosing %s.",
+                "Dear %s, your withdrawal of GHS %s could not be processed.%s The amount has been returned to your %s wallet.",
                 firstName != null ? firstName : "Customer",
                 amount.toPlainString(),
-                reasonLine,
-                siteName,
+                reasonPart,
                 siteName
         );
 
