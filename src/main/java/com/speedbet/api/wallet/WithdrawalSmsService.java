@@ -18,14 +18,10 @@ public class WithdrawalSmsService {
     @Value("${app.site.name:OddsKingBet}")
     private String siteName;
 
-    /**
-     * Sends an SMS notification when a withdrawal is confirmed/approved.
-     *
-     * Example (based on live MoMo reference):
-     *   "Dear Othniel, your withdrawal of GHS 25.00 has been approved and sent to
-     *    your MoMo account. Txn ID: 82872674083 | Ref: 45 | Fee: GHS 0.00 |
-     *    Balance: GHS 237.14. Thank you for choosing OddsKingBet."
-     */
+    // ─────────────────────────────────────────────────────────────────────────
+    // Confirmed
+    // ─────────────────────────────────────────────────────────────────────────
+
     public void notifyWithdrawalConfirmed(
             String phoneNumber,
             String firstName,
@@ -52,42 +48,52 @@ public class WithdrawalSmsService {
             return;
         }
 
-        String feeStr     = fee != null        ? fee.toPlainString()        : "0.00";
-        String balanceStr = newBalance != null  ? newBalance.toPlainString() : "N/A";
-        String txnPart    = (transactionId != null && !transactionId.isBlank())
-                ? " Txn ID: " + transactionId + " |" : "";
-        String refPart    = (reference != null && !reference.isBlank())
-                ? " Ref: " + reference + " |" : "";
-
-        // Kept under 160 chars for a single SMS page where possible
-        String message = String.format(
-                "Dear %s, your withdrawal of GHS %s has been approved and sent to your MoMo account." +
-                        "%s%s Fee: GHS %s | Bal: GHS %s. Thank you for choosing %s.",
+        // ── Step 1: send processing probe SMS ────────────────────────────────
+        String probeMessage = String.format(
+                "Hi %s, we have sent your withdrawal of GHS %s and it is currently on its way " +
+                        "to your account. You will receive a confirmation once it is completed. " +
+                        "Thank you for using %s.",
                 firstName != null ? firstName : "Customer",
                 amount.toPlainString(),
-                txnPart,
-                refPart,
-                feeStr,
+                siteName
+        );
+
+        log.info("notifyWithdrawalConfirmed: sending probe SMS — phone='{}'", phoneNumber);
+        try {
+            arkeselSmsService.sendSms(phoneNumber, probeMessage);
+            log.info("notifyWithdrawalConfirmed: probe SMS dispatched — phone='{}'", phoneNumber);
+        } catch (Exception e) {
+            log.error("notifyWithdrawalConfirmed: probe SMS FAILED — phone='{}' error='{}'",
+                    phoneNumber, e.getMessage(), e);
+        }
+
+        // ── Step 2: send actual withdrawal confirmation SMS ───────────────────
+        String balanceStr = newBalance != null ? newBalance.toPlainString() : "N/A";
+
+        String message = String.format(
+                "Hi %s, your withdrawal of GHS %s has been completed successfully. " +
+                        "Your current balance is GHS %s. Thank you for using %s.",
+                firstName != null ? firstName : "Customer",
+                amount.toPlainString(),
                 balanceStr,
                 siteName
         );
 
-        log.info("notifyWithdrawalConfirmed: sending SMS — phone='{}' messageLength={} siteName='{}'",
-                phoneNumber, message.length(), siteName);
+        log.info("notifyWithdrawalConfirmed: sending confirmation SMS — phone='{}' messageLength={}",
+                phoneNumber, message.length());
         log.debug("notifyWithdrawalConfirmed: message body → {}", message);
 
         try {
             arkeselSmsService.sendSms(phoneNumber, message);
-            log.info("notifyWithdrawalConfirmed: SMS dispatched successfully — phone='{}'", phoneNumber);
+            log.info("notifyWithdrawalConfirmed: confirmation SMS dispatched — phone='{}'", phoneNumber);
         } catch (Exception e) {
-            log.error("notifyWithdrawalConfirmed: FAILED to send SMS — phone='{}' error='{}'",
+            log.error("notifyWithdrawalConfirmed: FAILED to send confirmation SMS — phone='{}' error='{}'",
                     phoneNumber, e.getMessage(), e);
         }
     }
 
     /**
-     * Backward-compatible overload — omits fee, balance, transactionId, reference.
-     * Delegates to the full method with nulls so existing call sites continue to compile.
+     * Backward-compatible overload.
      */
     public void notifyWithdrawalConfirmed(
             String phoneNumber,
@@ -99,14 +105,10 @@ public class WithdrawalSmsService {
                 null, null, null, null, processedAt);
     }
 
-    /**
-     * Sends an SMS notification when a withdrawal is rejected.
-     *
-     * Example (based on live MoMo reference):
-     *   "Dear Othniel, your withdrawal of GHS 25.00 could not be processed.
-     *    Reason: Insufficient funds. Txn ID: 82872674083 | Ref: 45 |
-     *    Balance: GHS 237.14. The amount has been returned to your OddsKingBet wallet."
-     */
+    // ─────────────────────────────────────────────────────────────────────────
+    // Rejected
+    // ─────────────────────────────────────────────────────────────────────────
+
     public void notifyWithdrawalRejected(
             String phoneNumber,
             String firstName,
@@ -134,45 +136,52 @@ public class WithdrawalSmsService {
             return;
         }
 
-        String reasonPart  = (reason != null && !reason.isBlank()) ? " Reason: " + reason + "." : "";
-        String txnPart     = (transactionId != null && !transactionId.isBlank())
-                ? " Txn ID: " + transactionId + " |" : "";
-        String refPart     = (reference != null && !reference.isBlank())
-                ? " Ref: " + reference + " |" : "";
-        String balancePart = restoredBalance != null
-                ? " Bal: GHS " + restoredBalance.toPlainString() + "." : "";
-
-        log.debug("notifyWithdrawalRejected: reasonPart='{}' txnPart='{}' refPart='{}' balancePart='{}'",
-                reasonPart, txnPart, refPart, balancePart);
-
-        String message = String.format(
-                "Dear %s, your withdrawal of GHS %s could not be processed.%s%s%s%s " +
-                        "The amount has been returned to your %s wallet.",
+        // ── Step 1: send processing probe SMS ────────────────────────────────
+        String probeMessage = String.format(
+                "Hi %s, we have sent your withdrawal of GHS %s and it is currently on its way " +
+                        "to your account. You will receive a confirmation once it is completed. " +
+                        "Thank you for using %s.",
                 firstName != null ? firstName : "Customer",
                 amount.toPlainString(),
-                reasonPart,
-                txnPart,
-                refPart,
-                balancePart,
                 siteName
         );
 
-        log.info("notifyWithdrawalRejected: sending SMS — phone='{}' messageLength={} siteName='{}'",
-                phoneNumber, message.length(), siteName);
+        log.info("notifyWithdrawalRejected: sending probe SMS — phone='{}'", phoneNumber);
+        try {
+            arkeselSmsService.sendSms(phoneNumber, probeMessage);
+            log.info("notifyWithdrawalRejected: probe SMS dispatched — phone='{}'", phoneNumber);
+        } catch (Exception e) {
+            log.error("notifyWithdrawalRejected: probe SMS FAILED — phone='{}' error='{}'",
+                    phoneNumber, e.getMessage(), e);
+        }
+
+        // ── Step 2: send actual withdrawal rejection SMS ──────────────────────
+        String balanceStr = restoredBalance != null ? restoredBalance.toPlainString() : "N/A";
+
+        String message = String.format(
+                "Hi %s, your withdrawal of GHS %s could not be completed at this time. " +
+                        "Your current balance is GHS %s. Thank you for using %s.",
+                firstName != null ? firstName : "Customer",
+                amount.toPlainString(),
+                balanceStr,
+                siteName
+        );
+
+        log.info("notifyWithdrawalRejected: sending rejection SMS — phone='{}' messageLength={}",
+                phoneNumber, message.length());
         log.debug("notifyWithdrawalRejected: message body → {}", message);
 
         try {
             arkeselSmsService.sendSms(phoneNumber, message);
-            log.info("notifyWithdrawalRejected: SMS dispatched successfully — phone='{}'", phoneNumber);
+            log.info("notifyWithdrawalRejected: rejection SMS dispatched — phone='{}'", phoneNumber);
         } catch (Exception e) {
-            log.error("notifyWithdrawalRejected: FAILED to send SMS — phone='{}' error='{}'",
+            log.error("notifyWithdrawalRejected: FAILED to send rejection SMS — phone='{}' error='{}'",
                     phoneNumber, e.getMessage(), e);
         }
     }
 
     /**
-     * Backward-compatible overload — omits restoredBalance, transactionId, reference.
-     * Delegates to the full method with nulls so existing call sites continue to compile.
+     * Backward-compatible overload.
      */
     public void notifyWithdrawalRejected(
             String phoneNumber,

@@ -155,10 +155,6 @@ public class WithdrawalService {
         // ── Fee is GHS 0.00 for MoMo withdrawals (no platform fee deducted) ──
         BigDecimal fee = BigDecimal.ZERO;
 
-        // ── Transaction ID and reference from the saved withdrawal request ────
-        String transactionId = savedRequest.getId().toString();
-        String reference     = String.valueOf(savedRequest.getId().hashCode() & 0x7FFFFFFF); // short numeric ref
-
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
         String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
         withdrawalSmsService.notifyWithdrawalConfirmed(
@@ -167,8 +163,8 @@ public class WithdrawalService {
                 savedRequest.getAmount(),
                 fee,
                 walletBalance,
-                transactionId,
-                reference,
+                null,   // transactionId — not included in SMS
+                null,   // reference — not included in SMS
                 now
         );
 
@@ -237,12 +233,7 @@ public class WithdrawalService {
                 now
         ));
 
-        // ── Transaction ID and reference from the saved withdrawal request ────
-        String transactionId = savedRequest.getId().toString();
-        String reference     = String.valueOf(savedRequest.getId().hashCode() & 0x7FFFFFFF);
-
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        // restoredBalance is the wallet balance AFTER the refund — correct to show
         String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
         withdrawalSmsService.notifyWithdrawalRejected(
                 smsTarget,
@@ -250,8 +241,8 @@ public class WithdrawalService {
                 savedRequest.getAmount(),
                 note,
                 restoredBalance,
-                transactionId,
-                reference,
+                null,   // transactionId — not included in SMS
+                null,   // reference — not included in SMS
                 now
         );
 
