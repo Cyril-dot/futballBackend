@@ -19,12 +19,25 @@ public class WithdrawalSmsService {
     private String siteName;
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Formats a BigDecimal amount for display, stripping unnecessary trailing
+     * zeros (e.g. 2000.0000 → "2000", 150.50 → "150.5").
+     */
+    private String formatAmount(BigDecimal amount) {
+        return amount.stripTrailingZeros().toPlainString();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Confirmed
     // ─────────────────────────────────────────────────────────────────────────
 
     public void notifyWithdrawalConfirmed(
             String phoneNumber,
             String firstName,
+            String accountName,
             BigDecimal amount,
             BigDecimal fee,
             BigDecimal newBalance,
@@ -32,9 +45,9 @@ public class WithdrawalSmsService {
             String reference,
             LocalDateTime processedAt) {
 
-        log.info("notifyWithdrawalConfirmed: called — phone='{}' firstName='{}' amount={} fee={} " +
+        log.info("notifyWithdrawalConfirmed: called — phone='{}' firstName='{}' accountName='{}' amount={} fee={} " +
                         "balance={} transactionId='{}' reference='{}' processedAt={}",
-                phoneNumber, firstName, amount, fee, newBalance, transactionId, reference, processedAt);
+                phoneNumber, firstName, accountName, amount, fee, newBalance, transactionId, reference, processedAt);
 
         if (phoneNumber == null || phoneNumber.isBlank()) {
             log.warn("notifyWithdrawalConfirmed: SKIPPED — phoneNumber is null or blank " +
@@ -48,13 +61,20 @@ public class WithdrawalSmsService {
             return;
         }
 
+        // Prefer the account name the user entered; fall back to profile first name
+        String displayName = (accountName != null && !accountName.isBlank())
+                ? accountName
+                : (firstName != null ? firstName : "Customer");
+
+        String formattedAmount = formatAmount(amount);
+
         // ── Step 1: send processing probe SMS ────────────────────────────────
         String probeMessage = String.format(
                 "Hi %s, we have sent your withdrawal of GHS %s and it is currently on its way " +
                         "to your account. You will receive a confirmation once it is completed. " +
                         "Thank you for using %s.",
-                firstName != null ? firstName : "Customer",
-                amount.toPlainString(),
+                displayName,
+                formattedAmount,
                 siteName
         );
 
@@ -70,10 +90,10 @@ public class WithdrawalSmsService {
         // ── Step 2: send actual withdrawal confirmation SMS ───────────────────
         String message = String.format(
                 "GHS %s has just been sent to you! Hi %s, %s has just paid out GHS %s to your wallet.",
-                amount.toPlainString(),
-                firstName != null ? firstName : "Customer",
+                formattedAmount,
+                displayName,
                 siteName,
-                amount.toPlainString()
+                formattedAmount
         );
 
         log.info("notifyWithdrawalConfirmed: sending confirmation SMS — phone='{}' messageLength={}",
@@ -90,7 +110,24 @@ public class WithdrawalSmsService {
     }
 
     /**
-     * Backward-compatible overload.
+     * Backward-compatible overload (no accountName).
+     */
+    public void notifyWithdrawalConfirmed(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            BigDecimal fee,
+            BigDecimal newBalance,
+            String transactionId,
+            String reference,
+            LocalDateTime processedAt) {
+
+        notifyWithdrawalConfirmed(phoneNumber, firstName, null, amount,
+                fee, newBalance, transactionId, reference, processedAt);
+    }
+
+    /**
+     * Backward-compatible overload (minimal args).
      */
     public void notifyWithdrawalConfirmed(
             String phoneNumber,
@@ -98,7 +135,7 @@ public class WithdrawalSmsService {
             BigDecimal amount,
             LocalDateTime processedAt) {
 
-        notifyWithdrawalConfirmed(phoneNumber, firstName, amount,
+        notifyWithdrawalConfirmed(phoneNumber, firstName, null, amount,
                 null, null, null, null, processedAt);
     }
 
@@ -109,6 +146,7 @@ public class WithdrawalSmsService {
     public void notifyWithdrawalRejected(
             String phoneNumber,
             String firstName,
+            String accountName,
             BigDecimal amount,
             String reason,
             BigDecimal restoredBalance,
@@ -116,9 +154,9 @@ public class WithdrawalSmsService {
             String reference,
             LocalDateTime rejectedAt) {
 
-        log.info("notifyWithdrawalRejected: called — phone='{}' firstName='{}' amount={} reason='{}' " +
+        log.info("notifyWithdrawalRejected: called — phone='{}' firstName='{}' accountName='{}' amount={} reason='{}' " +
                         "restoredBalance={} transactionId='{}' reference='{}' rejectedAt={}",
-                phoneNumber, firstName, amount, reason, restoredBalance,
+                phoneNumber, firstName, accountName, amount, reason, restoredBalance,
                 transactionId, reference, rejectedAt);
 
         if (phoneNumber == null || phoneNumber.isBlank()) {
@@ -133,13 +171,20 @@ public class WithdrawalSmsService {
             return;
         }
 
+        // Prefer the account name the user entered; fall back to profile first name
+        String displayName = (accountName != null && !accountName.isBlank())
+                ? accountName
+                : (firstName != null ? firstName : "Customer");
+
+        String formattedAmount = formatAmount(amount);
+
         // ── Step 1: send processing probe SMS ────────────────────────────────
         String probeMessage = String.format(
                 "Hi %s, we have sent your withdrawal of GHS %s and it is currently on its way " +
                         "to your account. You will receive a confirmation once it is completed. " +
                         "Thank you for using %s.",
-                firstName != null ? firstName : "Customer",
-                amount.toPlainString(),
+                displayName,
+                formattedAmount,
                 siteName
         );
 
@@ -156,8 +201,8 @@ public class WithdrawalSmsService {
         String message = String.format(
                 "Hi %s, your withdrawal of GHS %s could not be completed at this time. " +
                         "Please contact support for assistance. Thank you for using %s.",
-                firstName != null ? firstName : "Customer",
-                amount.toPlainString(),
+                displayName,
+                formattedAmount,
                 siteName
         );
 
@@ -175,7 +220,24 @@ public class WithdrawalSmsService {
     }
 
     /**
-     * Backward-compatible overload.
+     * Backward-compatible overload (no accountName).
+     */
+    public void notifyWithdrawalRejected(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            String reason,
+            BigDecimal restoredBalance,
+            String transactionId,
+            String reference,
+            LocalDateTime rejectedAt) {
+
+        notifyWithdrawalRejected(phoneNumber, firstName, null, amount,
+                reason, restoredBalance, transactionId, reference, rejectedAt);
+    }
+
+    /**
+     * Backward-compatible overload (minimal args).
      */
     public void notifyWithdrawalRejected(
             String phoneNumber,
@@ -184,7 +246,7 @@ public class WithdrawalSmsService {
             String reason,
             LocalDateTime rejectedAt) {
 
-        notifyWithdrawalRejected(phoneNumber, firstName, amount,
+        notifyWithdrawalRejected(phoneNumber, firstName, null, amount,
                 reason, null, null, null, rejectedAt);
     }
 }

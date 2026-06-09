@@ -160,6 +160,7 @@ public class WithdrawalService {
         withdrawalSmsService.notifyWithdrawalConfirmed(
                 smsTarget,
                 u.getFirstName(),
+                savedRequest.getAccountName(),   // MoMo account name entered by user
                 savedRequest.getAmount(),
                 fee,
                 walletBalance,
@@ -238,6 +239,7 @@ public class WithdrawalService {
         withdrawalSmsService.notifyWithdrawalRejected(
                 smsTarget,
                 u.getFirstName(),
+                savedRequest.getAccountName(),   // MoMo account name entered by user
                 savedRequest.getAmount(),
                 note,
                 restoredBalance,
