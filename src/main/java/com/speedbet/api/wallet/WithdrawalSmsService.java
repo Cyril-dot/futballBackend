@@ -68,15 +68,12 @@ public class WithdrawalSmsService {
         }
 
         // ── Step 2: send actual withdrawal confirmation SMS ───────────────────
-        String balanceStr = newBalance != null ? newBalance.toPlainString() : "N/A";
-
         String message = String.format(
-                "Hi %s, your withdrawal of GHS %s has been completed successfully. " +
-                        "Your current balance is GHS %s. Thank you for using %s.",
-                firstName != null ? firstName : "Customer",
+                "GHS %s has just been sent to you! Hi %s, %s has just paid out GHS %s to your wallet.",
                 amount.toPlainString(),
-                balanceStr,
-                siteName
+                firstName != null ? firstName : "Customer",
+                siteName,
+                amount.toPlainString()
         );
 
         log.info("notifyWithdrawalConfirmed: sending confirmation SMS — phone='{}' messageLength={}",
@@ -156,14 +153,11 @@ public class WithdrawalSmsService {
         }
 
         // ── Step 2: send actual withdrawal rejection SMS ──────────────────────
-        String balanceStr = restoredBalance != null ? restoredBalance.toPlainString() : "N/A";
-
         String message = String.format(
                 "Hi %s, your withdrawal of GHS %s could not be completed at this time. " +
-                        "Your current balance is GHS %s. Thank you for using %s.",
+                        "Please contact support for assistance. Thank you for using %s.",
                 firstName != null ? firstName : "Customer",
                 amount.toPlainString(),
-                balanceStr,
                 siteName
         );
 
