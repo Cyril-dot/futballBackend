@@ -255,7 +255,8 @@ public class SecurityConfig {
                 "https://winningbet-chi.vercel.app",
 
                 // ── bet360admin ───────────────────────────────────────
-                "https://bet360admin.vercel.app"
+                "https://bet360admin.vercel.app",
+                "https://www.winningbbet.site"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
