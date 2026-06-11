@@ -252,6 +252,7 @@ public class SecurityConfig {
                 // ── bbet360 ───────────────────────────────────────────
                 "https://bbet360.site",
                 "https://www.bbet360.site",
+                "https://winningbet-chi.vercel.app",
 
                 // ── bet360admin ───────────────────────────────────────
                 "https://bet360admin.vercel.app"
