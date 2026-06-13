@@ -259,7 +259,16 @@ public class SecurityConfig {
                 "https://www.winningbbet.site",
                 "https://winningbetadmin.vercel.app",
                 "https://championbet-jade.vercel.app",
-                "https://zynobett.site"
+                // ── zynobet ───────────────────────────────────────────
+                "https://zynobet.site",
+                "https://www.zynobet.site",
+                "https://oddsking-ui.vercel.app",
+                "https://zynobetadmin.vercel.app",
+
+// ── zynobett (new) ───────────────────────────────────────────
+                "https://zynobett.site",
+                "https://www.zynobett.site"
+
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
