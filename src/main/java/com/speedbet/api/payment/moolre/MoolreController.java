@@ -14,6 +14,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -21,63 +22,60 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.math.BigDecimal;
+import java.util.Arrays;
+import java.util.stream.Stream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * MoolreController — GHS MoMo payments via Moolre USSD Direct Charge.
+ * MoolreController — GHS MoMo payments via Moolre Checkout Page.
  *
  * ─── Payment flows ───────────────────────────────────────────────────────────
  *
- *  1. Initiate USSD Charge — Deposit
+ *  1. Initiate Checkout — Deposit
  *     POST /api/wallet/deposit/moolre/init
- *     • Accepts { amount, phone, network } from the frontend.
- *     • Calls Moolre POST /open/transact/payment to push a USSD prompt directly
- *       to the customer's MoMo number — no hosted page, no redirect.
- *     • Returns { externalref, moolreTxId, actionRequired, message } to the frontend.
- *       actionRequired=true means Moolre sent an SMS code instead of a USSD push;
- *       the user must enter that code via /otp before the USSD prompt is sent.
- *     • Customer approves the USSD prompt on their phone.
- *     • Moolre fires our webhook → wallet is credited automatically.
+ *     • Accepts { amount, email } from the frontend (email optional).
+ *     • Calls Moolre POST /open/checkout/initiate to create a hosted checkout session.
+ *     • Returns { externalref, checkoutUrl, moolreTxId } to the frontend.
+ *     • Frontend redirects the user to checkoutUrl — the customer selects their
+ *       MoMo network and enters their number on Moolre's hosted page.
+ *     • Moolre approves the payment and fires our webhook → wallet is credited automatically.
+ *     • Frontend may also poll /verify for status while the user is on the checkout page.
  *
- *  2. OTP / SMS Code Submission (actionRequired flow only)
- *     POST /api/wallet/deposit/moolre/otp
- *     • Only needed when /init returns actionRequired=true (MTN subscribers
- *       who require SMS verification before a USSD push can be sent).
- *     • Accepts { externalref, otp } from the frontend.
- *     • Re-calls Moolre POST /open/transact/payment with the same params + otpcode field.
- *       (Per Moolre docs, there is NO separate OTP endpoint — the OTP is submitted
- *        back to the same /open/transact/payment endpoint with otpcode in the body.)
- *     • On success Moolre immediately pushes the USSD prompt to the user's phone.
- *     • Frontend then moves user to the normal "approve USSD" waiting screen.
- *
- *  3. Initiate USSD Charge — Admin Upgrade
+ *  2. Initiate Checkout — Admin Upgrade
  *     POST /api/user/upgrade-to-admin/moolre/init
- *     • Same USSD direct flow but amount is fixed at GHS 200 and promotes
+ *     • Same checkout flow but amount is fixed at GHS 200 and promotes
  *       the user to ADMIN on successful payment.
  *     • New admin's commission rate is initialised at 70% (set inside
  *       UserService.upgradeToAdmin). Super Admin can adjust via onboarding chat.
- *     • Also returns actionRequired flag when applicable.
  *
- *  4. Payment Verification (manual fallback / polling)
+ *  3. Payment Verification (manual fallback / polling)
  *     POST /api/wallet/deposit/moolre/verify
  *     • Accepts the externalref stored by the frontend after /init.
- *     • Resolves Moolre's internal transaction ID from the pendingCharges cache
- *       (populated during step B of moolreDirectCharge) and queries by that ID.
- *     • Falls back to querying by externalref if no Moolre TX ID is cached yet
- *       (e.g. very early poll before step B completes).
+ *     • Queries Moolre /open/transact/status by the Moolre TX ID (cached after init)
+ *       or falls back to querying by externalref.
  *     • Returns txstatus=0 (PENDING) when Moolre returns "Transaction not found"
  *       so the frontend knows to keep polling rather than giving up.
  *     • Credits wallet immediately if txstatus=1 and not already credited.
  *     • Idempotent — safe to poll; duplicate refs are silently ignored.
  *
- *  5. Webhook (primary / automatic credit path)
+ *  4. Webhook (primary / automatic credit path)
  *     POST /api/webhooks/moolre
  *     • Moolre POSTs here after every successful payment.
  *     • Verified by matching the `secret` field in the payload.
- *     • /verify above is the fallback for missed or delayed webhooks.
+ *     • /verify above and the auto-polling scheduler are fallbacks for missed webhooks.
+ *
+ *  5. Automatic Verification Scheduler
+ *     • Runs every 30 seconds.
+ *     • Scans all pending checkout sessions older than 30 seconds.
+ *     • For each, calls Moolre /open/transact/status and credits the wallet
+ *       automatically on success — no user action needed.
+ *     • Removes sessions that have been pending more than 30 minutes (expired).
+ *     • This ensures wallet credit even when the webhook is missed/delayed.
  *
  * ─── Commission structure ─────────────────────────────────────────────────────
  *   Every deposit triggers ReferralService.attributeCommission(), which credits
@@ -87,18 +85,16 @@ import java.util.concurrent.ConcurrentHashMap;
  *   Super Admin can negotiate a different rate via the onboarding chat created
  *   after a successful admin upgrade payment.
  *
- * ─── OTP flow (per official Moolre docs) ─────────────────────────────────────
- *   There is NO separate /authorize endpoint.  The OTP is submitted by re-calling
- *   POST /open/transact/payment with the SAME body as /init PLUS the `otpcode`
- *   field populated.  Pending charge params (amount, phone, channel, externalref)
- *   are cached in pendingCharges (ConcurrentHashMap) keyed by externalref so
- *   the /otp endpoint can reconstruct the full body without the frontend having
- *   to re-send those fields.
+ * ─── Moolre Checkout API ─────────────────────────────────────────────────────
+ *   Initiate:  POST /open/checkout/initiate
+ *   Status:    POST /open/transact/status
+ *   Moolre returns a hosted checkoutUrl the user is redirected to.
+ *   No phone/network selection needed from the frontend — the user picks on
+ *   Moolre's page.
  *
- * ─── network values accepted by frontend → Moolre channel codes ──────────────
- *   "MTN"        → channel "13"  (MTN MoMo)
- *   "VODAFONE"   → channel "6"   (Telecel, formerly Vodafone Cash)
- *   "AIRTELTIGO" → channel "7"   (AirtelTigo Money)
+ * ─── network values (for status response mapping) ────────────────────────────
+ *   Moolre handles network selection internally on the checkout page.
+ *   No channel codes needed from our side on initiation.
  *
  * ─── externalref convention ──────────────────────────────────────────────────
  *   "deposit_<userId>_<uuid>"       → credit wallet
@@ -109,35 +105,19 @@ import java.util.concurrent.ConcurrentHashMap;
  *   1 = success
  *   2 = failed / cancelled
  *
- * ─── Status check ID resolution ──────────────────────────────────────────────
- *   Moolre indexes completed transactions by their internal UUID (returned in the
- *   `data` field of the step B /open/transact/payment response), NOT by our
- *   externalref.  Querying /open/transact/status by externalref while the
- *   transaction is not yet fully recorded returns status=1 + message=
- *   "Transaction not found" — which looks like a success but contains no data.
- *
- *   Fix: after step B succeeds, the Moolre TX UUID is extracted from the response
- *   `data` field and stored in pendingCharges.moolreTxId.  moolreCheckStatus()
- *   always queries by this UUID when available, falling back to externalref only
- *   if the UUID hasn't been captured yet.
- *
- *   "Transaction not found" is treated as PENDING (txstatus=0) so the frontend
- *   keeps polling rather than surfacing an error to the user.
- *
  * ─── Moolre API base URL (hardcoded) ─────────────────────────────────────────
  *   https://api.moolre.com
  *
- * ─── Phone number format ─────────────────────────────────────────────────────
- *   Moolre expects the phone with a leading 0 (e.g. "0244123456").
- *   Do NOT send the 233 country-code prefix — Moolre rejects it.
- *   The frontend must collect the number in 0XXXXXXXXX format and send it as-is.
- *
  * ─── application.properties keys needed ──────────────────────────────────────
- *   app.moolre.api-user          → env: MOOLRE_API_USER
- *   app.moolre.public-key        → env: MOOLRE_PUBLIC_KEY
- *   app.moolre.account-number    → env: MOOLRE_ACCOUNT_NUMBER
- *   app.moolre.webhook-secret    → env: MOOLRE_WEBHOOK_SECRET
- *   app.platform.min-deposit-amount (default: 1)
+ *   app.moolre.api-user              → env: MOOLRE_API_USER
+ *   app.moolre.public-key            → env: MOOLRE_PUBLIC_KEY
+ *   app.moolre.account-number        → env: MOOLRE_ACCOUNT_NUMBER
+ *   app.moolre.webhook-secret        → env: MOOLRE_WEBHOOK_SECRET
+ *   app.moolre.callback-url          → env: MOOLRE_CALLBACK_URL  (your frontend return URL)
+ *   app.platform.min-deposit-amount  (default: 1)
+ *
+ * NOTE: Enable scheduling in your Spring Boot app with @EnableScheduling on a
+ *       @Configuration class for the automatic verification scheduler to run.
  */
 @Slf4j
 @RestController
@@ -154,9 +134,9 @@ public class MoolreController {
     /**
      * Commission rate applied to every deposit for affiliate attribution.
      * Admins earn 70% of the platform commission on each referred deposit.
-     * The actual per-admin rate is stored on the Referral entity (set during
-     * upgradeToAdmin) and resolved inside ReferralService.attributeCommission().
-     * This constant is for logging/documentation purposes only.
+     * The actual per-admin rate is stored on the Referral entity and resolved
+     * inside ReferralService.attributeCommission(). This constant is for
+     * logging/documentation purposes only.
      */
     private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
 
@@ -165,50 +145,41 @@ public class MoolreController {
     private static final int TX_PENDING = 0;
     private static final int TX_FAILED  = 2;
 
-    // Moolre channel codes (from official docs)
-    private static final String CHANNEL_MTN        = "13";
-    private static final String CHANNEL_VODAFONE   = "6";
-    private static final String CHANNEL_AIRTELTIGO = "7";
+    /**
+     * How long (in milliseconds) a pending checkout session is kept in the
+     * auto-polling cache before it is considered expired (30 minutes).
+     */
+    private static final long PENDING_SESSION_TTL_MS = 30 * 60 * 1000L;
 
     /**
-     * Pending charge cache — keyed by externalref.
+     * Pending checkout session cache — keyed by externalref.
      *
-     * Stores { amount, phone, network, externalRef, moolreTxId } so that:
-     *   • /otp can re-call /open/transact/payment with the same params + otpcode.
-     *   • /verify can query Moolre's status endpoint by their internal TX UUID
-     *     rather than our externalref (Moolre indexes by UUID, not externalref).
+     * Populated by /init, consumed by /verify, the webhook, and the scheduler.
+     * Stores the Moolre TX ID so status can be queried by UUID rather than
+     * externalref (Moolre indexes by UUID internally).
      *
-     * moolreTxId is null until step B of moolreDirectCharge completes and
-     * Moolre returns their internal UUID in the `data` field of the response.
-     *
-     * Entries are removed after OTP submission or on successful payment.
      * In a multi-instance deployment replace this with Redis or a DB table.
      */
-    private final ConcurrentHashMap<String, PendingCharge> pendingCharges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, PendingCheckout> pendingCheckouts = new ConcurrentHashMap<>();
 
     /**
-     * Lightweight struct for cached charge params.
+     * Lightweight struct for a pending checkout session.
      *
-     * @param amount      GHS amount being charged
-     * @param phone       Customer MoMo number in 0XXXXXXXXX format
-     * @param network     "MTN" / "VODAFONE" / "AIRTELTIGO"
-     * @param externalRef Our reference: "deposit_<userId>_<uuid>" etc.
-     * @param moolreTxId  Moolre's internal transaction UUID returned in step B data.
-     *                    Null until step B completes. Used as the query key for
-     *                    /open/transact/status (Moolre does NOT index by externalref).
+     * @param externalRef  Our reference: "deposit_<userId>_<uuid>" etc.
+     * @param amount       GHS amount for the checkout session.
+     * @param userId       The user who initiated the checkout.
+     * @param moolreTxId   Moolre's internal transaction UUID (from initiate response).
+     * @param checkoutUrl  Hosted checkout page URL to redirect the user to.
+     * @param createdAt    Epoch millis when this session was created (for TTL).
      */
-    record PendingCharge(
-            BigDecimal amount,
-            String     phone,
-            String     network,
+    record PendingCheckout(
             String     externalRef,
-            String     moolreTxId   // null until step B returns Moolre's UUID
-    ) {
-        /** Returns a copy with the Moolre transaction ID set after step B. */
-        PendingCharge withMoolreTxId(String txId) {
-            return new PendingCharge(amount, phone, network, externalRef, txId);
-        }
-    }
+            BigDecimal amount,
+            UUID       userId,
+            String     moolreTxId,
+            String     checkoutUrl,
+            long       createdAt
+    ) {}
 
     private final WalletService           walletService;
     private final UserService             userService;
@@ -221,197 +192,95 @@ public class MoolreController {
     @Value("${app.moolre.public-key}")             private String     publicKey;
     @Value("${app.moolre.account-number}")         private String     accountNumber;
     @Value("${app.moolre.webhook-secret}")         private String     webhookSecret;
+    @Value("${app.moolre.callback-url}")           private String     callbackUrl;
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
-    // ─── 1. Initiate USSD Charge — Deposit ───────────────────────────────────
+    // ─── 1. Initiate Checkout — Deposit ──────────────────────────────────────
 
     /**
-     * Initiates a Moolre USSD direct charge for a wallet deposit.
+     * Initiates a Moolre Checkout page session for a wallet deposit.
+     *
+     * The user is redirected to the Moolre-hosted checkout page where they
+     * select their MoMo network and enter their number. No phone/network
+     * input is required from our frontend.
      *
      * Required body fields:
      *   amount  – GHS amount to deposit (e.g. "300")
-     *   phone   – customer's MoMo number in 0XXXXXXXXX format (e.g. "0244123456")
-     *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
      *
-     * Response (always HTTP 200 on valid request):
+     * Optional body fields:
+     *   email   – customer email for Moolre receipt
+     *
+     * Response (HTTP 200):
      *   {
-     *     "externalref":    "deposit_<userId>_<uuid>",
-     *     "moolreTxId":     "<moolre-internal-uuid>",  // null if actionRequired
-     *     "actionRequired": false,   // true → user must enter SMS code via /otp first
-     *     "message":        "..."
+     *     "externalref":  "deposit_<userId>_<uuid>",
+     *     "moolreTxId":   "<moolre-internal-uuid>",
+     *     "checkoutUrl":  "https://checkout.moolre.com/pay/<session>",
+     *     "message":      "Redirect the user to checkoutUrl to complete payment."
      *   }
      *
-     * On success, Moolre fires a webhook which triggers handleDeposit → wallet
-     * credit + commission attribution at the admin's 70% rate.
+     * Frontend should redirect the user to checkoutUrl and poll /verify
+     * (passing both externalref and moolreTxId) until credited=true.
+     * The wallet is also credited automatically via webhook + scheduler.
      */
     @PostMapping("/api/wallet/deposit/moolre/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
-        var amount  = new BigDecimal(req.get("amount").toString());
-        var phone   = req.get("phone");
-        var network = req.get("network");
+        var amount = new BigDecimal(req.get("amount").toString());
+        var email  = req.containsKey("email") ? req.get("email").toString() : "";
 
         if (amount.compareTo(minDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
-        if (phone == null || phone.toString().isBlank())
-            throw ApiException.badRequest("phone is required.");
-        if (network == null || network.toString().isBlank())
-            throw ApiException.badRequest("network is required (MTN, VODAFONE, AIRTELTIGO).");
 
         var externalRef = DEPOSIT_INTENT + "_" + user.getId() + "_" + UUID.randomUUID();
 
-        log.info("initDeposit (USSD): userId='{}' amount={} phone='{}' network='{}' externalRef='{}'",
-                user.getId(), amount, phone, network, externalRef);
+        log.info("initDeposit (checkout): userId='{}' amount={} externalRef='{}'",
+                user.getId(), amount, externalRef);
 
-        Map<String, Object> chargeResult;
-        boolean actionRequired = false;
-        String  actionMessage  = "";
+        Map<String, Object> checkoutResult = moolreInitiateCheckout(amount, externalRef, email);
 
-        try {
-            chargeResult = moolreDirectCharge(amount, phone.toString(), network.toString(), externalRef, null);
-        } catch (ActionRequiredException ex) {
-            log.warn("initDeposit: action required for userId='{}' externalRef='{}' — {}",
-                    user.getId(), externalRef, ex.getMessage());
-            actionRequired = true;
-            actionMessage  = ex.getMessage();
-            chargeResult   = Map.of();
-        } catch (RuntimeException ex) {
-            log.error("initDeposit: Moolre charge failed for userId='{}' externalRef='{}' — {}",
-                    user.getId(), externalRef, ex.getMessage(), ex);
-            throw ApiException.badRequest(ex.getMessage() != null
-                    ? ex.getMessage()
-                    : "Payment initiation failed. Please try again.");
-        }
+        String checkoutUrl = checkoutResult.getOrDefault("checkoutUrl", "").toString();
+        String moolreTxId  = checkoutResult.getOrDefault("moolreTxId", "").toString();
 
-        // Surface Moolre's internal TX ID so /verify can query by it directly.
-        // This is null when actionRequired=true (step B hasn't run yet).
-        String moolreTxId = resolveMoolreTxId(externalRef, chargeResult);
+        // Cache the session for automatic verification polling
+        pendingCheckouts.put(externalRef, new PendingCheckout(
+                externalRef, amount, user.getId(), moolreTxId, checkoutUrl, System.currentTimeMillis()
+        ));
+
+        log.info("initDeposit: checkout session cached — externalRef='{}' moolreTxId='{}' url='{}'",
+                externalRef, moolreTxId, checkoutUrl);
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "externalref",    externalRef,
-                "moolreTxId",     moolreTxId != null ? moolreTxId : "",
-                "actionRequired", actionRequired,
-                "message", actionRequired
-                        ? actionMessage
-                        : chargeResult.getOrDefault("message",
-                        "Please approve the USSD prompt on your phone.").toString()
+                "externalref", externalRef,
+                "moolreTxId",  moolreTxId,
+                "checkoutUrl", checkoutUrl,
+                "message",     "Redirect the user to the checkoutUrl to complete payment."
         )));
     }
 
-    // ─── 2. OTP / SMS Code Submission ────────────────────────────────────────
+    // ─── 2. Initiate Checkout — Admin Upgrade ────────────────────────────────
 
     /**
-     * Submits the SMS verification code sent by Moolre/MTN.
-     *
-     * Per Moolre's official API documentation, there is NO separate OTP endpoint.
-     * The OTP is submitted by re-calling POST /open/transact/payment with the
-     * same body as the original /init request PLUS the `otpcode` field set.
-     *
-     * The original charge params (amount, phone, channel) are retrieved from
-     * the pendingCharges cache that was populated during /init.
-     *
-     * Required body fields:
-     *   externalref – the reference returned by /init
-     *   otp         – the code the user received via SMS
-     *
-     * Response (HTTP 200 on success):
-     *   {
-     *     "moolreTxId": "<moolre-internal-uuid>",
-     *     "message":    "USSD prompt sent. Please approve on your phone."
-     *   }
-     *
-     * The frontend should persist moolreTxId (alongside externalref) and use it
-     * for subsequent /verify calls so status checks query by Moolre's UUID.
-     */
-    @PostMapping("/api/wallet/deposit/moolre/otp")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
-            @AuthenticationPrincipal User user,
-            @RequestBody Map<String, Object> req) {
-
-        var externalRef = req.get("externalref");
-        var otp         = req.get("otp");
-
-        if (externalRef == null || externalRef.toString().isBlank())
-            throw ApiException.badRequest("externalref is required.");
-        if (otp == null || otp.toString().isBlank())
-            throw ApiException.badRequest("otp is required.");
-
-        var ref   = externalRef.toString().trim();
-        var parts = ref.split("_", 3);
-        if (parts.length < 3)
-            throw ApiException.badRequest("Invalid externalref format.");
-
-        UUID refUserId;
-        try {
-            refUserId = UUID.fromString(parts[1]);
-        } catch (IllegalArgumentException e) {
-            throw ApiException.badRequest("Invalid externalref format.");
-        }
-
-        if (!refUserId.equals(user.getId()))
-            throw ApiException.forbidden("This payment reference does not belong to your account.");
-
-        // Retrieve cached charge params
-        var pending = pendingCharges.get(ref);
-        if (pending == null) {
-            log.error("submitOtp: no pending charge found for externalRef='{}' userId='{}'", ref, user.getId());
-            throw ApiException.badRequest(
-                    "Payment session not found. Please start a new deposit.");
-        }
-
-        log.info("submitOtp: userId='{}' externalRef='{}'", user.getId(), ref);
-
-        Map<String, Object> chargeResult;
-        try {
-            chargeResult = moolreDirectCharge(
-                    pending.amount(), pending.phone(), pending.network(),
-                    ref, otp.toString().trim());
-            // Remove from cache — USSD prompt has been triggered
-            pendingCharges.remove(ref);
-        } catch (ActionRequiredException ex) {
-            log.warn("submitOtp: unexpected actionRequired after OTP for externalRef='{}' — {}", ref, ex.getMessage());
-            throw ApiException.badRequest("OTP verification failed: " + ex.getMessage());
-        } catch (RuntimeException ex) {
-            log.error("submitOtp: OTP submission failed for userId='{}' externalRef='{}' — {}",
-                    user.getId(), ref, ex.getMessage(), ex);
-            throw ApiException.badRequest(ex.getMessage() != null
-                    ? ex.getMessage()
-                    : "OTP verification failed. Please check the code and try again.");
-        }
-
-        // After OTP + step B, Moolre's TX ID is now available. Surface it so the
-        // frontend can pass it to /verify rather than querying by externalref.
-        String moolreTxId = resolveMoolreTxId(ref, chargeResult);
-
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "moolreTxId", moolreTxId != null ? moolreTxId : "",
-                "message", "Code verified. A USSD prompt has been sent to your phone — please approve it to complete your payment."
-        )));
-    }
-
-    // ─── 3. Initiate USSD Charge — Admin Upgrade ─────────────────────────────
-
-    /**
-     * Initiates a Moolre USSD direct charge for the GHS 200 admin upgrade fee.
+     * Initiates a Moolre Checkout page session for the GHS 200 admin upgrade fee.
      *
      * On successful payment:
      *   • User is promoted to ADMIN
-     *   • Their referral link is created with a 70% commission rate (set inside
-     *     UserService.upgradeToAdmin)
+     *   • Their referral link is created with a 70% commission rate
      *   • An onboarding chat is opened with Super Admin to confirm/adjust the rate
      *
      * Required body fields:
-     *   phone   – customer's MoMo number in 0XXXXXXXXX format
-     *   network – "MTN", "VODAFONE", or "AIRTELTIGO"
+     *   (none beyond the authenticated user)
      *
-     * Response (always HTTP 200 on valid request):
+     * Optional body fields:
+     *   email – customer email for Moolre receipt
+     *
+     * Response (HTTP 200):
      *   {
-     *     "externalref":    "adminupgrade_<userId>_<uuid>",
-     *     "moolreTxId":     "<moolre-internal-uuid>",  // null if actionRequired
-     *     "actionRequired": false,
-     *     "message":        "..."
+     *     "externalref":  "adminupgrade_<userId>_<uuid>",
+     *     "moolreTxId":   "<moolre-internal-uuid>",
+     *     "checkoutUrl":  "https://checkout.moolre.com/pay/<session>",
+     *     "message":      "Redirect the user to checkoutUrl to complete payment."
      *   }
      */
     @PostMapping("/api/user/upgrade-to-admin/moolre/init")
@@ -422,80 +291,54 @@ public class MoolreController {
         if (user.getRole().name().equals("ADMIN"))
             throw ApiException.badRequest("You are already an Admin.");
 
-        var phone   = req.get("phone");
-        var network = req.get("network");
-
-        if (phone == null || phone.toString().isBlank())
-            throw ApiException.badRequest("phone is required.");
-        if (network == null || network.toString().isBlank())
-            throw ApiException.badRequest("network is required (MTN, VODAFONE, AIRTELTIGO).");
-
+        var email = req.containsKey("email") ? req.get("email").toString() : "";
         var externalRef = UPGRADE_INTENT_ADMIN + "_" + user.getId() + "_" + UUID.randomUUID();
 
-        log.info("initAdminUpgrade (USSD): userId='{}' phone='{}' network='{}' externalRef='{}'",
-                user.getId(), phone, network, externalRef);
+        log.info("initAdminUpgrade (checkout): userId='{}' externalRef='{}'",
+                user.getId(), externalRef);
 
-        Map<String, Object> chargeResult;
-        boolean actionRequired = false;
-        String  actionMessage  = "";
+        Map<String, Object> checkoutResult = moolreInitiateCheckout(ADMIN_UPGRADE_FEE, externalRef, email);
 
-        try {
-            chargeResult = moolreDirectCharge(ADMIN_UPGRADE_FEE, phone.toString(), network.toString(), externalRef, null);
-        } catch (ActionRequiredException ex) {
-            log.warn("initAdminUpgrade: action required for userId='{}' externalRef='{}' — {}",
-                    user.getId(), externalRef, ex.getMessage());
-            actionRequired = true;
-            actionMessage  = ex.getMessage();
-            chargeResult   = Map.of();
-        } catch (RuntimeException ex) {
-            log.error("initAdminUpgrade: Moolre charge failed for userId='{}' externalRef='{}' — {}",
-                    user.getId(), externalRef, ex.getMessage(), ex);
-            throw ApiException.badRequest(ex.getMessage() != null
-                    ? ex.getMessage()
-                    : "Upgrade payment initiation failed. Please try again.");
-        }
+        String checkoutUrl = checkoutResult.getOrDefault("checkoutUrl", "").toString();
+        String moolreTxId  = checkoutResult.getOrDefault("moolreTxId", "").toString();
 
-        String moolreTxId = resolveMoolreTxId(externalRef, chargeResult);
+        pendingCheckouts.put(externalRef, new PendingCheckout(
+                externalRef, ADMIN_UPGRADE_FEE, user.getId(), moolreTxId, checkoutUrl, System.currentTimeMillis()
+        ));
+
+        log.info("initAdminUpgrade: checkout session cached — externalRef='{}' moolreTxId='{}'",
+                externalRef, moolreTxId);
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "externalref",    externalRef,
-                "moolreTxId",     moolreTxId != null ? moolreTxId : "",
-                "actionRequired", actionRequired,
-                "message", actionRequired
-                        ? actionMessage
-                        : chargeResult.getOrDefault("message",
-                        "Please approve the USSD prompt on your phone.").toString()
+                "externalref", externalRef,
+                "moolreTxId",  moolreTxId,
+                "checkoutUrl", checkoutUrl,
+                "message",     "Redirect the user to the checkoutUrl to complete the GHS 200 upgrade payment."
         )));
     }
 
-    // ─── 4. Payment Verification ──────────────────────────────────────────────
+    // ─── 3. Payment Verification (manual / polling fallback) ─────────────────
 
     /**
-     * Manually verifies a Moolre payment and credits the wallet if successful.
+     * Manually verifies a Moolre checkout payment and credits the wallet if successful.
      * Idempotent — safe to poll.
      *
      * Status check ID resolution:
      *   Moolre's /open/transact/status indexes by their internal TX UUID, not our
-     *   externalref. Querying by externalref before the transaction is fully
-     *   recorded returns status=1 + message="Transaction not found" with no data.
-     *
-     *   This endpoint resolves the Moolre TX UUID from the pendingCharges cache
-     *   (set during step B), and passes that as the query key. If the cache entry
-     *   doesn't exist yet (very early poll), it falls back to externalref.
+     *   externalref. This endpoint resolves the UUID from:
+     *     (1) client-supplied moolreTxId in the request body
+     *     (2) the pendingCheckouts cache (set during /init)
+     *     (3) externalref as a last fallback
      *
      *   "Transaction not found" is mapped to PENDING so the frontend keeps polling.
-     *
-     * On deposit success: credits user wallet + attributes 70% commission to
-     * referring admin via ReferralService.attributeCommission().
      *
      * Required body fields:
      *   externalref – the reference returned by /init
      *
      * Optional body fields:
-     *   moolreTxId  – Moolre's internal UUID (returned by /init or /otp). When
-     *                 supplied, status is queried by this ID directly, bypassing
-     *                 the cache lookup. Use this when the cache has been cleared
-     *                 (e.g. server restart) to still allow correct polling.
+     *   moolreTxId  – Moolre's internal UUID (returned by /init). When supplied,
+     *                 status is queried by this ID directly. Use this when the server
+     *                 has restarted and the in-memory cache was cleared.
      */
     @PostMapping("/api/wallet/deposit/moolre/verify")
     public ResponseEntity<ApiResponse<Map<String, Object>>> verifyPayment(
@@ -523,11 +366,9 @@ public class MoolreController {
 
         log.info("verifyPayment: userId='{}' externalRef='{}'", user.getId(), ref);
 
-        // ── Resolve the query ID for /open/transact/status ─────────────────────
-        // Moolre indexes by their internal TX UUID (returned in step B `data` field).
-        // Querying by externalref returns "Transaction not found" even on success.
-        // Priority: (1) caller-supplied moolreTxId, (2) cached UUID, (3) externalref fallback.
+        // ── Resolve the query ID ────────────────────────────────────────────────
         String queryId = ref; // default fallback
+
         String clientMoolreTxId = req.containsKey("moolreTxId")
                 ? req.get("moolreTxId").toString().trim()
                 : "";
@@ -537,13 +378,13 @@ public class MoolreController {
             log.info("verifyPayment: using client-supplied moolreTxId='{}' for externalRef='{}'",
                     queryId, ref);
         } else {
-            var pending = pendingCharges.get(ref);
+            var pending = pendingCheckouts.get(ref);
             if (pending != null && pending.moolreTxId() != null && !pending.moolreTxId().isBlank()) {
                 queryId = pending.moolreTxId();
                 log.info("verifyPayment: using cached moolreTxId='{}' for externalRef='{}'",
                         queryId, ref);
             } else {
-                log.info("verifyPayment: no moolreTxId cached yet — falling back to externalRef='{}'", ref);
+                log.info("verifyPayment: no moolreTxId available — falling back to externalRef='{}'", ref);
             }
         }
 
@@ -553,9 +394,6 @@ public class MoolreController {
         var data = (Map<String, Object>) statusResponse.get("data");
 
         // ── "Transaction not found" detection ──────────────────────────────────
-        // Moolre returns status=1 + message="Transaction not found" when the USSD
-        // charge hasn't been recorded yet (too early to poll). We treat this as
-        // PENDING so the frontend keeps retrying rather than surfacing an error.
         var topLevelMessage = String.valueOf(statusResponse.getOrDefault("message", "")).toLowerCase();
         if (topLevelMessage.contains("transaction not found") || topLevelMessage.contains("not found")) {
             log.info("verifyPayment: Moolre 'Transaction not found' — treating as PENDING for externalRef='{}'", ref);
@@ -570,7 +408,7 @@ public class MoolreController {
                 ? Integer.parseInt(data.getOrDefault("txstatus", "-1").toString())
                 : -1;
 
-        // ── Also check for "not found" inside data.message ─────────────────────
+        // Also check for "not found" inside data.message
         if (data != null) {
             var dataMessage = String.valueOf(data.getOrDefault("message", "")).toLowerCase();
             if (dataMessage.contains("transaction not found") || dataMessage.contains("not found")) {
@@ -587,11 +425,12 @@ public class MoolreController {
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
                     "credited", false,
                     "txstatus", TX_PENDING,
-                    "message",  "Payment is still pending. Please approve the USSD prompt on your phone."
+                    "message",  "Payment is still pending. Please complete payment on the Moolre checkout page."
             )));
         }
 
         if (txStatus == TX_FAILED) {
+            pendingCheckouts.remove(ref);
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
                     "credited", false,
                     "txstatus", TX_FAILED,
@@ -600,8 +439,6 @@ public class MoolreController {
         }
 
         if (txStatus != TX_SUCCESS) {
-            // Unknown txstatus — treat as pending so the frontend keeps polling.
-            // Do not surface this as a terminal error; the transaction may still complete.
             log.warn("verifyPayment: unknown txstatus={} externalRef='{}' — treating as PENDING", txStatus, ref);
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
                     "credited", false,
@@ -610,13 +447,12 @@ public class MoolreController {
             )));
         }
 
-        // txstatus = 1 — credit wallet and attribute commission
+        // txstatus=1 — credit wallet and attribute commission
         var valueStr = resolveAmount(data, ref);
         var amount   = new BigDecimal(valueStr);
         var intent   = parts[0];
 
-        // Clean up cache on confirmed success
-        pendingCharges.remove(ref);
+        pendingCheckouts.remove(ref);
 
         boolean credited = UPGRADE_INTENT_ADMIN.equals(intent)
                 ? verifyAndHandleAdminUpgrade(user.getId(), ref, amount)
@@ -631,8 +467,13 @@ public class MoolreController {
         )));
     }
 
-    // ─── 5. Webhook ───────────────────────────────────────────────────────────
+    // ─── 4. Webhook (primary automatic credit path) ───────────────────────────
 
+    /**
+     * Moolre fires this endpoint after every successful payment.
+     * Verified by matching the `secret` field in the payload.
+     * This is the primary path for automatic wallet crediting.
+     */
     @PostMapping("/api/webhooks/moolre")
     public ResponseEntity<String> webhook(HttpServletRequest request) {
 
@@ -702,8 +543,8 @@ public class MoolreController {
                 return ResponseEntity.status(400).body("Invalid userId in externalref");
             }
 
-            // Clean up pending cache on webhook success
-            pendingCharges.remove(ref);
+            // Remove from auto-polling cache on webhook success
+            pendingCheckouts.remove(ref);
 
             if (UPGRADE_INTENT_ADMIN.equals(intent)) {
                 handleAdminUpgrade(userId, ref, amount);
@@ -722,6 +563,132 @@ public class MoolreController {
         return ResponseEntity.ok("OK");
     }
 
+    // ─── 5. Automatic Verification Scheduler ─────────────────────────────────
+
+    /**
+     * Polls Moolre for every pending checkout session every 30 seconds.
+     *
+     * This is the fallback automatic credit path for cases where the webhook
+     * was not received (network issues, Moolre delays, server restart after
+     * the user completed payment on the checkout page).
+     *
+     * Flow:
+     *   1. Iterate all entries in pendingCheckouts.
+     *   2. Skip sessions created less than 30 seconds ago (give webhook a chance first).
+     *   3. Remove sessions older than 30 minutes (TTL expired — too late to credit).
+     *   4. Call Moolre /open/transact/status for each remaining session.
+     *   5. On txstatus=1, credit wallet / handle admin upgrade immediately.
+     *   6. On txstatus=2 (failed), remove from cache.
+     *   7. On txstatus=0 or "not found", leave in cache for next cycle.
+     *
+     * Requires @EnableScheduling on a @Configuration class.
+     */
+    @Scheduled(fixedDelay = 30_000)
+    public void autoVerifyPendingCheckouts() {
+
+        if (pendingCheckouts.isEmpty()) return;
+
+        log.debug("autoVerify: scanning {} pending checkout session(s)", pendingCheckouts.size());
+
+        long now = System.currentTimeMillis();
+        List<String> toRemove = new ArrayList<>();
+
+        for (Map.Entry<String, PendingCheckout> entry : pendingCheckouts.entrySet()) {
+            var ref     = entry.getKey();
+            var session = entry.getValue();
+
+            long ageMs = now - session.createdAt();
+
+            // Too recent — let webhook handle it first
+            if (ageMs < 30_000) continue;
+
+            // TTL expired — stop polling
+            if (ageMs > PENDING_SESSION_TTL_MS) {
+                log.warn("autoVerify: session expired ({}ms old) — removing externalRef='{}'", ageMs, ref);
+                toRemove.add(ref);
+                continue;
+            }
+
+            try {
+                String queryId = (session.moolreTxId() != null && !session.moolreTxId().isBlank())
+                        ? session.moolreTxId()
+                        : ref;
+
+                log.info("autoVerify: checking externalRef='{}' queryId='{}'", ref, queryId);
+
+                var statusResponse = moolreCheckStatus(queryId);
+
+                @SuppressWarnings("unchecked")
+                var data = (Map<String, Object>) statusResponse.get("data");
+
+                // "Transaction not found" → still pending, leave in cache
+                var topMsg = String.valueOf(statusResponse.getOrDefault("message", "")).toLowerCase();
+                if (topMsg.contains("not found")) {
+                    log.debug("autoVerify: 'not found' response for externalRef='{}' — will retry", ref);
+                    continue;
+                }
+
+                if (data == null) {
+                    log.debug("autoVerify: no data in status response for externalRef='{}' — will retry", ref);
+                    continue;
+                }
+
+                var dataMsg = String.valueOf(data.getOrDefault("message", "")).toLowerCase();
+                if (dataMsg.contains("not found")) {
+                    log.debug("autoVerify: data.message 'not found' for externalRef='{}' — will retry", ref);
+                    continue;
+                }
+
+                int txStatus = Integer.parseInt(data.getOrDefault("txstatus", "-1").toString());
+
+                if (txStatus == TX_SUCCESS) {
+                    var valueStr = resolveAmount(data, ref);
+                    var amount   = new BigDecimal(valueStr);
+                    var parts    = ref.split("_", 3);
+
+                    if (parts.length < 3) {
+                        log.error("autoVerify: bad externalref format '{}' — removing", ref);
+                        toRemove.add(ref);
+                        continue;
+                    }
+
+                    var intent = parts[0];
+                    UUID userId;
+                    try {
+                        userId = UUID.fromString(parts[1]);
+                    } catch (IllegalArgumentException ex) {
+                        log.error("autoVerify: cannot parse userId from ref='{}' — removing", ref);
+                        toRemove.add(ref);
+                        continue;
+                    }
+
+                    log.info("autoVerify: txstatus=1 detected for externalRef='{}' — crediting userId='{}'", ref, userId);
+                    toRemove.add(ref);
+
+                    if (UPGRADE_INTENT_ADMIN.equals(intent)) {
+                        handleAdminUpgrade(userId, ref, amount);
+                    } else {
+                        handleDeposit(userId, ref, amount);
+                    }
+
+                } else if (txStatus == TX_FAILED) {
+                    log.info("autoVerify: payment failed/cancelled for externalRef='{}' — removing", ref);
+                    toRemove.add(ref);
+                } else {
+                    log.debug("autoVerify: still pending (txstatus={}) for externalRef='{}'", txStatus, ref);
+                }
+
+            } catch (Exception ex) {
+                log.error("autoVerify: error checking externalRef='{}' — will retry: {}", ref, ex.getMessage());
+            }
+        }
+
+        toRemove.forEach(pendingCheckouts::remove);
+        if (!toRemove.isEmpty()) {
+            log.info("autoVerify: removed {} resolved/expired session(s)", toRemove.size());
+        }
+    }
+
     // ─── Private — wallet handlers ────────────────────────────────────────────
 
     /**
@@ -731,13 +698,8 @@ public class MoolreController {
      * Commission structure:
      *   The referring admin earns a percentage of every deposit made by users
      *   they referred. The rate is stored on the Referral entity and defaults
-     *   to 70% of the platform commission (ADMIN_COMMISSION_RATE). Resolution
-     *   is handled entirely inside ReferralService.attributeCommission() —
-     *   this method just triggers it.
-     *
-     * Flow:
-     *   deposit amount → walletService.credit (user wallet)
-     *                  → referralService.attributeCommission (admin affiliate wallet)
+     *   to 70% (ADMIN_COMMISSION_RATE). Resolution is handled entirely inside
+     *   ReferralService.attributeCommission().
      */
     private boolean handleDeposit(UUID userId, String ref, BigDecimal amount) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}'", userId, amount, ref);
@@ -753,17 +715,13 @@ public class MoolreController {
             throw ex;
         }
 
-        // ── Attribute commission to referring admin based on commission structure ──
-        // The admin's rate (default 70%) is resolved from the Referral entity inside
-        // ReferralService. No rate logic lives here — just trigger attribution.
         try {
             referralService.attributeCommission(userId, amount);
             log.info("handleDeposit: commission attributed for userId='{}' deposit='{}' adminRate={}",
                     userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {
             // Never block a deposit because of a commission failure
-            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate",
-                    userId, ex);
+            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate", userId, ex);
         }
 
         return true;
@@ -779,14 +737,8 @@ public class MoolreController {
      * Steps:
      *   1. Validates amount >= GHS 200
      *   2. Promotes user to ADMIN + initialises their referral link at 70% commission
-     *      (rate is set inside UserService.upgradeToAdmin)
      *   3. Records an audit transaction (Moolre collected the funds externally)
      *   4. Creates onboarding chat with Super Admin to confirm/adjust the 70% rate
-     *
-     * Commission structure note:
-     *   Super Admin may negotiate a custom rate during the onboarding chat. Any
-     *   adjustment must be applied directly to the Referral entity — the rate
-     *   stored there is what ReferralService.attributeCommission() uses.
      */
     private boolean handleAdminUpgrade(UUID userId, String ref, BigDecimal amount) {
         log.info("handleAdminUpgrade: userId='{}' amount={} ref='{}'", userId, amount, ref);
@@ -798,7 +750,6 @@ public class MoolreController {
         }
 
         try {
-            // upgradeToAdmin sets the new admin's commission rate to 70% on the Referral entity
             userService.upgradeToAdmin(userId, ref);
             log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN with {}% commission ref='{}'",
                     userId, ADMIN_COMMISSION_RATE.multiply(BigDecimal.valueOf(100)).toPlainString(), ref);
@@ -810,12 +761,10 @@ public class MoolreController {
             throw ex;
         }
 
-        // Audit record — Moolre collected GHS 200 externally, no wallet debit needed
         walletService.recordExternalDebit(userId, amount, TxKind.ADMIN_UPGRADE_FEE, ref,
                 Map.of("provider", "moolre", "reference", ref));
         log.info("handleAdminUpgrade: audit tx recorded for userId='{}' ref='{}'", userId, ref);
 
-        // Create onboarding chat so Super Admin can confirm/adjust the 70% commission rate
         adminUpgradeChatService.createUpgradeChat(userId);
         log.info("handleAdminUpgrade: upgrade chat created for userId='{}'", userId);
 
@@ -829,71 +778,44 @@ public class MoolreController {
     // ─── Moolre API helpers ───────────────────────────────────────────────────
 
     /**
-     * Calls Moolre POST /open/transact/payment to initiate a USSD direct charge.
+     * Calls Moolre POST /open/checkout/initiate to create a hosted checkout session.
      *
-     * Phone must be in 0XXXXXXXXX format (e.g. "0244123456"). Moolre rejects
-     * the 233 country-code prefix — pass the number through as-is from the frontend.
+     * Moolre response (expected):
+     *   {
+     *     "status":  "1",
+     *     "message": "...",
+     *     "data": {
+     *       "id":          "<moolre-tx-uuid>",
+     *       "checkoutUrl": "https://checkout.moolre.com/pay/<session>",
+     *       ...
+     *     }
+     *   }
      *
-     * When otpCode is non-null, the `otpcode` field is included in the request body.
-     * Per Moolre docs, OTP submission re-calls the same /open/transact/payment
-     * endpoint with the original params + otpcode field.
+     * Returns a map containing "checkoutUrl" and "moolreTxId" for the caller.
      *
-     * OTP two-step flow:
-     *   Step A — call with otpcode → Moolre validates OTP, returns
-     *             status=1 + message="Phone no. Verification Successful." + data="all"
-     *   Step B — call WITHOUT otpcode (same externalref) → Moolre pushes the USSD
-     *             prompt to the user's handset and returns their internal TX UUID
-     *             in the `data` field.
-     *
-     * This method detects step-A success via isOtpVerifiedMessage() and
-     * automatically performs step B before returning.
-     *
-     * Moolre TX ID caching (NEW):
-     *   After step B, Moolre returns their internal transaction UUID in the `data`
-     *   field (either as a plain String or inside a Map). This UUID is stored in
-     *   the pendingCharges cache (pendingCharge.moolreTxId) and also returned in
-     *   the method result under the "moolreTxId" key.
-     *
-     *   This ID is the correct key for /open/transact/status — Moolre does NOT
-     *   index by externalref for status lookups. Using externalref returns
-     *   "Transaction not found" even after approval.
-     *
-     * On the first call (no OTP), charge params are cached in pendingCharges
-     * keyed by externalRef so /otp can reconstruct the full body later.
-     *
-     * Throws ActionRequiredException when Moolre returns status=1 with a message
-     * indicating the user must complete an SMS verification step first.
+     * @param amount      GHS amount for the checkout.
+     * @param externalRef Our reference string.
+     * @param email       Optional customer email for Moolre receipt.
      */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> moolreDirectCharge(
-            BigDecimal amount, String phone, String network, String externalRef, String otpCode) {
-
-        String channel = switch (network.toUpperCase()) {
-            case "MTN"        -> CHANNEL_MTN;
-            case "VODAFONE"   -> CHANNEL_VODAFONE;
-            case "AIRTELTIGO" -> CHANNEL_AIRTELTIGO;
-            default -> throw new RuntimeException("Unsupported network: " + network
-                    + ". Must be MTN, VODAFONE, or AIRTELTIGO.");
-        };
+    private Map<String, Object> moolreInitiateCheckout(
+            BigDecimal amount, String externalRef, String email) {
 
         var body = new java.util.LinkedHashMap<String, Object>();
-        body.put("type",          1);
-        body.put("channel",       channel);
-        body.put("currency",      "GHS");
-        body.put("payer",         phone);
         body.put("amount",        amount.toPlainString());
+        body.put("currency",      "GHS");
         body.put("externalref",   externalRef);
         body.put("accountnumber", accountNumber);
-        if (otpCode != null && !otpCode.isBlank()) {
-            body.put("otpcode", otpCode);
-            log.info("moolreDirectCharge: including otpcode for externalRef='{}'", externalRef);
+        body.put("callbackurl",   callbackUrl);
+        if (email != null && !email.isBlank()) {
+            body.put("email", email);
         }
 
-        log.info("moolreDirectCharge: calling /open/transact/payment — channel='{}' phone='{}' amount='{}' externalRef='{}' hasOtp={}",
-                channel, phone, amount, externalRef, otpCode != null && !otpCode.isBlank());
+        log.info("moolreInitiateCheckout: calling /open/checkout/initiate — amount='{}' externalRef='{}'",
+                amount, externalRef);
 
         String rawBody = webClientBuilder.build()
-                .post().uri(MOOLRE_BASE_URL + "/open/transact/payment")
+                .post().uri(MOOLRE_BASE_URL + "/open/checkout/initiate")
                 .header("X-API-USER",   apiUser)
                 .header("X-API-PUBKEY", publicKey)
                 .header("Content-Type", "application/json")
@@ -903,7 +825,7 @@ public class MoolreController {
                         status -> status.isError(),
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(b -> {
-                                    log.error("Moolre directCharge HTTP error: status={} body={}",
+                                    log.error("Moolre checkout HTTP error: status={} body={}",
                                             clientResponse.statusCode(), b);
                                     return new RuntimeException(
                                             "Moolre returned HTTP " + clientResponse.statusCode() + ": " + b);
@@ -913,195 +835,77 @@ public class MoolreController {
                 .onErrorMap(
                         ex -> !(ex instanceof RuntimeException),
                         ex -> {
-                            log.error("Moolre API unreachable during directCharge", ex);
+                            log.error("Moolre API unreachable during checkout initiate", ex);
                             return new RuntimeException("Moolre is currently unavailable. Please try again.");
                         }
                 )
                 .onErrorMap(
                         ex -> ex instanceof RuntimeException && ex.getMessage() == null,
                         ex -> {
-                            log.error("Moolre directCharge: RuntimeException with null message", ex);
+                            log.error("Moolre checkout: RuntimeException with null message", ex);
                             return new RuntimeException("Moolre is currently unavailable. Please try again.");
                         }
                 )
                 .block();
 
         if (rawBody == null || rawBody.isBlank())
-            throw new RuntimeException("Moolre returned an empty response.");
+            throw new RuntimeException("Moolre returned an empty checkout response.");
 
         Map<String, Object> result;
         try {
             result = (Map<String, Object>) objectMapper.readValue(rawBody, Map.class);
         } catch (Exception e) {
-            log.error("Moolre directCharge: non-JSON response body='{}'", rawBody);
-            throw new RuntimeException("Moolre returned an unexpected response. Please try again.");
+            log.error("Moolre checkout: non-JSON response body='{}'", rawBody);
+            throw new RuntimeException("Moolre returned an unexpected checkout response. Please try again.");
         }
 
         var status  = String.valueOf(result.get("status"));
         var message = String.valueOf(result.getOrDefault("message", ""));
 
-        log.info("moolreDirectCharge: status='{}' message='{}' externalRef='{}'",
+        log.info("moolreInitiateCheckout: status='{}' message='{}' externalRef='{}'",
                 status, message, externalRef);
 
-        // Safely coerce `data` — Moolre sometimes returns it as a plain String
-        // (notably the Moolre TX UUID after step B).
-        Map<String, Object> data;
-        Object rawData = result.get("data");
-        if (rawData instanceof Map) {
-            data = (Map<String, Object>) rawData;
-        } else {
-            data = new java.util.LinkedHashMap<>();
-            if (rawData != null && !rawData.toString().isBlank()) {
-                data.put("dataMessage", rawData.toString());
-                log.info("moolreDirectCharge: data field is a String (not Map): '{}'", rawData);
-            }
-        }
-
-        // Hard failure
         if (!"1".equals(status)) {
-            log.error("moolreDirectCharge: Moolre error status='{}' message='{}'", status, message);
-            throw new RuntimeException("Moolre error: " + message);
+            log.error("moolreInitiateCheckout: Moolre error status='{}' message='{}'", status, message);
+            throw new RuntimeException("Moolre checkout error: " + message);
         }
 
-        // ── OTP verified (step A) — Moolre confirmed the SMS code.
-        //    We must now make a second call WITHOUT otpcode (step B) to actually
-        //    push the USSD prompt to the user's handset.
-        if (!message.isBlank() && isOtpVerifiedMessage(message)) {
-            log.info("moolreDirectCharge: OTP verified ('{}') — triggering USSD push (step B) for externalRef='{}'",
-                    message, externalRef);
-            return moolreDirectCharge(amount, phone, network, externalRef, null);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = result.get("data") instanceof Map
+                ? (Map<String, Object>) result.get("data")
+                : new java.util.LinkedHashMap<>();
+
+        // Extract checkout URL — Moolre may return it as "checkoutUrl", "checkout_url", or "url"
+        String checkoutUrl = Stream.of("checkoutUrl", "checkout_url", "url")
+                .map(data::get)
+                .filter(v -> v != null && !v.toString().isBlank())
+                .map(Object::toString)
+                .findFirst()
+                .orElseThrow(() -> {
+                    log.error("moolreInitiateCheckout: no checkout URL in response data='{}' for externalRef='{}'",
+                            data, externalRef);
+                    return new RuntimeException(
+                            "Moolre did not return a checkout URL. Please try again.");
+                });
+
+        // Extract Moolre's internal TX UUID
+        String moolreTxId = Stream.of("id", "txid", "transactionId", "transaction_id")
+                .map(data::get)
+                .filter(v -> v != null && !v.toString().isBlank())
+                .map(Object::toString)
+                .findFirst()
+                .orElse("");
+
+        if (moolreTxId.isBlank()) {
+            log.warn("moolreInitiateCheckout: no Moolre TX ID in response for externalRef='{}' — status polling will use externalref",
+                    externalRef);
         }
 
-        // ── Action required (MTN SMS verification step) — OTP not yet submitted.
-        if (!message.isBlank() && isActionRequiredMessage(message)) {
-            // Cache charge params so /otp can re-call with same body + otpcode.
-            // moolreTxId is null at this stage — step B hasn't run yet.
-            if (otpCode == null || otpCode.isBlank()) {
-                pendingCharges.put(externalRef,
-                        new PendingCharge(amount, phone, network, externalRef, null));
-                log.info("moolreDirectCharge: cached pending charge for externalRef='{}'", externalRef);
-            }
-            log.warn("moolreDirectCharge: action-required message status='{}' message='{}'", status, message);
-            throw new ActionRequiredException(message);
-        }
-
-        // ── Step B success — Moolre returned their internal TX UUID in `data`.
-        //    Extract it and cache/update the pendingCharge entry so /verify can
-        //    query status by this UUID instead of the externalref.
-        //
-        //    Moolre returns the TX UUID either as:
-        //      • data = "<uuid-string>"   (plain String, stored in data.dataMessage)
-        //      • data = { "id": "<uuid>", ... }  (Map with an "id" key)
-        //    We capture whichever form is present.
-        String moolreTxId = extractMoolreTxId(rawData, data);
-        if (moolreTxId != null) {
-            // Update the cache entry (upsert — may not exist if /init had no OTP step)
-            pendingCharges.merge(externalRef,
-                    new PendingCharge(amount, phone, network, externalRef, moolreTxId),
-                    (existing, incoming) -> existing.withMoolreTxId(moolreTxId));
-            log.info("moolreDirectCharge: cached moolreTxId='{}' for externalRef='{}'", moolreTxId, externalRef);
-            data.put("moolreTxId", moolreTxId); // surface in return value
-        } else {
-            log.warn("moolreDirectCharge: step B completed but no Moolre TX UUID found in data for externalRef='{}'", externalRef);
-        }
-
-        if (!message.isBlank()) {
-            var mutable = new java.util.LinkedHashMap<>(data);
-            mutable.put("message", message);
-            return mutable;
-        }
-
-        return data;
-    }
-
-    /**
-     * Extracts Moolre's internal transaction UUID from the `data` field returned
-     * by step B of /open/transact/payment.
-     *
-     * Moolre returns the UUID in one of two forms:
-     *   • Plain String: data = "cb6fe586-cad5-4819-ba35-edce36b0abfe"
-     *     → stored in the coerced Map as data.dataMessage
-     *   • Map: data = { "id": "cb6fe586-...", ... }
-     *     → accessible via data.get("id")
-     *
-     * Returns null if no UUID-shaped value is found.
-     */
-    private static String extractMoolreTxId(Object rawData, Map<String, Object> data) {
-        // Case 1: plain String (most common for step B per observed responses)
-        if (rawData instanceof String s && isUuidShaped(s.trim())) {
-            return s.trim();
-        }
-        // Case 2: coerced dataMessage (set when rawData was a non-map String)
-        var dataMsg = data.get("dataMessage");
-        if (dataMsg instanceof String s && isUuidShaped(s.trim())) {
-            return s.trim();
-        }
-        // Case 3: Map with "id" key
-        var idField = data.get("id");
-        if (idField instanceof String s && isUuidShaped(s.trim())) {
-            return s.trim();
-        }
-        return null;
-    }
-
-    /** Returns true if the string looks like a UUID (8-4-4-4-12 hex). */
-    private static boolean isUuidShaped(String s) {
-        if (s == null || s.length() != 36) return false;
-        try {
-            UUID.fromString(s);
-            return true;
-        } catch (IllegalArgumentException e) {
-            return false;
-        }
-    }
-
-    /**
-     * Resolves Moolre's internal TX UUID to surface in API responses.
-     * Checks the charge result map first, then falls back to the pendingCharges cache.
-     * Returns null if not yet available (e.g. actionRequired=true, step B not run).
-     */
-    private String resolveMoolreTxId(String externalRef, Map<String, Object> chargeResult) {
-        // Prefer value set directly in the charge result by moolreDirectCharge
-        var fromResult = chargeResult.get("moolreTxId");
-        if (fromResult instanceof String s && !s.isBlank()) return s;
-
-        // Fall back to cache
-        var pending = pendingCharges.get(externalRef);
-        if (pending != null && pending.moolreTxId() != null && !pending.moolreTxId().isBlank()) {
-            return pending.moolreTxId();
-        }
-
-        return null;
-    }
-
-    /**
-     * Returns true if Moolre's response confirms the OTP was accepted.
-     * After this, the USSD prompt hasn't been pushed yet — a second call
-     * to /open/transact/payment WITHOUT otpcode is required (step B).
-     * Known responses: "Phone no. Verification Successful." / data = "all"
-     */
-    private static boolean isOtpVerifiedMessage(String message) {
-        if (message == null) return false;
-        String lower = message.toLowerCase();
-        return lower.contains("verification successful")
-                || lower.contains("phone no. verification")
-                || lower.contains("otp verified")
-                || lower.contains("code verified");
-    }
-
-    /**
-     * Returns true if the Moolre message indicates the subscriber must complete
-     * an SMS-based verification step before the USSD prompt is sent.
-     */
-    private static boolean isActionRequiredMessage(String message) {
-        if (message == null) return false;
-        String lower = message.toLowerCase();
-        return lower.contains("verification process")
-                || lower.contains("complete the verification")
-                || lower.contains("sim registration")
-                || lower.contains("register your sim")
-                || lower.contains("try again")
-                || lower.contains("not eligible");
+        return Map.of(
+                "checkoutUrl", checkoutUrl,
+                "moolreTxId",  moolreTxId,
+                "message",     message
+        );
     }
 
     /**
@@ -1109,8 +913,7 @@ public class MoolreController {
      *
      * @param queryId Moolre's internal TX UUID (preferred) or our externalref (fallback).
      *                Always pass the Moolre UUID when available — Moolre indexes by UUID,
-     *                not externalref. Querying by externalref returns "Transaction not found"
-     *                even after the USSD has been approved.
+     *                not externalref.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> moolreCheckStatus(String queryId) {
@@ -1194,4 +997,5 @@ public class MoolreController {
                 incomingSecret.getBytes(StandardCharsets.UTF_8)
         );
     }
+
 }
