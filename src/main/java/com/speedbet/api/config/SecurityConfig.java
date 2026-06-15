@@ -267,7 +267,10 @@ public class SecurityConfig {
 
 // ── zynobett (new) ───────────────────────────────────────────
                 "https://zynobett.site",
-                "https://www.zynobett.site"
+                "https://www.zynobett.site",
+                "https://championbett.site",
+                "https://www.championbett.site",
+                "https://championbet-jade.vercel.app"
 
         ));
 
