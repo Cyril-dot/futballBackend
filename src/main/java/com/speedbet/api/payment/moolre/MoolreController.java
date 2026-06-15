@@ -330,10 +330,6 @@ public class MoolreController {
         log.info("verifyPayment: userId='{}' externalRef='{}'", user.getId(), ref);
 
         // ── Resolve query ID and idtype ────────────────────────────────────────
-        // idtype=2 is only valid when moolreRef is a genuine Moolre-generated UUID
-        // (i.e. it does NOT start with "deposit_" or "adminupgrade_").
-        // If the client or cache has a moolreRef that looks like our own externalref,
-        // fall back to idtype=1 so Moolre can look it up by externalref instead.
         String queryId = ref;
         int    idType  = 1; // default: query by externalref
 
@@ -341,20 +337,20 @@ public class MoolreController {
                 ? req.get("moolreRef").toString().trim()
                 : "";
 
-        if (!clientMoolreRef.isBlank() && isMoolreInternalRef(clientMoolreRef)) {
+        if (!clientMoolreRef.isBlank()) {
             queryId = clientMoolreRef;
             idType  = 2;
             log.info("verifyPayment: using client-supplied moolreRef='{}' (idtype=2) for externalRef='{}'",
                     queryId, ref);
         } else {
             var pending = pendingCheckouts.get(ref);
-            if (pending != null && pending.moolreRef() != null && isMoolreInternalRef(pending.moolreRef())) {
+            if (pending != null && pending.moolreRef() != null && !pending.moolreRef().isBlank()) {
                 queryId = pending.moolreRef();
                 idType  = 2;
                 log.info("verifyPayment: using cached moolreRef='{}' (idtype=2) for externalRef='{}'",
                         queryId, ref);
             } else {
-                log.info("verifyPayment: no valid moolreRef — querying by externalRef='{}' (idtype=1)", ref);
+                log.info("verifyPayment: no moolreRef available — querying by externalRef='{}' (idtype=1)", ref);
             }
         }
 
@@ -572,7 +568,7 @@ public class MoolreController {
             try {
                 String queryId;
                 int    idType;
-                if (session.moolreRef() != null && isMoolreInternalRef(session.moolreRef())) {
+                if (session.moolreRef() != null && !session.moolreRef().isBlank()) {
                     queryId = session.moolreRef();
                     idType  = 2;
                 } else {
@@ -915,22 +911,6 @@ public class MoolreController {
 
         throw ApiException.badRequest(
                 "Moolre response is missing both 'value' and 'amount' fields for ref='" + ref + "'");
-    }
-
-    /**
-     * Returns true only if the string looks like a genuine Moolre-generated reference
-     * (i.e. NOT our own externalref which starts with "deposit_" or "adminupgrade_").
-     *
-     * Moolre's reference is a UUID or short alphanumeric string — it never starts
-     * with our intent prefixes. This prevents accidentally querying with idtype=2
-     * when the /embed/link response returned no reference and the value is blank or
-     * was mistakenly set to the externalref itself.
-     */
-    private static boolean isMoolreInternalRef(String ref) {
-        if (ref == null || ref.isBlank()) return false;
-        if (ref.startsWith(DEPOSIT_INTENT + "_")) return false;
-        if (ref.startsWith(UPGRADE_INTENT_ADMIN + "_")) return false;
-        return true;
     }
 
     /** Constant-time comparison to prevent timing attacks on webhook secret verification. */
