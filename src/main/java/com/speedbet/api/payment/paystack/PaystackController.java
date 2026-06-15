@@ -20,13 +20,14 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
-import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.util.retry.Retry;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.UUID;
@@ -47,6 +48,16 @@ public class PaystackController {
      * This constant is for logging/documentation purposes only.
      */
     private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
+
+    /** How long to wait for Paystack to respond before timing out. */
+    private final Duration paystackTimeout = Duration.ofSeconds(10);
+
+    /**
+     * How many times to retry on transient network failures (e.g. "Connection reset
+     * by peer"). Does NOT retry on Paystack 4xx/5xx — those are mapped to a
+     * RuntimeException by the onStatus handler and are therefore excluded from retry.
+     */
+    private final long paystackRetryAttempts = 2;
 
     private final WalletService           walletService;
     private final UserService             userService;
@@ -286,8 +297,12 @@ public class PaystackController {
      * Calls Paystack /transaction/initialize and returns the FULL response map:
      *   { "status": true, "message": "...", "data": { "authorization_url": "...", "reference": "..." } }
      *
-     * Errors (4xx/5xx, network timeouts, bad secret key) are surfaced as
-     * exceptions rather than silently returning status=false.
+     * Resilience:
+     *   - Times out after 10 seconds so the caller thread is never held indefinitely.
+     *   - Retries up to 2 times on transient network
+     *     errors (e.g. "Connection reset by peer", TCP timeout). Retries do NOT fire
+     *     on Paystack 4xx/5xx responses — those are mapped to RuntimeException by the
+     *     onStatus handler, which excludes them from the retry predicate.
      *
      * The frontend unwraps the nested `data` object itself:
      *   const inner = raw?.data ?? raw;
@@ -321,10 +336,19 @@ public class PaystackController {
                                 })
                 )
                 .bodyToMono(Map.class)
+                // Fail fast: don't hold a thread longer than paystackTimeout.
+                // TimeoutException is a network-level error and will be picked up by retry.
+                .timeout(paystackTimeout)
+                // Retry on transient network failures only (e.g. "Connection reset by peer",
+                // TCP timeout). RuntimeExceptions thrown directly by the onStatus handler
+                // (Paystack 4xx/5xx) have no wrapped cause, so they are excluded by the
+                // filter and surface immediately without retrying.
+                .retryWhen(Retry.max(paystackRetryAttempts)
+                        .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
                 .onErrorMap(
                         ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
                         ex -> {
-                            log.error("Paystack API unreachable", ex);
+                            log.error("Paystack API unreachable after {} retries", paystackRetryAttempts, ex);
                             return new RuntimeException("Paystack is currently unavailable. Please try again.");
                         }
                 )
