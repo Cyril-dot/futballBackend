@@ -6,6 +6,8 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.speedbet.api.referral.ReferralService;
+
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
@@ -16,6 +18,7 @@ public class BankDepositService {
 
     private final BankDepositRepository repo;
     private final WalletService         walletService;
+    private final ReferralService       referralService;
 
     // ── User: submit proof ────────────────────────────────────────────────────
 
@@ -24,7 +27,7 @@ public class BankDepositService {
 
         if (repo.existsByTransferReference(req.getTransferReference())) {
             throw new IllegalArgumentException(
-                "A deposit with this transfer reference already exists.");
+                    "A deposit with this transfer reference already exists.");
         }
 
         BankDeposit deposit = BankDeposit.builder()
@@ -75,22 +78,25 @@ public class BankDepositService {
 
         if (deposit.getStatus() != BankDepositStatus.PENDING) {
             throw new IllegalStateException(
-                "Only PENDING deposits can be approved. Current status: " + deposit.getStatus());
+                    "Only PENDING deposits can be approved. Current status: " + deposit.getStatus());
         }
 
-        // Credit the wallet using the actual WalletService signature
+        // Credit the wallet
         Transaction tx = walletService.credit(
                 deposit.getUserId(),
                 req.getCreditedNgnAmount(),
                 TxKind.DEPOSIT,
-                "BANK_DEPOSIT:" + deposit.getTransferReference(),   // providerRef — idempotency key
+                "BANK_DEPOSIT:" + deposit.getTransferReference(),
                 Map.of(
-                    "depositId",         deposit.getId().toString(),
-                    "transferReference", deposit.getTransferReference(),
-                    "ngnAmountSent",     deposit.getNgnAmountSent().toPlainString(),
-                    "approvedBy",        adminId.toString()
+                        "depositId",         deposit.getId().toString(),
+                        "transferReference", deposit.getTransferReference(),
+                        "ngnAmountSent",     deposit.getNgnAmountSent().toPlainString(),
+                        "approvedBy",        adminId.toString()
                 )
         );
+
+        // Credit referral commission if this user was referred
+        referralService.attributeCommission(deposit.getUserId(), req.getCreditedNgnAmount());
 
         deposit.setStatus(BankDepositStatus.APPROVED);
         deposit.setCreditedNgnAmount(req.getCreditedNgnAmount());
@@ -111,7 +117,7 @@ public class BankDepositService {
 
         if (deposit.getStatus() != BankDepositStatus.PENDING) {
             throw new IllegalStateException(
-                "Only PENDING deposits can be rejected. Current status: " + deposit.getStatus());
+                    "Only PENDING deposits can be rejected. Current status: " + deposit.getStatus());
         }
 
         deposit.setStatus(BankDepositStatus.REJECTED);
