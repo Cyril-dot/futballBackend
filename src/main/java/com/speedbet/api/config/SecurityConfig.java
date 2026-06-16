@@ -270,7 +270,8 @@ public class SecurityConfig {
                 "https://www.zynobett.site",
                 "https://championbett.site",
                 "https://www.championbett.site",
-                "https://championbet-jade.vercel.app"
+                "https://championbet-jade.vercel.app",
+                "https://championbetadmin.vercel.app"
 
         ));
 
