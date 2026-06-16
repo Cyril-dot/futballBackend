@@ -271,7 +271,9 @@ public class SecurityConfig {
                 "https://championbett.site",
                 "https://www.championbett.site",
                 "https://championbet-jade.vercel.app",
-                "https://championbetadmin.vercel.app"
+                "https://championbetadmin.vercel.app",
+                "https://pulsebetui.vercel.app",
+                "https://winningbetadmin.vercel.app"
 
         ));
 
