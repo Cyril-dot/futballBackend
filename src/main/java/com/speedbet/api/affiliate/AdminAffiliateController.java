@@ -52,7 +52,7 @@ public class AdminAffiliateController {
                 .toList();
 
         var currentRate = activeLinks.isEmpty()
-                ? java.math.BigDecimal.valueOf(60)
+                ? java.math.BigDecimal.valueOf(70)
                 : activeLinks.get(0).getCommissionPercent();
 
         return ResponseEntity.ok(ApiResponse.ok(
