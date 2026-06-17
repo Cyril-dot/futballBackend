@@ -277,7 +277,12 @@ public class SecurityConfig {
                 // ── pulsebett ─────────────────────────────────────────────
                 "https://pulsebett.site",
                 "https://www.pulsebett.site",
-                "https://pulsebetui.vercel.app"
+                "https://pulsebetui.vercel.app",
+                // ── pulsebett ─────────────────────────────────────────────
+                "https://pulsebett.site",
+                "https://www.pulsebett.site",
+                "https://pulsebetui.vercel.app",
+                "https://pulsebetadmin.vercel.app"
 
         ));
 
