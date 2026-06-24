@@ -19,6 +19,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 @Slf4j
@@ -29,6 +30,10 @@ public class BookingService {
     private static final String CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     private static final int CODE_LENGTH = 8;
     private static final SecureRandom RANDOM = new SecureRandom();
+
+    // Statuses for which a match's outcome is already known (fully or partially)
+    // and a selection on it must NOT be staked on anymore.
+    private static final Set<String> NON_STAKEABLE_STATUSES = Set.of("LIVE", "FINISHED");
 
     private final BookingCodeRepository bookingRepo;
     private final MatchRepository matchRepo;
@@ -172,9 +177,30 @@ public class BookingService {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // REDEEM  (unchanged except redundant cast removed)
+    // REDEEM
     // ══════════════════════════════════════════════════════════════════════
 
+    /**
+     * FIX: redemption now checks the live status of every underlying match
+     * BEFORE incrementing the redemption count or returning a payout.
+     *
+     * Previously this method only validated the booking code's own
+     * status/expiry/redemption-count fields. It never looked at whether the
+     * matches referenced by the selections had already gone LIVE or
+     * FINISHED. That meant:
+     *   1. A user could redeem a code referencing a finished match, and
+     *      since the result was already known, the slip would settle as a
+     *      guaranteed win — a free-money exploit.
+     *   2. Enrichment silently dropped data for matches whose state had
+     *      changed, so the slip looked broken/empty for the user instead of
+     *      clearly showing "match finished, can no longer be staked".
+     *
+     * Now: any selection whose match is LIVE or FINISHED blocks the entire
+     * redemption with a clear 400 error naming the offending fixture, and
+     * enrichment always surfaces matchStatus (even for matches with no
+     * stake-eligible odds left) so the UI can render the slip correctly
+     * instead of silently failing.
+     */
     @Transactional
     public RedeemResponse redeem(String code) {
         log.info("redeemBookingCode: code={}", code);
@@ -189,6 +215,10 @@ public class BookingService {
         if (booking.getMaxRedemptions() != null &&
                 booking.getRedemptionCount() >= booking.getMaxRedemptions())
             throw ApiException.badRequest("Booking code has reached max redemptions");
+
+        // NEW: block staking on any selection whose match has already gone
+        // live or finished — the outcome is (partially or fully) known.
+        validateMatchesAreStakeable(booking.getSelections());
 
         booking.setRedemptionCount(booking.getRedemptionCount() + 1);
         bookingRepo.save(booking);
@@ -212,6 +242,9 @@ public class BookingService {
                     enriched.put("homeTeam", m.getHomeTeam());
                     enriched.put("awayTeam", m.getAwayTeam());
                     enriched.put("league", m.getLeague());
+                    // NEW: always surface match status so the client can show
+                    // "finished" / "live" state instead of a blank/broken slip.
+                    enriched.put("matchStatus", m.getStatus());
                     oddsRepo.findByMatchIdAndMarketAndSelection(
                             matchId,
                             marketRaw.toString(),
@@ -290,6 +323,41 @@ public class BookingService {
                         "Fixture " + fixtureId + " does not belong to your account.");
 
             // MatchSource.EXTERNAL — no ownership check needed
+        }
+    }
+
+    /**
+     * NEW. Blocks redemption of any selection whose match has already gone
+     * LIVE or FINISHED. Match.status is a free-form String column ("UPCOMING",
+     * "LIVE", "FINISHED", ...), so we compare against NON_STAKEABLE_STATUSES.
+     *
+     * A missing fixture_id or unknown match is also rejected — redeeming a
+     * slip that references a fixture we can no longer find is not safe to
+     * pay out on either.
+     *
+     * Called exclusively by {@link #redeem}.
+     */
+    private void validateMatchesAreStakeable(List<Map<String, Object>> selections) {
+        for (var sel : selections) {
+            Object fixtureIdRaw = sel.get("fixture_id");
+            if (fixtureIdRaw == null)
+                throw ApiException.badRequest("Selection missing fixture_id — cannot redeem");
+
+            UUID matchId;
+            try {
+                matchId = UUID.fromString(fixtureIdRaw.toString());
+            } catch (IllegalArgumentException e) {
+                throw ApiException.badRequest("Invalid fixture_id: " + fixtureIdRaw);
+            }
+
+            Match match = matchRepo.findById(matchId)
+                    .orElseThrow(() -> ApiException.badRequest("Fixture not found: " + matchId));
+
+            if (NON_STAKEABLE_STATUSES.contains(match.getStatus()))
+                throw ApiException.badRequest(
+                        "This booking code can no longer be redeemed — fixture "
+                                + matchId + " (" + match.getHomeTeam() + " vs " + match.getAwayTeam()
+                                + ") is " + match.getStatus().toLowerCase() + ".");
         }
     }
 
