@@ -689,6 +689,7 @@ public class PaystackMobileMoneyController {
             throw new RuntimeException("Paystack returned an empty response.");
         }
 
+        log.info("[MoMo][checkPendingCharge] Raw response — ref='{}' result='{}'", reference, result);
         return result;
     }
 
