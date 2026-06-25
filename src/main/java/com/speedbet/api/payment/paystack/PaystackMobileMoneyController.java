@@ -45,17 +45,17 @@ import java.util.UUID;
  *     before being sent to Paystack. Strip +233 or 233 prefix if present.
  *   - Possible data.status values after POST /charge:
  *       "pay_offline"  — customer must approve push prompt on their phone (most common)
- *       "pending"      — Paystack is processing; poll or wait for webhook
+ *       "pending"      — Paystack is processing; poll GET /charge/:ref after 10s
  *       "send_otp"     — provider requires OTP; call POST /charge/submit_otp
  *       "success"      — charged immediately (rare for MoMo)
  *       "failed"       — charge was declined
  *   - Final confirmation arrives via charge.success webhook on the "mobile_money"
- *     channel. If it doesn't land within ~180s, fall back to verifyMomoCharge.
+ *     channel. If it doesn't land within ~180s, fall back to checkPendingCharge.
+ *   - IMPORTANT: Use GET /charge/:reference (not GET /transaction/verify/:reference)
+ *     to poll the status of a Charge API transaction. The transaction/verify endpoint
+ *     returns "abandoned" for in-progress charge-based flows and must NOT be used here.
  *   - No direct recurring/returning-customer charges — every attempt starts
  *     a brand new transaction.
- *
- * This controller only handles wallet deposits. Mirror handleAdminUpgrade()
- * from PaystackController if Mobile Money ever needs to support admin upgrades.
  */
 @Slf4j
 @RestController
@@ -69,7 +69,7 @@ public class PaystackMobileMoneyController {
      * Ghana network prefixes (local format, after stripping country code).
      * Used to warn early if the wrong number is passed for the chosen provider.
      */
-    private static final Set<String> MTN_GH_PREFIXES = Set.of("024", "054", "055", "059");
+    private static final Set<String> MTN_GH_PREFIXES = Set.of("024", "025", "053", "054", "055", "059");
     private static final Set<String> ATL_GH_PREFIXES = Set.of("026", "027", "056", "057");
     private static final Set<String> VOD_GH_PREFIXES = Set.of("020", "050");
 
@@ -203,12 +203,9 @@ public class PaystackMobileMoneyController {
                         "data.status='{}' display_text='{}'",
                 user.getId(), ref, dataStatus, displayText);
 
-        // Log the full Paystack data block at DEBUG so it's available when diagnosing issues
-        // without cluttering INFO logs in normal operation
         log.debug("[MoMo][initMomoDeposit] Full Paystack data block — userId='{}' data='{}'",
                 user.getId(), data);
 
-        // Warn on unexpected statuses so we catch new Paystack behavior early
         if (!Set.of("pay_offline", "pending", "send_otp", "success", "failed")
                 .contains(String.valueOf(dataStatus))) {
             log.warn("[MoMo][initMomoDeposit] UNEXPECTED data.status='{}' from Paystack for " +
@@ -259,7 +256,6 @@ public class PaystackMobileMoneyController {
         var otp       = rawOtp.toString().trim();
         var reference = rawRef.toString().trim();
 
-        // Sanitize OTP length just in case (Paystack OTPs are typically 6 digits)
         if (otp.length() > 10) {
             log.warn("[MoMo][submitOtp] Suspiciously long OTP length={} for userId='{}' ref='{}'",
                     otp.length(), user.getId(), reference);
@@ -290,15 +286,22 @@ public class PaystackMobileMoneyController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    // ─── Manual Verification (fallback if webhook hasn't landed) ──────────────
+    // ─── Check Pending Charge (Charge API status poll) ────────────────────────
 
     /**
-     * Polls Paystack GET /transaction/verify/:reference for the current status of
-     * a Mobile Money transaction.
+     * Polls Paystack GET /charge/:reference for the current status of a MoMo charge.
+     *
+     * *** IMPORTANT ***
+     * This MUST use GET /charge/:reference — NOT GET /transaction/verify/:reference.
+     * The /transaction/verify endpoint is only correct for Popup/Redirect flows.
+     * For Charge API flows (like MoMo), /transaction/verify returns "abandoned" even
+     * when the charge is still pending or was just completed via OTP — use /charge/:ref.
+     *
+     * Per Paystack docs: when you get "pending" from any /charge endpoint, wait at
+     * least 10 seconds before polling here to avoid a flood of pending responses.
      *
      * Use this as a frontend fallback when the charge.success webhook is delayed
-     * past the customer's ~180-second authorization window. Poll every 5-10s and
-     * show the customer the result once data.status is "success" or "failed".
+     * past the customer's ~180-second authorization window.
      *
      * Wallet crediting NEVER happens here — only the webhook handler does that.
      * This is purely a read-only status check.
@@ -313,9 +316,11 @@ public class PaystackMobileMoneyController {
 
         Map<String, Object> response;
         try {
-            response = verifyTransaction(reference);
+            // FIX: was calling /transaction/verify/:reference which incorrectly returns
+            // "abandoned" for Charge API flows. Must use /charge/:reference instead.
+            response = checkPendingCharge(reference);
         } catch (Exception e) {
-            log.error("[MoMo][verifyMomoCharge] Paystack verify FAILED — userId='{}' ref='{}' — {}",
+            log.error("[MoMo][verifyMomoCharge] Paystack /charge check FAILED — userId='{}' ref='{}' — {}",
                     user.getId(), reference, e.getMessage(), e);
             throw e;
         }
@@ -330,7 +335,7 @@ public class PaystackMobileMoneyController {
                         "amount='{}' channel='{}'",
                 user.getId(), reference, txStatus, txAmount, txChannel);
 
-        log.debug("[MoMo][verifyMomoCharge] Full Paystack verify response — userId='{}' data='{}'",
+        log.debug("[MoMo][verifyMomoCharge] Full Paystack charge response — userId='{}' data='{}'",
                 user.getId(), data);
 
         return ResponseEntity.ok(ApiResponse.ok(response));
@@ -492,7 +497,6 @@ public class PaystackMobileMoneyController {
             log.info("[MoMo][handleDeposit] Commission attributed for userId='{}' depositGHS={}",
                     userId, amount);
         } catch (Exception ex) {
-            // Commission failure must NEVER roll back or block the deposit
             log.error("[MoMo][handleDeposit] Commission attribution FAILED for userId='{}' " +
                             "depositGHS={} — INVESTIGATE: {}",
                     userId, amount, ex.getMessage(), ex);
@@ -505,13 +509,6 @@ public class PaystackMobileMoneyController {
 
     /**
      * Calls Paystack POST /charge with a mobile_money payload.
-     *
-     * Returns the full response:
-     *   { "status": true, "message": "Charge attempted",
-     *     "data": { "reference": "...", "status": "pay_offline", "display_text": "..." } }
-     *
-     * Resilience: 10s timeout, 2 retries on transient network errors only.
-     * Paystack 4xx/5xx throw RuntimeException and are NOT retried.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> paystackMomoCharge(String email, int amountPesewas,
@@ -585,8 +582,6 @@ public class PaystackMobileMoneyController {
      * Calls Paystack POST /charge/submit_otp.
      *
      * Used when the initial /charge response has data.status == "send_otp".
-     * After the customer enters the OTP on the frontend, call this to advance
-     * the charge. The response has the same shape as the /charge response.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> paystackSubmitOtp(String otp, String reference) {
@@ -645,24 +640,28 @@ public class PaystackMobileMoneyController {
     }
 
     /**
-     * Calls Paystack GET /transaction/verify/:reference.
-     * Used as a fallback when the charge.success webhook hasn't arrived
-     * after the 180-second authorization window.
+     * Calls Paystack GET /charge/:reference to check the current status of a charge.
+     *
+     * *** USE THIS — NOT /transaction/verify/:reference ***
+     * The /transaction/verify endpoint is for Popup/Redirect flows only and returns
+     * "abandoned" for Charge API MoMo transactions that are still in progress.
+     * Per Paystack docs, always wait >= 10 seconds after a "pending" status before
+     * polling here to avoid excessive pending responses.
      */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> verifyTransaction(String reference) {
+    private Map<String, Object> checkPendingCharge(String reference) {
 
-        log.debug("[MoMo][verifyTransaction] Calling Paystack /transaction/verify/'{}' ", reference);
+        log.debug("[MoMo][checkPendingCharge] Calling Paystack GET /charge/'{}' ", reference);
 
         var result = (Map<String, Object>) webClientBuilder.build()
-                .get().uri(baseUrl + "/transaction/verify/" + reference)
+                .get().uri(baseUrl + "/charge/" + reference)   // ← THE FIX: was /transaction/verify/
                 .header("Authorization", "Bearer " + secretKey)
                 .retrieve()
                 .onStatus(
                         status -> status.isError(),
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(body -> {
-                                    log.error("[MoMo][verifyTransaction] HTTP error from Paystack — " +
+                                    log.error("[MoMo][checkPendingCharge] HTTP error from Paystack — " +
                                                     "status={} body='{}' ref='{}'",
                                             clientResponse.statusCode(), body, reference);
                                     return new RuntimeException(
@@ -676,7 +675,7 @@ public class PaystackMobileMoneyController {
                 .onErrorMap(
                         ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
                         ex -> {
-                            log.error("[MoMo][verifyTransaction] Paystack unreachable after {} retries — ref='{}'",
+                            log.error("[MoMo][checkPendingCharge] Paystack unreachable after {} retries — ref='{}'",
                                     paystackRetryAttempts, reference, ex);
                             return new RuntimeException(
                                     "Paystack is currently unavailable. Please try again.");
@@ -685,7 +684,7 @@ public class PaystackMobileMoneyController {
                 .block();
 
         if (result == null) {
-            log.error("[MoMo][verifyTransaction] Paystack returned null/empty response for ref='{}'",
+            log.error("[MoMo][checkPendingCharge] Paystack returned null/empty response for ref='{}'",
                     reference);
             throw new RuntimeException("Paystack returned an empty response.");
         }
@@ -698,16 +697,8 @@ public class PaystackMobileMoneyController {
     /**
      * Normalizes a Ghana phone number to the local 10-digit format Paystack
      * expects for Ghana MoMo (0XXXXXXXXX).
-     *
-     * Handles:
-     *   "+233XXXXXXXXX" (12 chars after stripping +) → strip "+233", prepend "0"
-     *   "233XXXXXXXXX"  (11 chars)                   → strip "233",  prepend "0"
-     *   "0XXXXXXXXX"    (10 chars)                   → unchanged
-     *
-     * Throws ApiException.badRequest if the result isn't exactly 10 digits.
      */
     private String normalizeGhanaPhone(String raw) {
-        // Strip all whitespace and dashes
         var digits = raw.replaceAll("[\\s\\-]", "");
 
         if (digits.startsWith("+233")) {
@@ -735,8 +726,7 @@ public class PaystackMobileMoneyController {
 
     /**
      * Logs a warning if the phone prefix doesn't match the declared provider.
-     * Does NOT throw — Paystack is the final authority; this is just an early
-     * signal to help debug mismatches in the logs.
+     * Does NOT throw — Paystack is the final authority.
      */
     private void validateProviderPrefix(String phone, String provider) {
         var prefix = phone.substring(0, 3);
