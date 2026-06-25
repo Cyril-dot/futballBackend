@@ -39,9 +39,10 @@ import java.util.UUID;
  * Notes (per Paystack docs):
  *   - Hits POST /charge directly (not /transaction/initialize) — there's no
  *     redirect/authorization_url. The customer authorizes on their phone.
- *   - Currency is GHS, amount in pesewas — same convention as the card flow
- *     in PaystackController.
+ *   - Currency is GHS, amount in pesewas (1 GHS = 100 pesewas).
  *   - Supported Ghana providers: MTN ("mtn"), AirtelTigo ("atl"), Telecel ("vod").
+ *   - Phone numbers are normalized to local Ghana format (0XXXXXXXXX, 10 digits)
+ *     before being sent to Paystack. Strip +233 or 233 prefix if present.
  *   - The initial response has data.status == "pay_offline" with a
  *     data.display_text to show the customer. They must approve within
  *     180 seconds (a network-provider limitation, not configurable).
@@ -62,6 +63,14 @@ public class PaystackMobileMoneyController {
     /** Paystack's character codes for Ghana mobile money providers. */
     private static final Set<String> VALID_GH_PROVIDERS = Set.of("mtn", "atl", "vod");
 
+    /**
+     * MTN Ghana prefixes (local format, after stripping country code).
+     * Used to warn early if the wrong number is passed for the "mtn" provider.
+     */
+    private static final Set<String> MTN_GH_PREFIXES  = Set.of("024", "054", "055", "059");
+    private static final Set<String> ATL_GH_PREFIXES  = Set.of("026", "027", "056", "057");
+    private static final Set<String> VOD_GH_PREFIXES  = Set.of("020", "050");
+
     /** How long to wait for Paystack to respond before timing out. */
     private final Duration paystackTimeout = Duration.ofSeconds(10);
 
@@ -77,9 +86,9 @@ public class PaystackMobileMoneyController {
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
 
-    @Value("${app.paystack.secret-key}")             private String     secretKey;
-    @Value("${app.paystack.base-url}")               private String     baseUrl;
-    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
+    @Value("${app.paystack.secret-key}")            private String     secretKey;
+    @Value("${app.paystack.base-url}")              private String     baseUrl;
+    @Value("${app.platform.min-deposit-amount:1}")  private BigDecimal minDeposit;
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
@@ -89,31 +98,45 @@ public class PaystackMobileMoneyController {
      * verification) and data.display_text (show this to the customer).
      *
      * Expects req to contain: amount, phone, provider (one of "mtn", "atl", "vod").
+     *
+     * Phone normalization:
+     *   "+233XXXXXXXXX" → "0XXXXXXXXX"
+     *   "233XXXXXXXXX"  → "0XXXXXXXXX"
+     *   "0XXXXXXXXX"    → "0XXXXXXXXX"  (already correct, left as-is)
      */
     @PostMapping("/api/wallet/deposit/paystack-momo/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initMomoDeposit(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
+        // ── Amount ────────────────────────────────────────────────────────────
         var amount = new BigDecimal(req.get("amount").toString());
         if (amount.compareTo(minDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
 
-        var phone = String.valueOf(req.get("phone"));
-        if (phone == null || phone.isBlank())
+        // ── Phone ─────────────────────────────────────────────────────────────
+        var rawPhone = String.valueOf(req.get("phone")).trim();
+        if (rawPhone.isBlank() || rawPhone.equals("null"))
             throw ApiException.badRequest("Phone number is required.");
 
-        var provider = String.valueOf(req.get("provider"));
+        var phone = normalizeGhanaPhone(rawPhone);
+
+        // ── Provider ──────────────────────────────────────────────────────────
+        var provider = String.valueOf(req.get("provider")).trim().toLowerCase();
         if (!VALID_GH_PROVIDERS.contains(provider))
             throw ApiException.badRequest(
                     "Unsupported provider '" + provider + "'. Use one of: mtn, atl, vod.");
 
+        // Warn (don't block) if the number prefix doesn't match the chosen provider
+        validateProviderPrefix(phone, provider);
+
+        // ── Charge ────────────────────────────────────────────────────────────
         var amountPesewas = amount
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
                 .intValue();
 
-        log.info("initMomoDeposit: userId='{}' amount={} pesewas={} provider='{}'",
-                user.getId(), amount, amountPesewas, provider);
+        log.info("initMomoDeposit: userId='{}' amount={} pesewas={} phone='{}' provider='{}'",
+                user.getId(), amount, amountPesewas, maskPhone(phone), provider);
 
         var response = paystackMomoCharge(
                 user.getEmail(),
@@ -160,12 +183,11 @@ public class PaystackMobileMoneyController {
     // ─── Webhook ──────────────────────────────────────────────────────────────
 
     /**
-     * Same signature-verification + parsing approach as PaystackController's
-     * webhook. Kept as a separate endpoint for readability/isolation, but
-     * Paystack only allows ONE webhook URL per account — in production this
-     * mobile_money handling needs to live inside (or be called from) your
-     * single shared webhook endpoint. Route on data.channel there instead of
-     * registering this URL separately on the dashboard.
+     * Receives Paystack charge.success events for the mobile_money channel.
+     *
+     * NOTE: Paystack only allows ONE webhook URL per account. In production
+     * this handler must live inside (or be called from) your single shared
+     * webhook endpoint — route on data.channel == "mobile_money" there.
      */
     @PostMapping("/api/webhooks/paystack-momo")
     public ResponseEntity<String> webhook(
@@ -278,20 +300,19 @@ public class PaystackMobileMoneyController {
     // ─── Paystack API helpers ──────────────────────────────────────────────────
 
     /**
-     * Calls Paystack POST /charge with a mobile_money payload and returns the
-     * FULL response map:
-     *   {
-     *     "status": true, "message": "...",
-     *     "data": { "reference": "...", "status": "pay_offline", "display_text": "..." }
-     *   }
+     * Calls Paystack POST /charge with a mobile_money payload.
      *
-     * Same resilience pattern as PaystackController.paystackInit: 10s timeout,
-     * 2 retries on transient network errors only (Paystack 4xx/5xx are not retried).
+     * Returns the FULL response map:
+     *   { "status": true, "message": "Charge attempted",
+     *     "data": { "reference": "...", "status": "pay_offline", "display_text": "..." } }
+     *
+     * Resilience: 10s timeout, 2 retries on transient network errors only
+     * (Paystack 4xx/5xx throw RuntimeException and are NOT retried).
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> paystackMomoCharge(String email, int amountPesewas,
-                                                    String phone, String provider,
-                                                    Map<String, Object> metadata) {
+                                                   String phone, String provider,
+                                                   Map<String, Object> metadata) {
 
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + "/charge")
@@ -325,15 +346,16 @@ public class PaystackMobileMoneyController {
                 .onErrorMap(
                         ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
                         ex -> {
-                            log.error("Paystack MoMo API unreachable after {} retries", paystackRetryAttempts, ex);
-                            return new RuntimeException("Paystack is currently unavailable. Please try again.");
+                            log.error("Paystack MoMo API unreachable after {} retries",
+                                    paystackRetryAttempts, ex);
+                            return new RuntimeException(
+                                    "Paystack is currently unavailable. Please try again.");
                         }
                 )
                 .block();
 
-        if (result == null) {
+        if (result == null)
             throw new RuntimeException("Paystack returned an empty response.");
-        }
 
         log.info("paystackMomoCharge: Paystack status='{}' message='{}'",
                 result.get("status"), result.get("message"));
@@ -348,10 +370,9 @@ public class PaystackMobileMoneyController {
     }
 
     /**
-     * Calls Paystack GET /transaction/verify/:reference to manually check a
-     * Mobile Money transaction's status. Useful when the charge.success
-     * webhook hasn't arrived after the customer's 180-second authorization
-     * window has passed.
+     * Calls Paystack GET /transaction/verify/:reference.
+     * Used as a fallback when the charge.success webhook hasn't arrived
+     * after the 180-second authorization window.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> verifyTransaction(String reference) {
@@ -379,16 +400,67 @@ public class PaystackMobileMoneyController {
                         ex -> {
                             log.error("Paystack verify-transaction unreachable after {} retries",
                                     paystackRetryAttempts, ex);
-                            return new RuntimeException("Paystack is currently unavailable. Please try again.");
+                            return new RuntimeException(
+                                    "Paystack is currently unavailable. Please try again.");
                         }
                 )
                 .block();
 
-        if (result == null) {
+        if (result == null)
             throw new RuntimeException("Paystack returned an empty response.");
-        }
 
         return result;
+    }
+
+    // ─── Phone normalization ──────────────────────────────────────────────────
+
+    /**
+     * Normalizes a Ghana phone number to the local 10-digit format Paystack
+     * expects for Ghana MoMo (0XXXXXXXXX).
+     *
+     * Handles:
+     *   "+233XXXXXXXXX" (12 chars) → strip "+233", prepend "0"
+     *   "233XXXXXXXXX"  (11 chars) → strip "233",  prepend "0"
+     *   "0XXXXXXXXX"    (10 chars) → unchanged
+     *
+     * Throws ApiException.badRequest if the result isn't exactly 10 digits.
+     */
+    private String normalizeGhanaPhone(String raw) {
+        // Strip all whitespace and dashes
+        var digits = raw.replaceAll("[\\s\\-]", "");
+
+        if (digits.startsWith("+233")) {
+            digits = "0" + digits.substring(4);
+        } else if (digits.startsWith("233") && digits.length() == 12) {
+            digits = "0" + digits.substring(3);
+        }
+
+        if (!digits.matches("^0\\d{9}$")) {
+            throw ApiException.badRequest(
+                    "Invalid Ghana phone number '" + raw + "'. " +
+                            "Expected format: 0XXXXXXXXX (10 digits) or +233XXXXXXXXX.");
+        }
+
+        return digits;
+    }
+
+    /**
+     * Logs a warning if the phone prefix doesn't match the declared provider.
+     * Does NOT throw — we let Paystack be the final authority; this is just an
+     * early signal to help debug mismatches.
+     */
+    private void validateProviderPrefix(String phone, String provider) {
+        var prefix = phone.substring(0, 3);
+        var mismatch = switch (provider) {
+            case "mtn" -> !MTN_GH_PREFIXES.contains(prefix);
+            case "atl" -> !ATL_GH_PREFIXES.contains(prefix);
+            case "vod" -> !VOD_GH_PREFIXES.contains(prefix);
+            default    -> false;
+        };
+        if (mismatch) {
+            log.warn("validateProviderPrefix: phone prefix '{}' may not belong to provider '{}' — " +
+                    "Paystack will reject if wrong", prefix, provider);
+        }
     }
 
     // ─── Signature verification ───────────────────────────────────────────────
@@ -404,5 +476,13 @@ public class PaystackMobileMoneyController {
             log.error("Paystack MoMo webhook: signature verification error", e);
             return false;
         }
+    }
+
+    // ─── Utilities ────────────────────────────────────────────────────────────
+
+    /** Returns a masked phone number safe to log: e.g. "0551234987" → "055****987" */
+    private String maskPhone(String phone) {
+        if (phone == null || phone.length() < 7) return "***";
+        return phone.substring(0, 3) + "****" + phone.substring(phone.length() - 3);
     }
 }
