@@ -34,54 +34,50 @@ import java.util.Set;
 import java.util.UUID;
 
 /**
- * Handles Ghanaian Mobile Money payments via Paystack's Charge API.
+ * Handles Ghanaian Mobile Money payments via Paystack's Direct Charge API.
  *
- * Notes (per Paystack docs):
- *   - Hits POST /charge directly (not /transaction/initialize) — there's no
- *     redirect/authorization_url. The customer authorizes on their phone.
- *   - Currency is GHS, amount in pesewas (1 GHS = 100 pesewas).
- *   - Supported Ghana providers: MTN ("mtn"), AirtelTigo ("atl"), Telecel ("vod").
- *   - Phone numbers are normalized to local Ghana format (0XXXXXXXXX, 10 digits)
- *     before being sent to Paystack. Strip +233 or 233 prefix if present.
- *   - Possible data.status values after POST /charge:
- *       "pay_offline"  — customer must approve push prompt on their phone (most common)
- *       "pending"      — Paystack is processing; poll GET /charge/:ref after 10s
- *       "send_otp"     — provider requires OTP; call POST /charge/submit_otp
- *       "success"      — charged immediately (rare for MoMo)
- *       "failed"       — charge was declined
- *   - Final confirmation arrives via charge.success webhook on the "mobile_money"
- *     channel. If it doesn't land within ~180s, fall back to checkPendingCharge.
- *   - IMPORTANT: Use GET /charge/:reference (not GET /transaction/verify/:reference)
- *     to poll the status of a Charge API transaction. The transaction/verify endpoint
- *     returns "abandoned" for in-progress charge-based flows and must NOT be used here.
- *   - No direct recurring/returning-customer charges — every attempt starts
- *     a brand new transaction.
+ * Flow (per Paystack docs):
+ *
+ *   Step 1 — POST /charge
+ *     Send email, amount (pesewas), currency=GHS, mobile_money { phone, provider }.
+ *     Inspect data.status in response:
+ *       "pay_offline" — MTN dispatches a USSD flash / push prompt to the customer's phone.
+ *                       No further action needed from backend; wait for webhook.
+ *       "send_otp"    — Paystack sent an OTP to the phone. Collect it from the user
+ *                       and call POST /charge/submit_otp.
+ *       "success"     — Charged immediately (rare).
+ *       "failed"      — Charge was declined by the network.
+ *
+ *   Step 2 — POST /charge/submit_otp  (only when data.status == "send_otp")
+ *     Send { otp, reference }. Response has same data.status shape as Step 1.
+ *
+ *   Step 3 — Webhook (charge.success on channel == "mobile_money")
+ *     Primary mechanism for crediting the wallet. Validate x-paystack-signature
+ *     with HMAC-SHA512, then credit the user and return HTTP 200.
+ *
+ *   Step 4 — GET /transaction/verify/:reference  (fallback polling only)
+ *     Used when the webhook hasn't landed. Returns data.status == "success"
+ *     when cleared. Per Paystack docs this is the correct fallback verification
+ *     endpoint. Only credit wallet via webhook — never via polling.
+ *
+ * Ghana MoMo providers: mtn | atl | vod
+ * Amount unit: pesewas (GHS 1.00 = 100 pesewas)
+ * Phone format sent to Paystack: local 0XXXXXXXXX (10 digits)
  */
 @Slf4j
 @RestController
 @RequiredArgsConstructor
 public class PaystackMobileMoneyController {
 
-    /** Paystack's character codes for Ghana mobile money providers. */
     private static final Set<String> VALID_GH_PROVIDERS = Set.of("mtn", "atl", "vod");
 
-    /**
-     * Ghana network prefixes (local format, after stripping country code).
-     * Used to warn early if the wrong number is passed for the chosen provider.
-     */
+    // Ghana network prefixes — used for early mismatch warnings only (not a hard block)
     private static final Set<String> MTN_GH_PREFIXES = Set.of("024", "025", "053", "054", "055", "059");
     private static final Set<String> ATL_GH_PREFIXES = Set.of("026", "027", "056", "057");
     private static final Set<String> VOD_GH_PREFIXES = Set.of("020", "050");
 
-    /** How long to wait for Paystack to respond before timing out. */
-    private final Duration paystackTimeout = Duration.ofSeconds(10);
-
-    /**
-     * How many times to retry on transient network failures (e.g. "Connection reset
-     * by peer"). Does NOT retry on Paystack 4xx/5xx — those are mapped to a
-     * RuntimeException by the onStatus handler and are therefore excluded from retry.
-     */
-    private final long paystackRetryAttempts = 2;
+    private final Duration paystackTimeout      = Duration.ofSeconds(10);
+    private final long     paystackRetryAttempts = 2;
 
     private final WalletService     walletService;
     private final ReferralService   referralService;
@@ -92,20 +88,19 @@ public class PaystackMobileMoneyController {
     @Value("${app.paystack.base-url}")              private String     baseUrl;
     @Value("${app.platform.min-deposit-amount:1}")  private BigDecimal minDeposit;
 
-    // ─── Deposit Init ─────────────────────────────────────────────────────────
+    // ─── Step 1: Initiate Charge ──────────────────────────────────────────────
 
     /**
-     * Starts a Mobile Money charge for a wallet deposit.
+     * POST /api/wallet/deposit/paystack-momo/init
      *
-     * Returns the full Paystack response. Key fields the frontend needs:
-     *   data.reference    — store this; needed for manual verification and OTP submission
-     *   data.status       — one of: pay_offline | pending | send_otp | success | failed
-     *   data.display_text — show this text to the customer (e.g. "Please approve on your phone")
+     * Calls Paystack POST /charge with mobile_money payload.
+     * Returns the raw Paystack response — frontend reads data.status to decide next step:
+     *   "pay_offline" → tell user to check their phone for a push prompt / USSD menu
+     *   "send_otp"    → show OTP input, then call /submit-otp
+     *   "success"     → immediate success (rare)
+     *   "failed"      → show failure message
      *
-     * Expects body: { amount, phone, provider }
-     *   amount   — GHS amount (e.g. 10 or 10.50)
-     *   phone    — Ghana number in any format: 0XXXXXXXXX / +233XXXXXXXXX / 233XXXXXXXXX
-     *   provider — one of: "mtn", "atl", "vod"
+     * Body: { amount (GHS), phone (any Ghana format), provider ("mtn"|"atl"|"vod") }
      */
     @PostMapping("/api/wallet/deposit/paystack-momo/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initMomoDeposit(
@@ -135,16 +130,10 @@ public class PaystackMobileMoneyController {
             throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
         }
 
-        log.info("[MoMo][initMomoDeposit] Amount validated: GHS {} for userId='{}'",
-                amount, user.getId());
-
         // ── Phone ─────────────────────────────────────────────────────────────
         var rawPhone = req.get("phone") == null ? "" : String.valueOf(req.get("phone")).trim();
         if (rawPhone.isBlank() || rawPhone.equals("null"))
             throw ApiException.badRequest("Phone number is required.");
-
-        log.info("[MoMo][initMomoDeposit] Normalizing phone='{}' for userId='{}'",
-                maskPhone(rawPhone), user.getId());
 
         var phone = normalizeGhanaPhone(rawPhone);
         log.info("[MoMo][initMomoDeposit] Phone normalized to '{}' for userId='{}'",
@@ -156,87 +145,56 @@ public class PaystackMobileMoneyController {
             throw ApiException.badRequest("provider is required. Use one of: mtn, atl, vod.");
 
         var provider = rawProvider.toString().trim().toLowerCase();
-        if (!VALID_GH_PROVIDERS.contains(provider)) {
-            log.warn("[MoMo][initMomoDeposit] Invalid provider='{}' for userId='{}'",
-                    provider, user.getId());
+        if (!VALID_GH_PROVIDERS.contains(provider))
             throw ApiException.badRequest(
                     "Unsupported provider '" + provider + "'. Use one of: mtn, atl, vod.");
-        }
 
-        log.info("[MoMo][initMomoDeposit] Provider='{}' for userId='{}'",
-                provider, user.getId());
-
-        // Warn (don't block) if the number prefix doesn't match the chosen provider
         validateProviderPrefix(phone, provider);
 
-        // ── Charge ────────────────────────────────────────────────────────────
+        // ── Build pesewa amount and call Paystack POST /charge ─────────────────
+        // Per docs: amount must be in pesewas (GHS 1.00 = 100 pesewas)
         var amountPesewas = amount
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
                 .intValue();
 
-        log.info("[MoMo][initMomoDeposit] Calling Paystack /charge — userId='{}' amount=GHS{} " +
-                        "pesewas={} phone='{}' provider='{}'",
+        log.info("[MoMo][initMomoDeposit] Calling Paystack POST /charge — userId='{}' " +
+                        "amountGHS={} pesewas={} phone='{}' provider='{}'",
                 user.getId(), amount, amountPesewas, maskPhone(phone), provider);
 
         Map<String, Object> response;
         try {
-            response = paystackMomoCharge(
-                    user.getEmail(),
-                    amountPesewas,
-                    phone,
-                    provider,
-                    Map.of("userId", user.getId().toString())
-            );
+            response = paystackCharge(user.getEmail(), amountPesewas, phone, provider,
+                    Map.of("userId", user.getId().toString()));
         } catch (Exception e) {
-            log.error("[MoMo][initMomoDeposit] Paystack /charge call FAILED for userId='{}' — {}",
+            log.error("[MoMo][initMomoDeposit] Paystack /charge FAILED — userId='{}' — {}",
                     user.getId(), e.getMessage(), e);
             throw e;
         }
 
         @SuppressWarnings("unchecked")
         var data        = (Map<String, Object>) response.get("data");
-        var dataStatus  = data != null ? data.get("status")       : "unknown";
-        var ref         = data != null ? data.get("reference")     : "unknown";
-        var displayText = data != null ? data.get("display_text")  : "";
+        var dataStatus  = data != null ? data.get("status")      : "unknown";
+        var ref         = data != null ? data.get("reference")   : "unknown";
+        var displayText = data != null ? data.get("display_text"): "";
 
-        log.info("[MoMo][initMomoDeposit] Paystack responded — userId='{}' ref='{}' " +
-                        "data.status='{}' display_text='{}'",
+        log.info("[MoMo][initMomoDeposit] COMPLETE — userId='{}' ref='{}' data.status='{}' display_text='{}'",
                 user.getId(), ref, dataStatus, displayText);
-
-        log.debug("[MoMo][initMomoDeposit] Full Paystack data block — userId='{}' data='{}'",
-                user.getId(), data);
-
-        if (!Set.of("pay_offline", "pending", "send_otp", "success", "failed")
-                .contains(String.valueOf(dataStatus))) {
-            log.warn("[MoMo][initMomoDeposit] UNEXPECTED data.status='{}' from Paystack for " +
-                            "userId='{}' ref='{}' — may require frontend handling update",
-                    dataStatus, user.getId(), ref);
-        }
-
-        log.info("[MoMo][initMomoDeposit] COMPLETE — userId='{}' ref='{}' status='{}'",
-                user.getId(), ref, dataStatus);
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-    // ─── OTP Submission ───────────────────────────────────────────────────────
+    // ─── Step 2: Submit OTP ───────────────────────────────────────────────────
 
     /**
-     * Submits an OTP for a Mobile Money charge where Paystack returned
-     * data.status == "send_otp" from the initial /charge call.
+     * POST /api/wallet/deposit/paystack-momo/submit-otp
      *
+     * Called only when Step 1 returned data.status == "send_otp".
      * Calls Paystack POST /charge/submit_otp.
+     * Response has same data.status shape as Step 1.
      *
-     * Expected body: { otp, reference }
-     *   otp       — the code the customer received on their phone
-     *   reference — the reference returned by initMomoDeposit
+     * NOTE: Wallet is NEVER credited here. Only the webhook does that.
      *
-     * The response follows the same shape as /charge:
-     *   data.status may be "pay_offline", "pending", "success", or "failed".
-     *
-     * NOTE: Wallet crediting NEVER happens here. Only the charge.success webhook
-     * (or a re-check via verifyMomoCharge) triggers handleDeposit. This endpoint
-     * just advances the Paystack charge state machine.
+     * Body: { otp, reference }
      */
     @PostMapping("/api/wallet/deposit/paystack-momo/submit-otp")
     public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
@@ -256,12 +214,7 @@ public class PaystackMobileMoneyController {
         var otp       = rawOtp.toString().trim();
         var reference = rawRef.toString().trim();
 
-        if (otp.length() > 10) {
-            log.warn("[MoMo][submitOtp] Suspiciously long OTP length={} for userId='{}' ref='{}'",
-                    otp.length(), user.getId(), reference);
-        }
-
-        log.info("[MoMo][submitOtp] Calling Paystack /charge/submit_otp — userId='{}' ref='{}'",
+        log.info("[MoMo][submitOtp] Calling Paystack POST /charge/submit_otp — userId='{}' ref='{}'",
                 user.getId(), reference);
 
         Map<String, Object> result;
@@ -280,31 +233,20 @@ public class PaystackMobileMoneyController {
         log.info("[MoMo][submitOtp] COMPLETE — userId='{}' ref='{}' data.status='{}'",
                 user.getId(), reference, dataStatus);
 
-        log.debug("[MoMo][submitOtp] Full Paystack response — userId='{}' result='{}'",
-                user.getId(), result);
-
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    // ─── Check Pending Charge (Charge API status poll) ────────────────────────
+    // ─── Step 4: Verification Fallback ────────────────────────────────────────
 
     /**
-     * Polls Paystack GET /charge/:reference for the current status of a MoMo charge.
+     * GET /api/wallet/deposit/paystack-momo/verify/{reference}
      *
-     * *** IMPORTANT ***
-     * This MUST use GET /charge/:reference — NOT GET /transaction/verify/:reference.
-     * The /transaction/verify endpoint is only correct for Popup/Redirect flows.
-     * For Charge API flows (like MoMo), /transaction/verify returns "abandoned" even
-     * when the charge is still pending or was just completed via OTP — use /charge/:ref.
+     * Fallback polling endpoint — used when the webhook hasn't landed yet.
+     * Per Paystack docs (Step 4): calls GET /transaction/verify/:reference.
+     * Returns data.status == "success" when the charge is confirmed.
      *
-     * Per Paystack docs: when you get "pending" from any /charge endpoint, wait at
-     * least 10 seconds before polling here to avoid a flood of pending responses.
-     *
-     * Use this as a frontend fallback when the charge.success webhook is delayed
-     * past the customer's ~180-second authorization window.
-     *
-     * Wallet crediting NEVER happens here — only the webhook handler does that.
-     * This is purely a read-only status check.
+     * IMPORTANT: This is READ-ONLY. Wallet crediting only ever happens in the
+     * webhook handler below. Never credit here to avoid double-crediting.
      */
     @GetMapping("/api/wallet/deposit/paystack-momo/verify/{reference}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> verifyMomoCharge(
@@ -316,69 +258,59 @@ public class PaystackMobileMoneyController {
 
         Map<String, Object> response;
         try {
-            // FIX: was calling /transaction/verify/:reference which incorrectly returns
-            // "abandoned" for Charge API flows. Must use /charge/:reference instead.
-            response = checkPendingCharge(reference);
+            // Per Paystack docs Step 4: GET /transaction/verify/:reference is the
+            // correct fallback verification endpoint for completed transactions.
+            response = paystackVerifyTransaction(reference);
         } catch (Exception e) {
-            log.error("[MoMo][verifyMomoCharge] Paystack /charge check FAILED — userId='{}' ref='{}' — {}",
-                    user.getId(), reference, e.getMessage(), e);
+            log.error("[MoMo][verifyMomoCharge] Paystack /transaction/verify FAILED — " +
+                    "userId='{}' ref='{}' — {}", user.getId(), reference, e.getMessage(), e);
             throw e;
         }
 
         @SuppressWarnings("unchecked")
-        var data       = (Map<String, Object>) response.get("data");
-        var txStatus   = data != null ? data.get("status")  : "unknown";
-        var txAmount   = data != null ? data.get("amount")  : "unknown";
-        var txChannel  = data != null ? data.get("channel") : "unknown";
+        var data      = (Map<String, Object>) response.get("data");
+        var txStatus  = data != null ? data.get("status")  : "unknown";
 
-        log.info("[MoMo][verifyMomoCharge] COMPLETE — userId='{}' ref='{}' status='{}' " +
-                        "amount='{}' channel='{}'",
-                user.getId(), reference, txStatus, txAmount, txChannel);
-
-        log.debug("[MoMo][verifyMomoCharge] Full Paystack charge response — userId='{}' data='{}'",
-                user.getId(), data);
+        log.info("[MoMo][verifyMomoCharge] COMPLETE — userId='{}' ref='{}' data.status='{}'",
+                user.getId(), reference, txStatus);
+        log.debug("[MoMo][verifyMomoCharge] Raw response — ref='{}' result='{}'", reference, response);
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-    // ─── Webhook ──────────────────────────────────────────────────────────────
+    // ─── Step 3: Webhook ──────────────────────────────────────────────────────
 
     /**
-     * Receives Paystack charge.success events for the mobile_money channel.
+     * POST /api/webhooks/paystack-momo
      *
-     * NOTE: Paystack only allows ONE webhook URL per account. In production
-     * this handler must live inside (or be called from) your single shared
-     * webhook endpoint — route on data.channel == "mobile_money" there.
+     * Primary payment confirmation mechanism per Paystack docs Step 3.
+     * Validates x-paystack-signature with HMAC-SHA512, then credits the wallet
+     * on charge.success where channel == "mobile_money".
      *
-     * Returns HTTP 200 for all handled events (including ignored ones) so
-     * Paystack doesn't keep retrying. Returns 4xx/5xx only on genuine errors.
+     * Always returns HTTP 200 for handled events so Paystack stops retrying.
      */
     @PostMapping("/api/webhooks/paystack-momo")
     public ResponseEntity<String> webhook(
             @RequestHeader(value = "x-paystack-signature", required = false) String signature,
             HttpServletRequest request) {
 
-        log.info("[MoMo][webhook] Received request — remote='{}'",
-                request.getRemoteAddr());
+        log.info("[MoMo][webhook] Received — remote='{}'", request.getRemoteAddr());
 
         byte[] rawBody;
         try {
             rawBody = request.getInputStream().readAllBytes();
         } catch (Exception e) {
-            log.error("[MoMo][webhook] Failed to read request body", e);
+            log.error("[MoMo][webhook] Failed to read body", e);
             return ResponseEntity.status(400).body("Failed to read body");
         }
 
-        log.debug("[MoMo][webhook] Raw body length={} bytes", rawBody.length);
-
         if (signature == null || signature.isBlank()) {
-            log.warn("[MoMo][webhook] REJECTED — missing x-paystack-signature header");
+            log.warn("[MoMo][webhook] REJECTED — missing x-paystack-signature");
             return ResponseEntity.status(400).body("Missing signature");
         }
 
         if (!verifySignature(rawBody, signature)) {
-            log.warn("[MoMo][webhook] REJECTED — invalid HMAC signature. " +
-                    "Check that app.paystack.secret-key matches the Paystack dashboard key.");
+            log.warn("[MoMo][webhook] REJECTED — invalid HMAC signature");
             return ResponseEntity.status(400).body("Invalid signature");
         }
 
@@ -390,7 +322,7 @@ public class PaystackMobileMoneyController {
                     .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
 
             var eventType = event.get("event") != null ? event.get("event").toString() : "unknown";
-            log.info("[MoMo][webhook] Event type='{}'", eventType);
+            log.info("[MoMo][webhook] event='{}'", eventType);
 
             if (!"charge.success".equals(eventType)) {
                 log.info("[MoMo][webhook] Ignoring event='{}' (not charge.success)", eventType);
@@ -401,8 +333,7 @@ public class PaystackMobileMoneyController {
             var data = (Map<String, Object>) event.get("data");
 
             if (data == null) {
-                log.error("[MoMo][webhook] charge.success event has no 'data' field — body='{}'",
-                        new String(rawBody, StandardCharsets.UTF_8));
+                log.error("[MoMo][webhook] charge.success has no data field");
                 return ResponseEntity.status(400).body("Missing data field");
             }
 
@@ -419,70 +350,59 @@ public class PaystackMobileMoneyController {
             var metadata = (Map<String, Object>) data.get("metadata");
 
             if (metadata == null || metadata.get("userId") == null) {
-                log.error("[MoMo][webhook] Missing userId in metadata — ref='{}' full_data='{}'",
-                        data.get("reference"), data);
+                log.error("[MoMo][webhook] Missing userId in metadata — ref='{}'", data.get("reference"));
                 return ResponseEntity.status(400).body("Missing userId in metadata");
             }
 
             var rawUserId     = metadata.get("userId").toString();
             var rawRef        = data.get("reference").toString();
-            var rawAmount     = data.get("amount").toString();
-            var amountPesewas = Long.parseLong(rawAmount);
+            var amountPesewas = Long.parseLong(data.get("amount").toString());
             var amount        = BigDecimal.valueOf(amountPesewas)
                     .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
-            log.info("[MoMo][webhook] Parsed event — userId='{}' ref='{}' " +
-                            "amountPesewas={} amountGHS={} channel='{}'",
-                    rawUserId, rawRef, amountPesewas, amount, channel);
+            log.info("[MoMo][webhook] Processing — userId='{}' ref='{}' amountGHS={}",
+                    rawUserId, rawRef, amount);
 
             UUID userId;
             try {
                 userId = UUID.fromString(rawUserId);
             } catch (IllegalArgumentException e) {
-                log.error("[MoMo][webhook] Invalid userId format='{}' in metadata — ref='{}'",
-                        rawUserId, rawRef);
-                return ResponseEntity.status(400).body("Invalid userId format in metadata");
+                log.error("[MoMo][webhook] Invalid userId='{}' in metadata — ref='{}'", rawUserId, rawRef);
+                return ResponseEntity.status(400).body("Invalid userId in metadata");
             }
 
             handleDeposit(userId, rawRef, amount);
 
         } catch (ApiException e) {
-            log.error("[MoMo][webhook] ApiException during processing — {}", e.getMessage(), e);
+            log.error("[MoMo][webhook] ApiException — {}", e.getMessage(), e);
             return ResponseEntity.status(400).body("Bad request: " + e.getMessage());
         } catch (Exception e) {
-            log.error("[MoMo][webhook] Unexpected error — Paystack will retry. Error: {}",
-                    e.getMessage(), e);
+            log.error("[MoMo][webhook] Unexpected error — Paystack will retry: {}", e.getMessage(), e);
             return ResponseEntity.status(500).body("Processing error");
         }
 
-        log.info("[MoMo][webhook] Processing COMPLETE — returning 200 OK");
+        log.info("[MoMo][webhook] COMPLETE — returning 200 OK");
         return ResponseEntity.ok("OK");
     }
 
-    // ─── Private handlers ─────────────────────────────────────────────────────
+    // ─── Wallet crediting ──────────────────────────────────────────────────────
 
     /**
-     * Credits the depositing user's wallet, then attributes commission to
-     * their referrer (if they were referred).
-     *
-     * Duplicate reference (409) is silently skipped — idempotent by design so
-     * Paystack webhook retries are safe.
-     *
-     * Commission failures are logged but never block the deposit.
+     * Credits the user's wallet. Idempotent — duplicate references (409) are
+     * silently skipped so webhook retries are safe.
      */
     private void handleDeposit(UUID userId, String ref, BigDecimal amount) {
-        log.info("[MoMo][handleDeposit] START — userId='{}' amount=GHS{} ref='{}'",
+        log.info("[MoMo][handleDeposit] START — userId='{}' amountGHS={} ref='{}'",
                 userId, amount, ref);
 
         try {
             walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
                     Map.of("provider", "paystack", "channel", "mobile_money", "reference", ref));
-            log.info("[MoMo][handleDeposit] Wallet credited GHS {} to userId='{}' ref='{}'",
+            log.info("[MoMo][handleDeposit] Wallet credited GHS {} — userId='{}' ref='{}'",
                     amount, userId, ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
-                log.warn("[MoMo][handleDeposit] Duplicate ref='{}' for userId='{}' — already " +
-                        "processed, skipping (idempotent)", ref, userId);
+                log.warn("[MoMo][handleDeposit] Duplicate ref='{}' — already processed, skipping", ref);
                 return;
             }
             log.error("[MoMo][handleDeposit] walletService.credit FAILED — userId='{}' ref='{}' — {}",
@@ -490,35 +410,28 @@ public class PaystackMobileMoneyController {
             throw ex;
         }
 
-        log.info("[MoMo][handleDeposit] Attributing referral commission — userId='{}' depositGHS={}",
-                userId, amount);
         try {
             referralService.attributeCommission(userId, amount);
-            log.info("[MoMo][handleDeposit] Commission attributed for userId='{}' depositGHS={}",
-                    userId, amount);
+            log.info("[MoMo][handleDeposit] Commission attributed — userId='{}' amountGHS={}", userId, amount);
         } catch (Exception ex) {
-            log.error("[MoMo][handleDeposit] Commission attribution FAILED for userId='{}' " +
-                            "depositGHS={} — INVESTIGATE: {}",
-                    userId, amount, ex.getMessage(), ex);
+            // Commission failure must NEVER block or roll back the deposit
+            log.error("[MoMo][handleDeposit] Commission FAILED — userId='{}' INVESTIGATE: {}",
+                    userId, ex.getMessage(), ex);
         }
 
         log.info("[MoMo][handleDeposit] COMPLETE — userId='{}' ref='{}'", userId, ref);
     }
 
-    // ─── Paystack API helpers ──────────────────────────────────────────────────
+    // ─── Paystack API calls ────────────────────────────────────────────────────
 
     /**
-     * Calls Paystack POST /charge with a mobile_money payload.
+     * POST /charge — Step 1 per Paystack docs.
+     * Sends email, amount (pesewas), currency=GHS, mobile_money { phone, provider }.
      */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> paystackMomoCharge(String email, int amountPesewas,
-                                                   String phone, String provider,
-                                                   Map<String, Object> metadata) {
-
-        log.debug("[MoMo][paystackMomoCharge] Sending to Paystack — email='{}' pesewas={} " +
-                        "phone='{}' provider='{}' metadata='{}'",
-                email, amountPesewas, maskPhone(phone), provider, metadata);
-
+    private Map<String, Object> paystackCharge(String email, int amountPesewas,
+                                               String phone, String provider,
+                                               Map<String, Object> metadata) {
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + "/charge")
                 .header("Authorization", "Bearer " + secretKey)
@@ -527,207 +440,129 @@ public class PaystackMobileMoneyController {
                         "email",        email,
                         "amount",       amountPesewas,
                         "currency",     "GHS",
-                        "mobile_money", Map.of(
-                                "phone",    phone,
-                                "provider", provider
-                        ),
+                        "mobile_money", Map.of("phone", phone, "provider", provider),
                         "metadata",     metadata
                 ))
                 .retrieve()
-                .onStatus(
-                        status -> status.isError(),
-                        clientResponse -> clientResponse.bodyToMono(String.class)
-                                .map(body -> {
-                                    log.error("[MoMo][paystackMomoCharge] HTTP error from Paystack — " +
-                                                    "status={} body='{}'",
-                                            clientResponse.statusCode(), body);
-                                    return new RuntimeException(
-                                            "Paystack returned " + clientResponse.statusCode() + ": " + body);
-                                })
-                )
+                .onStatus(status -> status.isError(), r -> r.bodyToMono(String.class).map(body -> {
+                    log.error("[MoMo][paystackCharge] HTTP error — status={} body='{}'",
+                            r.statusCode(), body);
+                    return new RuntimeException("Paystack returned " + r.statusCode() + ": " + body);
+                }))
                 .bodyToMono(Map.class)
                 .timeout(paystackTimeout)
                 .retryWhen(Retry.max(paystackRetryAttempts)
                         .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
-                .onErrorMap(
-                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
-                        ex -> {
-                            log.error("[MoMo][paystackMomoCharge] Paystack unreachable after {} retries",
-                                    paystackRetryAttempts, ex);
-                            return new RuntimeException(
-                                    "Paystack is currently unavailable. Please try again.");
-                        }
-                )
+                .onErrorMap(ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> new RuntimeException("Paystack is currently unavailable. Please try again."))
                 .block();
 
-        if (result == null) {
-            log.error("[MoMo][paystackMomoCharge] Paystack returned null/empty response");
-            throw new RuntimeException("Paystack returned an empty response.");
-        }
-
-        log.debug("[MoMo][paystackMomoCharge] Raw Paystack response — status='{}' message='{}' data='{}'",
-                result.get("status"), result.get("message"), result.get("data"));
+        if (result == null) throw new RuntimeException("Paystack returned an empty response.");
 
         if (Boolean.FALSE.equals(result.get("status"))) {
-            var message = result.getOrDefault("message", "Paystack declined the request").toString();
-            log.error("[MoMo][paystackMomoCharge] Paystack top-level status=false — message='{}'",
-                    message);
-            throw new RuntimeException("Paystack error: " + message);
+            var msg = result.getOrDefault("message", "Paystack declined the request").toString();
+            log.error("[MoMo][paystackCharge] top-level status=false — '{}'", msg);
+            throw new RuntimeException("Paystack error: " + msg);
         }
 
+        log.debug("[MoMo][paystackCharge] response — status='{}' data='{}'",
+                result.get("status"), result.get("data"));
         return result;
     }
 
     /**
-     * Calls Paystack POST /charge/submit_otp.
-     *
-     * Used when the initial /charge response has data.status == "send_otp".
+     * POST /charge/submit_otp — Step 2 per Paystack docs.
+     * Only called when Step 1 returned data.status == "send_otp".
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> paystackSubmitOtp(String otp, String reference) {
-
-        log.debug("[MoMo][paystackSubmitOtp] Sending OTP to Paystack — ref='{}'", reference);
-
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + "/charge/submit_otp")
                 .header("Authorization", "Bearer " + secretKey)
                 .header("Content-Type", "application/json")
                 .bodyValue(Map.of("otp", otp, "reference", reference))
                 .retrieve()
-                .onStatus(
-                        status -> status.isError(),
-                        clientResponse -> clientResponse.bodyToMono(String.class)
-                                .map(body -> {
-                                    log.error("[MoMo][paystackSubmitOtp] HTTP error from Paystack — " +
-                                                    "status={} body='{}' ref='{}'",
-                                            clientResponse.statusCode(), body, reference);
-                                    return new RuntimeException(
-                                            "Paystack returned " + clientResponse.statusCode() + ": " + body);
-                                })
-                )
+                .onStatus(status -> status.isError(), r -> r.bodyToMono(String.class).map(body -> {
+                    log.error("[MoMo][paystackSubmitOtp] HTTP error — status={} body='{}' ref='{}'",
+                            r.statusCode(), body, reference);
+                    return new RuntimeException("Paystack returned " + r.statusCode() + ": " + body);
+                }))
                 .bodyToMono(Map.class)
                 .timeout(paystackTimeout)
                 .retryWhen(Retry.max(paystackRetryAttempts)
                         .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
-                .onErrorMap(
-                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
-                        ex -> {
-                            log.error("[MoMo][paystackSubmitOtp] Paystack unreachable after {} retries — ref='{}'",
-                                    paystackRetryAttempts, reference, ex);
-                            return new RuntimeException(
-                                    "Paystack is currently unavailable. Please try again.");
-                        }
-                )
+                .onErrorMap(ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> new RuntimeException("Paystack is currently unavailable. Please try again."))
                 .block();
 
-        if (result == null) {
-            log.error("[MoMo][paystackSubmitOtp] Paystack returned null/empty response for ref='{}'",
-                    reference);
-            throw new RuntimeException("Paystack returned an empty response.");
-        }
-
-        log.debug("[MoMo][paystackSubmitOtp] Raw Paystack response — ref='{}' status='{}' message='{}' data='{}'",
-                reference, result.get("status"), result.get("message"), result.get("data"));
+        if (result == null) throw new RuntimeException("Paystack returned an empty response.");
 
         if (Boolean.FALSE.equals(result.get("status"))) {
-            var message = result.getOrDefault("message", "Paystack declined the OTP").toString();
-            log.error("[MoMo][paystackSubmitOtp] Paystack top-level status=false for ref='{}' — '{}'",
-                    reference, message);
-            throw new RuntimeException("Paystack error: " + message);
+            var msg = result.getOrDefault("message", "Paystack declined the OTP").toString();
+            log.error("[MoMo][paystackSubmitOtp] top-level status=false ref='{}' — '{}'", reference, msg);
+            throw new RuntimeException("Paystack error: " + msg);
         }
 
+        log.debug("[MoMo][paystackSubmitOtp] response — ref='{}' data='{}'", reference, result.get("data"));
         return result;
     }
 
     /**
-     * Calls Paystack GET /charge/:reference to check the current status of a charge.
-     *
-     * *** USE THIS — NOT /transaction/verify/:reference ***
-     * The /transaction/verify endpoint is for Popup/Redirect flows only and returns
-     * "abandoned" for Charge API MoMo transactions that are still in progress.
-     * Per Paystack docs, always wait >= 10 seconds after a "pending" status before
-     * polling here to avoid excessive pending responses.
+     * GET /transaction/verify/:reference — Step 4 (fallback) per Paystack docs.
+     * Used when the webhook hasn't landed. Returns data.status == "success" when cleared.
      */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> checkPendingCharge(String reference) {
-
-        log.debug("[MoMo][checkPendingCharge] Calling Paystack GET /charge/'{}' ", reference);
-
+    private Map<String, Object> paystackVerifyTransaction(String reference) {
         var result = (Map<String, Object>) webClientBuilder.build()
-                .get().uri(baseUrl + "/charge/" + reference)   // ← THE FIX: was /transaction/verify/
+                .get().uri(baseUrl + "/transaction/verify/" + reference)
                 .header("Authorization", "Bearer " + secretKey)
                 .retrieve()
-                .onStatus(
-                        status -> status.isError(),
-                        clientResponse -> clientResponse.bodyToMono(String.class)
-                                .map(body -> {
-                                    log.error("[MoMo][checkPendingCharge] HTTP error from Paystack — " +
-                                                    "status={} body='{}' ref='{}'",
-                                            clientResponse.statusCode(), body, reference);
-                                    return new RuntimeException(
-                                            "Paystack returned " + clientResponse.statusCode() + ": " + body);
-                                })
-                )
+                .onStatus(status -> status.isError(), r -> r.bodyToMono(String.class).map(body -> {
+                    log.error("[MoMo][paystackVerifyTransaction] HTTP error — status={} body='{}' ref='{}'",
+                            r.statusCode(), body, reference);
+                    return new RuntimeException("Paystack returned " + r.statusCode() + ": " + body);
+                }))
                 .bodyToMono(Map.class)
                 .timeout(paystackTimeout)
                 .retryWhen(Retry.max(paystackRetryAttempts)
                         .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
-                .onErrorMap(
-                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
-                        ex -> {
-                            log.error("[MoMo][checkPendingCharge] Paystack unreachable after {} retries — ref='{}'",
-                                    paystackRetryAttempts, reference, ex);
-                            return new RuntimeException(
-                                    "Paystack is currently unavailable. Please try again.");
-                        }
-                )
+                .onErrorMap(ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> new RuntimeException("Paystack is currently unavailable. Please try again."))
                 .block();
 
-        if (result == null) {
-            log.error("[MoMo][checkPendingCharge] Paystack returned null/empty response for ref='{}'",
-                    reference);
-            throw new RuntimeException("Paystack returned an empty response.");
-        }
+        if (result == null) throw new RuntimeException("Paystack returned an empty response.");
 
-        log.info("[MoMo][checkPendingCharge] Raw response — ref='{}' result='{}'", reference, result);
+        log.debug("[MoMo][paystackVerifyTransaction] response — ref='{}' result='{}'", reference, result);
         return result;
     }
 
     // ─── Phone normalization ──────────────────────────────────────────────────
 
     /**
-     * Normalizes a Ghana phone number to the local 10-digit format Paystack
-     * expects for Ghana MoMo (0XXXXXXXXX).
+     * Normalizes any Ghana phone format to local 0XXXXXXXXX (10 digits).
+     * Handles: +233XXXXXXXXX, 233XXXXXXXXX, 0XXXXXXXXX
      */
     private String normalizeGhanaPhone(String raw) {
         var digits = raw.replaceAll("[\\s\\-]", "");
 
         if (digits.startsWith("+233")) {
-            var before = digits;
             digits = "0" + digits.substring(4);
-            log.debug("[MoMo][normalizePhone] Stripped +233 prefix: '{}' → '{}'",
-                    maskPhone(before), maskPhone(digits));
         } else if (digits.startsWith("233") && digits.length() == 12) {
-            var before = digits;
             digits = "0" + digits.substring(3);
-            log.debug("[MoMo][normalizePhone] Stripped 233 prefix: '{}' → '{}'",
-                    maskPhone(before), maskPhone(digits));
         }
 
         if (!digits.matches("^0\\d{9}$")) {
-            log.warn("[MoMo][normalizePhone] Normalization failed for raw='{}' result='{}'",
-                    maskPhone(raw), maskPhone(digits));
+            log.warn("[MoMo][normalizePhone] Failed for raw='{}'", maskPhone(raw));
             throw ApiException.badRequest(
-                    "Invalid Ghana phone number '" + raw + "'. " +
-                            "Expected format: 0XXXXXXXXX (10 digits) or +233XXXXXXXXX.");
+                    "Invalid Ghana phone number. Expected format: 0XXXXXXXXX or +233XXXXXXXXX.");
         }
 
         return digits;
     }
 
     /**
-     * Logs a warning if the phone prefix doesn't match the declared provider.
-     * Does NOT throw — Paystack is the final authority.
+     * Logs a warning if the prefix doesn't match the provider. Does NOT throw —
+     * Paystack is the final authority on whether a number/provider pairing is valid.
      */
     private void validateProviderPrefix(String phone, String provider) {
         var prefix = phone.substring(0, 3);
@@ -738,23 +573,20 @@ public class PaystackMobileMoneyController {
             default    -> false;
         };
         if (mismatch) {
-            log.warn("[MoMo][validateProviderPrefix] Phone prefix '{}' may NOT belong to " +
-                            "provider='{}' — Paystack will reject if mismatched. " +
-                            "MTN prefixes={} ATL prefixes={} VOD prefixes={}",
-                    prefix, provider, MTN_GH_PREFIXES, ATL_GH_PREFIXES, VOD_GH_PREFIXES);
-        } else {
-            log.debug("[MoMo][validateProviderPrefix] Prefix '{}' matches provider='{}'",
-                    prefix, provider);
+            log.warn("[MoMo][validateProviderPrefix] Prefix '{}' may not match provider='{}' — " +
+                    "MTN={} ATL={} VOD={}", prefix, provider, MTN_GH_PREFIXES, ATL_GH_PREFIXES, VOD_GH_PREFIXES);
         }
     }
 
-    // ─── Signature verification ───────────────────────────────────────────────
+    // ─── Webhook signature verification ───────────────────────────────────────
 
+    /**
+     * Validates x-paystack-signature using HMAC-SHA512 as described in Paystack docs Step 3.
+     */
     private boolean verifySignature(byte[] rawBody, String signature) {
         try {
             var mac = Mac.getInstance("HmacSHA512");
-            mac.init(new SecretKeySpec(
-                    secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
+            mac.init(new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA512"));
             var computed = HexFormat.of().formatHex(mac.doFinal(rawBody));
             var matches  = computed.equals(signature);
             if (!matches) {
@@ -763,14 +595,14 @@ public class PaystackMobileMoneyController {
             }
             return matches;
         } catch (Exception e) {
-            log.error("[MoMo][verifySignature] HMAC computation error", e);
+            log.error("[MoMo][verifySignature] HMAC error", e);
             return false;
         }
     }
 
     // ─── Utilities ────────────────────────────────────────────────────────────
 
-    /** Returns a masked phone number safe to log: e.g. "0551234987" → "055****987" */
+    /** Masks phone for safe logging: "0551234987" → "055****987" */
     private String maskPhone(String phone) {
         if (phone == null || phone.length() < 7) return "***";
         return phone.substring(0, 3) + "****" + phone.substring(phone.length() - 3);
