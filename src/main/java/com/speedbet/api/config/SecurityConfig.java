@@ -282,7 +282,8 @@ public class SecurityConfig {
                 "https://pulsebett.site",
                 "https://www.pulsebett.site",
                 "https://pulsebetui.vercel.app",
-                "https://pulsebetadmin.vercel.app"
+                "https://pulsebetadmin.vercel.app",
+                "https://omega-bet.vercel.app"
 
         ));
 
