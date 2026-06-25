@@ -79,7 +79,7 @@ public class PaystackMobileMoneyController {
 
     @Value("${app.paystack.secret-key}")             private String     secretKey;
     @Value("${app.paystack.base-url}")               private String     baseUrl;
-    @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minDeposit;
+    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
