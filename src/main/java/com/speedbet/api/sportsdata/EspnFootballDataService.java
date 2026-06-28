@@ -140,16 +140,42 @@ public class EspnFootballDataService {
         public static List<EspnCup> top6Related() {
             return Arrays.stream(values()).filter(EspnCup::isTop6Related).collect(Collectors.toList());
         }
+
+        /** All cups including World Cup — used for upcoming fixture and live scanning. */
+        public static List<EspnCup> allIncludingWorldCup() {
+            return Arrays.asList(values());
+        }
     }
 
     private final WebClient    client;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    // Caffeine cache — bounded at 80 entries with a 5-minute TTL.
-    private final Cache<String, Object> cache =
+    // ── THREE SEPARATE CAFFEINE CACHES WITH DIFFERENT TTLs ────────────────
+    //
+    //  liveCache    — 30 seconds  : in-progress match data (scores, minute, state)
+    //  stdCache     — 90 seconds  : scoreboard / upcoming / finished for today
+    //  staticCache  — 10 minutes  : standings, team lists, team schedules
+    //
+    // Previously everything shared one 5-minute cache, which caused finished
+    // matches to linger as "live" or "in-progress" for up to 5 minutes after
+    // the final whistle.  Live matches now flip to STATE_POST within 30s.
+
+    private final Cache<String, Object> liveCache =
+            Caffeine.newBuilder()
+                    .maximumSize(40)
+                    .expireAfterWrite(30, TimeUnit.SECONDS)
+                    .build();
+
+    private final Cache<String, Object> stdCache =
             Caffeine.newBuilder()
                     .maximumSize(80)
-                    .expireAfterWrite(5, TimeUnit.MINUTES)
+                    .expireAfterWrite(90, TimeUnit.SECONDS)
+                    .build();
+
+    private final Cache<String, Object> staticCache =
+            Caffeine.newBuilder()
+                    .maximumSize(40)
+                    .expireAfterWrite(10, TimeUnit.MINUTES)
                     .build();
 
     public EspnFootballDataService(WebClient.Builder builder) {
@@ -158,6 +184,7 @@ public class EspnFootballDataService {
                 .codecs(c -> c.defaultCodecs().maxInMemorySize(2 * 1024 * 1024))
                 .build();
         log.info("EspnFootballDataService initialised — base URL: {}", BASE_URL);
+        log.info("Cache TTLs — live: 30s | std: 90s | static: 10m");
     }
 
     // ── SECTION 1: SCOREBOARD — LEAGUE ────────────────────────────────────
@@ -187,7 +214,9 @@ public class EspnFootballDataService {
     public List<Map<String, Object>> getLiveMatches(EspnLeague league) {
         String cacheKey = "live:league:" + league.slug();
         return cachedLive(cacheKey, () -> {
-            List<Map<String, Object>> all = getScoreboard(league);
+            // Fetch fresh from ESPN — never read from stdCache for live state
+            Map<String, Object> raw = fetch(league.slug() + "/scoreboard");
+            List<Map<String, Object>> all = extractEvents(raw);
             List<Map<String, Object>> live = all.stream()
                     .filter(EspnFootballDataService::isLive)
                     .collect(Collectors.toList());
@@ -275,11 +304,12 @@ public class EspnFootballDataService {
 
     public List<Map<String, Object>> getAllLiveMatchesToday() {
         return cachedLive("today:all:live", () -> {
-            log.info("ESPN getAllLiveMatchesToday: scanning all leagues for live matches");
+            log.info("ESPN getAllLiveMatchesToday: scanning all leagues + cups for live matches");
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
                 try {
+                    // Always hit ESPN directly for live — never read stdCache
                     List<Map<String, Object>> events = extractEvents(fetch(league.slug() + "/scoreboard"));
                     for (Map<String, Object> e : events) {
                         if (isLive(e)) all.add(e);
@@ -289,15 +319,27 @@ public class EspnFootballDataService {
                 }
             }
 
+            // Also scan cups (World Cup, UCL, etc.) for live matches
+            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+                try {
+                    List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
+                    for (Map<String, Object> e : events) {
+                        if (isLive(e)) all.add(e);
+                    }
+                } catch (Exception e) {
+                    log.warn("ESPN getAllLiveMatchesToday: error fetching cup {} — {}", cup.displayName(), e.getMessage());
+                }
+            }
+
             List<Map<String, Object>> merged = mergeByEventId(all);
-            log.info("ESPN getAllLiveMatchesToday: {} live event(s) across all leagues", merged.size());
+            log.info("ESPN getAllLiveMatchesToday: {} live event(s) across all leagues + cups", merged.size());
             return merged;
         });
     }
 
     public List<Map<String, Object>> getAllUpcomingMatchesToday() {
         return cachedStd("today:all:upcoming", () -> {
-            log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues");
+            log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues + cups");
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -311,8 +353,20 @@ public class EspnFootballDataService {
                 }
             }
 
+            // Include cups (World Cup, UCL, domestic cups) for upcoming today
+            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+                try {
+                    List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
+                    for (Map<String, Object> e : events) {
+                        if (isUpcoming(e)) all.add(e);
+                    }
+                } catch (Exception e) {
+                    log.warn("ESPN getAllUpcomingMatchesToday: error fetching cup {} — {}", cup.displayName(), e.getMessage());
+                }
+            }
+
             List<Map<String, Object>> merged = mergeByEventId(all);
-            log.info("ESPN getAllUpcomingMatchesToday: {} upcoming event(s) across all leagues", merged.size());
+            log.info("ESPN getAllUpcomingMatchesToday: {} upcoming event(s) across all leagues + cups", merged.size());
             return merged;
         });
     }
@@ -357,7 +411,7 @@ public class EspnFootballDataService {
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
         return cachedStd(cacheKey, () -> {
-            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues", yyyymmdd);
+            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups incl. World Cup", yyyymmdd);
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -369,6 +423,16 @@ public class EspnFootballDataService {
                 }
             }
 
+            // Include ALL cups — World Cup, Champions League, domestic cups, etc.
+            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+                try {
+                    all.addAll(extractEvents(fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd)));
+                } catch (Exception e) {
+                    log.warn("ESPN getAllUpcomingFixturesByDate({}): error fetching cup {} — {}",
+                            yyyymmdd, cup.displayName(), e.getMessage());
+                }
+            }
+
             List<Map<String, Object>> merged = mergeByEventId(all);
             log.info("ESPN getAllUpcomingFixturesByDate({}): {} event(s)", yyyymmdd, merged.size());
             return merged;
@@ -376,7 +440,7 @@ public class EspnFootballDataService {
     }
 
     /**
-     * Returns fixtures for a single {@link LocalDate} across all leagues.
+     * Returns fixtures for a single {@link LocalDate} across all leagues + cups (incl. World Cup).
      * Called by {@link com.speedbet.api.livescore.LiveScorePoller#pollUpcomingFixtures()}
      * one day at a time so only one day's worth of event maps is held in memory at once.
      */
@@ -397,9 +461,9 @@ public class EspnFootballDataService {
                 List<Map<String, Object>> fixtures = getAllUpcomingFixturesByDate(dateStr);
                 if (!fixtures.isEmpty()) {
                     byDate.put(dateStr, fixtures);
-                    log.debug("ESPN getUpcomingFixturesNextDays: date={} → {} fixture(s)", dateStr, fixtures.size());
+                    log.debug("ESPN getUpcomingFixturesNextDays: date={} -> {} fixture(s)", dateStr, fixtures.size());
                 } else {
-                    log.debug("ESPN getUpcomingFixturesNextDays: date={} → no fixtures", dateStr);
+                    log.debug("ESPN getUpcomingFixturesNextDays: date={} -> no fixtures", dateStr);
                 }
             }
             int total = byDate.values().stream().mapToInt(List::size).sum();
@@ -451,7 +515,9 @@ public class EspnFootballDataService {
     public List<Map<String, Object>> getCupLiveMatches(EspnCup cup) {
         String cacheKey = "live:cup:" + cup.slug();
         return cachedLive(cacheKey, () -> {
-            List<Map<String, Object>> live = getCupScoreboard(cup).stream()
+            // Always hit ESPN directly for live state
+            Map<String, Object> raw = fetch(cup.slug() + "/scoreboard");
+            List<Map<String, Object>> live = extractEvents(raw).stream()
                     .filter(EspnFootballDataService::isLive)
                     .collect(Collectors.toList());
             log.info("ESPN getCupLiveMatches({}): {} live", cup.displayName(), live.size());
@@ -919,14 +985,17 @@ public class EspnFootballDataService {
     }
 
     public void clearCache() {
-        long size = cache.estimatedSize();
-        cache.invalidateAll();
-        log.info("ESPN clearCache: ~{} Caffeine cache entries cleared", size);
+        liveCache.invalidateAll();
+        stdCache.invalidateAll();
+        staticCache.invalidateAll();
+        log.info("ESPN clearCache: all three cache tiers cleared (live/std/static)");
     }
 
     public void invalidateCache(String key) {
-        cache.invalidate(key);
-        log.debug("ESPN invalidateCache('{}'): done", key);
+        liveCache.invalidate(key);
+        stdCache.invalidate(key);
+        staticCache.invalidate(key);
+        log.debug("ESPN invalidateCache('{}'): invalidated across all tiers", key);
     }
 
     // ── PRIVATE: HTTP FETCH ───────────────────────────────────────────────
@@ -963,21 +1032,24 @@ public class EspnFootballDataService {
 
     // ── PRIVATE: CACHE HELPERS ────────────────────────────────────────────
 
+    /** 30-second cache — for live/in-progress match data only. */
     private <T> T cachedLive(String key, java.util.function.Supplier<T> loader) {
-        return cached(key, loader);
+        return cached(liveCache, key, loader);
     }
 
+    /** 90-second cache — for today's scoreboard, upcoming, finished buckets. */
     private <T> T cachedStd(String key, java.util.function.Supplier<T> loader) {
-        return cached(key, loader);
+        return cached(stdCache, key, loader);
     }
 
+    /** 10-minute cache — for standings, team lists, schedules. */
     private <T> T cachedStatic(String key, java.util.function.Supplier<T> loader) {
-        return cached(key, loader);
+        return cached(staticCache, key, loader);
     }
 
     @SuppressWarnings("unchecked")
-    private <T> T cached(String key, java.util.function.Supplier<T> loader) {
-        T result = (T) cache.getIfPresent(key);
+    private <T> T cached(Cache<String, Object> c, String key, java.util.function.Supplier<T> loader) {
+        T result = (T) c.getIfPresent(key);
         if (result != null) {
             log.debug("ESPN cache HIT: '{}'", key);
             return result;
@@ -985,7 +1057,7 @@ public class EspnFootballDataService {
         log.debug("ESPN cache MISS: '{}'", key);
         result = loader.get();
         if (result != null) {
-            cache.put(key, result);
+            c.put(key, result);
         }
         return result;
     }
