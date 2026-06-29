@@ -71,6 +71,12 @@ public class AuthController {
         log.info("login: attempt for email='{}'", req.email());
         authManager.authenticate(new UsernamePasswordAuthenticationToken(req.email(), req.password()));
         var user = userService.getByEmail(req.email());
+
+        // ✅ Add this check
+        if (user.getStatus() == UserStatus.DISABLED) {
+            throw ApiException.badRequest("Your account has been deactivated. Please contact support.");
+        }
+
         log.info("login: success for email='{}'", req.email());
         return ResponseEntity.ok(ApiResponse.ok(buildAuthResponse(user, res)));
     }
