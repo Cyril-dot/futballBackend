@@ -69,7 +69,6 @@ public class AuthController {
             @Valid @RequestBody AuthDtos.LoginRequest req,
             HttpServletResponse res) {
         log.info("login: attempt for email='{}'", req.email());
-        log.info("we active");
         authManager.authenticate(new UsernamePasswordAuthenticationToken(req.email(), req.password()));
         var user = userService.getByEmail(req.email());
 
