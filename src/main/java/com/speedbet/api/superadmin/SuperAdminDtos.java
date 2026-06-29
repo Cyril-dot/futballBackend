@@ -4,6 +4,7 @@ import com.speedbet.api.wallet.TxKind;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.util.Map;
 import java.util.UUID;
 
@@ -20,6 +21,18 @@ public class SuperAdminDtos {
             long totalDepositCount,
             long totalWithdrawalCount,
             String currency
+    ) {}
+
+    // Inside SuperAdminDtos class
+
+    public record UserStatusUpdateDto(
+            UUID userId,
+            String email,
+            String firstName,
+            String lastName,
+            String status,
+            String message,
+            LocalDateTime updatedAt
     ) {}
 
     // ─── Paginated User List ──────────────────────────────────────────────────
