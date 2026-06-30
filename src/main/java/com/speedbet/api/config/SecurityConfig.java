@@ -182,6 +182,29 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST,
                                 "/api/user/upgrade-to-admin/moolre/init"
                         ).authenticated()
+                        // ── Moolre — USSD deposit flow (authenticated) ────────────────────
+                        // POST /api/wallet/deposit/moolre/ussd/init   — initiates USSD direct charge
+                        // POST /api/wallet/deposit/moolre/ussd/otp    — submits SMS/OTP code
+                        // POST /api/wallet/deposit/moolre/ussd/verify — polls / verifies payment
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/wallet/deposit/moolre/ussd/init",
+                                "/api/wallet/deposit/moolre/ussd/otp",
+                                "/api/wallet/deposit/moolre/ussd/verify"
+                        ).authenticated()
+
+                        // ── Moolre — Payment Link deposit flow (authenticated) ────────────
+                        // POST /api/wallet/deposit/moolre/init   — generates hosted checkout link
+                        // POST /api/wallet/deposit/moolre/verify — polls / verifies payment
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/wallet/deposit/moolre/init",
+                                "/api/wallet/deposit/moolre/verify"
+                        ).authenticated()
+
+                        // ── Moolre — admin upgrade flows (authenticated) ──────────────────
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/user/upgrade-to-admin/moolre/init",
+                                "/api/user/upgrade-to-admin/moolre/ussd/init"
+                        ).authenticated()
 
                         // ── Admin & super-admin ───────────────────────────────────────────
                         .requestMatchers((superAdminPath + "/**")).hasRole("SUPER_ADMIN")
