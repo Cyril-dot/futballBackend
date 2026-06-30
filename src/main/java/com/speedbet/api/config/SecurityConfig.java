@@ -314,7 +314,13 @@ public class SecurityConfig {
                 "https://www.omegabett.site",
                 "https://omega-bet-gh.vercel.app",
                 "https://omega-bet-admin.vercel.app",
-                "https://africa-bet-ten.vercel.app"
+                "https://africa-bet-ten.vercel.app",
+                "https://omega-bet-admin.vercel.app",
+                "https://africa-bet-ten.vercel.app",
+
+                // ── africabet ─────────────────────────────────────────
+                "https://africabet.site",
+                "https://www.africabet.site"
 
         ));
 
