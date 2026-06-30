@@ -134,6 +134,7 @@ public class SuperAdminQueryService {
                 user.getPhone(),
                 user.getCountry(),
                 user.getRole().name(),
+                user.getStatus().name(),
                 user.isEmailVerified(),
                 createdAt,
                 walletDto
@@ -243,9 +244,9 @@ public class SuperAdminQueryService {
         Pageable p = pageable.getSort().isSorted()
                 ? pageable
                 : PageRequest.of(
-                        pageable.getPageNumber(),
-                        pageable.getPageSize(),
-                        Sort.by(Sort.Direction.DESC, "createdAt"));
+                pageable.getPageNumber(),
+                pageable.getPageSize(),
+                Sort.by(Sort.Direction.DESC, "createdAt"));
 
         return txRepo.findAll(TransactionSpecs.filtered(kind, status, walletId, from, to), p)
                 .map(tx -> {
@@ -281,6 +282,7 @@ public class SuperAdminQueryService {
         return new SuperAdminDtos.UserSummaryDto(
                 u.getId(), u.getEmail(), u.getFirstName(), u.getLastName(),
                 u.getPhone(), u.getCountry(), u.getRole().name(),
+                u.getStatus().name(),
                 u.isEmailVerified(),
                 u.getCreatedAt() != null ? u.getCreatedAt().toInstant(java.time.ZoneOffset.UTC) : null
         );

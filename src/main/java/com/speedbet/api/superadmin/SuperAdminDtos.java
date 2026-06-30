@@ -45,6 +45,7 @@ public class SuperAdminDtos {
             String phone,
             String country,
             String role,
+            String status,
             boolean emailVerified,
             Instant createdAt
     ) {}
@@ -59,6 +60,7 @@ public class SuperAdminDtos {
             String phone,
             String country,
             String role,
+            String status,
             boolean emailVerified,
             Instant createdAt,
             WalletSummaryDto wallet
