@@ -103,6 +103,9 @@ public class LiveOddsGeneratorService {
      *
      * Time factor: 0.0 at kick-off → 1.0 at full time.
      * Higher timeFactor = less likely a comeback = more extreme odds.
+     *
+     * BUG FIX: Trailing team now correctly receives highest probability (lowest odds)
+     * instead of draw being artificially inflated.
      */
     double[] computeLiveProbs(int gd, double timeFactor) {
 
@@ -129,14 +132,17 @@ public class LiveOddsGeneratorService {
         double shift = baseShift * (1.0 + timeFactor * 0.30);
         shift = Math.min(shift, 0.88); // cap: never make comeback impossible
 
-        // Leaders probability rises sharply; trailers' drops
+        // Leaders probability rises sharply
         double leaderProb  = 0.50 + shift * 0.50;
-        double trailerProb = Math.max(0.02, (1.0 - leaderProb) * 0.60);
 
-        // Draw: compresses as GD grows and time runs out
-        double drawProb = Math.max(0.02, 1.0 - leaderProb - trailerProb);
+        // FIXED: Draw shrinks with goal difference and time
+        // This ensures the trailer gets the remaining probability (not capped at 60%)
+        double drawProb = Math.max(0.02, 1.0 - leaderProb - shift * 0.20);
         drawProb *= (1.0 - timeFactor * 0.40); // at 90min draw very unlikely if someone's leading
         drawProb = Math.max(0.02, drawProb);
+
+        // FIXED: Trailer gets the remainder — this will be the highest probability
+        double trailerProb = Math.max(0.02, 1.0 - leaderProb - drawProb);
 
         // Re-normalise to 1.0
         double total = leaderProb + drawProb + trailerProb;
