@@ -20,6 +20,7 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -59,6 +60,75 @@ public class SuperAdminController {
         auditService.log(actor.getId(), "CREATE_ADMIN", "users", admin.getId(),
                 null, Map.of("email", admin.getEmail()), null);
         return ResponseEntity.ok(ApiResponse.ok(admin, "Admin created"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // NEW: CREATE ADMIN WITH COMMISSION RATE
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * POST /api/super-admin/admins/with-commission
+     *
+     * Creates a new admin AND sets their commission rate in one step, at
+     * creation time — calls UserService.createAdminWithCommissionRate(...),
+     * a separate method from the one the existing POST /admins endpoint
+     * above calls. That endpoint (and UserService.createAdmin) are left
+     * completely untouched; admins created through it still get no referral
+     * link / commission rate until updateAdminCommissionRate (below) is
+     * called on them separately.
+     *
+     * Required body fields: email, password, firstName, lastName, commissionRate
+     *   commissionRate is sent as a plain numeric string, e.g. "60" means 60%.
+     *   UserService.createAdminWithCommissionRate validates it's between 0 and 100.
+     */
+    @PostMapping("/admins/with-commission")
+    public ResponseEntity<ApiResponse<User>> createAdminWithCommission(
+            @AuthenticationPrincipal User actor,
+            @RequestBody Map<String, String> req) {
+
+        var rate = new BigDecimal(req.get("commissionRate"));
+
+        var admin = userService.createAdminWithCommissionRate(
+                req.get("email"), req.get("password"),
+                req.get("firstName"), req.get("lastName"),
+                actor.getId(), rate);
+
+        auditService.log(actor.getId(), "CREATE_ADMIN_WITH_COMMISSION", "users", admin.getId(),
+                null, Map.of("email", admin.getEmail(), "commissionRate", rate.toPlainString()), null);
+
+        return ResponseEntity.ok(ApiResponse.ok(admin, "Admin created with " + rate + "% commission rate"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // NEW: UPDATE AN EXISTING ADMIN'S COMMISSION RATE
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * PATCH /api/super-admin/admins/{adminId}/commission-rate
+     *
+     * Updates the commission rate on an existing admin's active referral
+     * link(s) — calls UserService.updateAdminCommissionRate(...), which
+     * confirms the target is actually an ADMIN before delegating to
+     * ReferralService.updateCommissionRate(). Takes effect immediately on
+     * the admin's next referred deposit; nothing already earned at the old
+     * rate is recalculated retroactively.
+     *
+     * Required body field: commissionRate — plain numeric string, e.g. "45" means 45%.
+     */
+    @PatchMapping("/admins/{adminId}/commission-rate")
+    public ResponseEntity<ApiResponse<User>> updateAdminCommissionRate(
+            @AuthenticationPrincipal User actor,
+            @PathVariable UUID adminId,
+            @RequestBody Map<String, String> req) {
+
+        var rate = new BigDecimal(req.get("commissionRate"));
+
+        var admin = userService.updateAdminCommissionRate(adminId, rate);
+
+        auditService.log(actor.getId(), "UPDATE_ADMIN_COMMISSION_RATE", "users", admin.getId(),
+                null, Map.of("commissionRate", rate.toPlainString()), null);
+
+        return ResponseEntity.ok(ApiResponse.ok(admin, "Commission rate updated to " + rate + "%"));
     }
 
     @GetMapping("/metrics")
