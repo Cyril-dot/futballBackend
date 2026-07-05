@@ -58,7 +58,7 @@ public class FlutterwaveGhDepositController extends AbstractFlutterwaveDepositCo
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
 
-    @Value("${app.platform.min-deposit-amount-ghs:5}")
+    @Value("${app.platform.min-deposit-amount-ghs:1}")
     private BigDecimal minDeposit;
 
     @Value("${app.platform.frontend-url}")

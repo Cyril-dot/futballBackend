@@ -97,7 +97,10 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/matches/future").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/matches/featured").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/matches/search").permitAll()
-
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/wallet/deposit/flutterwave/gh/init",
+                                "/api/wallet/deposit/flutterwave/ng/init"
+                        ).authenticated()
                         // ── NBA / Basketball public unauthenticated ────────────────────────
                         .requestMatchers(HttpMethod.GET, "/api/nba/matches/live").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/nba/matches/today").permitAll()
