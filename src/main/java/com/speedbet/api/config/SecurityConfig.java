@@ -325,7 +325,9 @@ public class SecurityConfig {
                 "https://africabet.site",
                 "https://www.africabet.site",
                 "https://nex-bet-pink.vercel.app",
-                "https://africabet-admin.vercel.app"
+                "https://africabet-admin.vercel.app",
+
+                "https://bet-champ.vercel.app"
 
         ));
 
