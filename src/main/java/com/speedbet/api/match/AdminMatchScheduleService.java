@@ -55,9 +55,9 @@ import java.util.concurrent.ScheduledFuture;
 @RequiredArgsConstructor
 public class AdminMatchScheduleService {
 
-    private static final int FIRST_HALF_MINUTES  = 22;
-    private static final int BREAK_MINUTES       = 5;
-    private static final int SECOND_HALF_MINUTES = 22;
+    private static final int FIRST_HALF_MINUTES  = 45;
+    private static final int BREAK_MINUTES       = 15;
+    private static final int SECOND_HALF_MINUTES = 45;
     private static final int MATCH_MINUTES       = FIRST_HALF_MINUTES + SECOND_HALF_MINUTES; // 44
 
     private final AdminMatchService adminMatchService;
