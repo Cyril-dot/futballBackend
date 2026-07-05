@@ -7,6 +7,7 @@ import com.speedbet.api.wallet.WalletService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.util.retry.Retry;
 
@@ -40,11 +41,14 @@ import java.util.UUID;
  *      anything. Never trust amount/status straight from the webhook body.
  *
  *   3. Flutterwave supports only ONE webhook URL per dashboard account.
- *      Both country controllers below expose their own /webhooks endpoint
- *      for separation of concerns, but only one of them (or a small router
- *      controller in front of both) can actually be registered in the
- *      Flutterwave dashboard at a time — pick one, or add a thin dispatcher
- *      that inspects data.currency and delegates.
+ *      A single router controller (FlutterwaveWebhookRouterController)
+ *      sits in front of both country controllers, inspects data.currency
+ *      in the incoming payload, and delegates to the right one via the
+ *      shared processWebhook() method below. Register ONLY the router's
+ *      URL — /api/webhooks/flutterwave — in the Flutterwave dashboard.
+ *      The per-country /api/webhooks/flutterwave/{gh,ng} endpoints still
+ *      exist and work standalone (useful for manual testing / curl), but
+ *      Flutterwave itself should only ever call the router URL.
  */
 @Slf4j
 public abstract class AbstractFlutterwaveDepositController {
@@ -217,6 +221,96 @@ public abstract class AbstractFlutterwaveDepositController {
         }
 
         return result;
+    }
+
+    // ─── Shared webhook processing ──────────────────────────────────────────
+
+    /**
+     * Shared body for both country controllers' webhook endpoints, and for
+     * the FlutterwaveWebhookRouterController that Flutterwave itself calls.
+     *
+     * Steps: verify the verif-hash header -> parse the event -> ignore
+     * anything that isn't charge.completed -> re-verify the transaction
+     * directly against Flutterwave's API (never trust the webhook body) ->
+     * confirm currency matches what this controller expects -> credit the
+     * wallet.
+     *
+     * @param verifHash        the "verif-hash" request header
+     * @param rawBody          the raw request body bytes
+     * @param expectedCurrency e.g. "GHS" or "NGN" — a mismatch is treated as
+     *                         an error, since it usually means the webhook
+     *                         router sent this payload to the wrong handler
+     * @param providerTag      e.g. "flutterwave_gh" or "flutterwave_ng" —
+     *                         stored on the wallet transaction for auditing
+     */
+    @SuppressWarnings("unchecked")
+    protected ResponseEntity<String> processWebhook(String verifHash, byte[] rawBody,
+                                                      String expectedCurrency, String providerTag) {
+        if (!verifyWebhookHash(verifHash)) {
+            log.warn("Flutterwave webhook [{}]: invalid or missing verif-hash", providerTag);
+            return ResponseEntity.status(400).body("Invalid signature");
+        }
+
+        try {
+            var event = (Map<String, Object>) objectMapper()
+                    .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
+
+            var eventType = String.valueOf(event.get("event"));
+            log.info("Flutterwave webhook [{}]: received event='{}'", providerTag, eventType);
+
+            if (!"charge.completed".equals(eventType)) {
+                log.info("Flutterwave webhook [{}]: ignoring event='{}'", providerTag, eventType);
+                return ResponseEntity.ok("Ignored");
+            }
+
+            var webhookData = (Map<String, Object>) event.get("data");
+            if (webhookData == null || webhookData.get("id") == null) {
+                log.error("Flutterwave webhook [{}]: missing data.id in payload", providerTag);
+                return ResponseEntity.status(400).body("Missing transaction id");
+            }
+
+            var flwTransactionId = Long.parseLong(webhookData.get("id").toString());
+
+            // Do NOT trust webhookData directly — re-verify against Flutterwave's API.
+            var verified = verifyTransaction(flwTransactionId);
+
+            var status   = String.valueOf(verified.get("status"));
+            var currency = String.valueOf(verified.get("currency"));
+
+            if (!"successful".equals(status)) {
+                log.info("Flutterwave webhook [{}]: flwTransactionId={} verified status='{}' — not crediting",
+                        providerTag, flwTransactionId, status);
+                return ResponseEntity.ok("Not successful, ignored");
+            }
+
+            if (!expectedCurrency.equals(currency)) {
+                log.error("Flutterwave webhook [{}]: flwTransactionId={} unexpected currency='{}' (expected {})",
+                        providerTag, flwTransactionId, currency, expectedCurrency);
+                return ResponseEntity.status(400).body("Unexpected currency");
+            }
+
+            var meta = (Map<String, Object>) verified.get("meta");
+            if (meta == null || meta.get("userId") == null) {
+                log.error("Flutterwave webhook [{}]: verified data missing meta.userId, flwTransactionId={}",
+                        providerTag, flwTransactionId);
+                return ResponseEntity.status(400).body("Missing userId in meta");
+            }
+
+            var userId = UUID.fromString(meta.get("userId").toString());
+            var ref    = String.valueOf(verified.get("tx_ref"));
+            var amount = new BigDecimal(verified.get("amount").toString());
+
+            handleVerifiedDeposit(userId, ref, amount, expectedCurrency, providerTag);
+
+        } catch (ApiException e) {
+            log.error("Flutterwave webhook [{}]: bad request — {}", providerTag, e.getMessage(), e);
+            return ResponseEntity.status(400).body("Bad request: " + e.getMessage());
+        } catch (Exception e) {
+            log.error("Flutterwave webhook [{}]: unexpected error — will retry", providerTag, e);
+            return ResponseEntity.status(500).body("Processing error");
+        }
+
+        return ResponseEntity.ok("OK");
     }
 
     // ─── Shared deposit crediting ───────────────────────────────────────────

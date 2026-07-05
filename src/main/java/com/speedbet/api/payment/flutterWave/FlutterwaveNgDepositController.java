@@ -19,7 +19,7 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -33,23 +33,24 @@ import java.util.UUID;
  *           (data.status == "pending" at this point — the customer still
  *           has to dial the code on their phone to actually pay)
  *   2. Customer dials the USSD code and completes payment on their bank's menu
- *   3. Flutterwave sends a "charge.completed" webhook to
- *        POST /api/webhooks/flutterwave/ng
+ *   3. Flutterwave sends a "charge.completed" webhook
  *        -> we re-verify the transaction server-side, then credit the wallet
  *
- * NOTE: Flutterwave only allows one webhook URL per dashboard account. If
- * this and the Ghana controller are both deployed, only one of these
- * /webhooks endpoints can be registered directly — otherwise add a small
- * router in front of both that inspects data.currency and delegates.
+ * NOTE: Flutterwave only allows one webhook URL per dashboard account.
+ * Register FlutterwaveWebhookRouterController's URL
+ * (/api/webhooks/flutterwave) in the Flutterwave dashboard — NOT this
+ * controller's /api/webhooks/flutterwave/ng directly. The router inspects
+ * data.currency and delegates here via webhook(...) below. This endpoint
+ * still works standalone too (e.g. for manual curl testing).
  */
 @Slf4j
 @RestController
 @RequiredArgsConstructor
 public class FlutterwaveNgDepositController extends AbstractFlutterwaveDepositController {
 
-    private static final String CHARGE_TYPE       = "ussd";
-    private static final String EXPECTED_CURRENCY = "NGN";
-    private static final String PROVIDER_TAG      = "flutterwave_ng";
+    static final String CHARGE_TYPE       = "ussd";
+    static final String EXPECTED_CURRENCY = "NGN";
+    static final String PROVIDER_TAG      = "flutterwave_ng";
 
     private final WalletService     walletService;
     private final ReferralService   referralService;
@@ -97,7 +98,7 @@ public class FlutterwaveNgDepositController extends AbstractFlutterwaveDepositCo
         log.info("initDeposit(NG): userId='{}' amount={} accountBank='{}' txRef='{}'",
                 user.getId(), amount, accountBank, txRef);
 
-        var body = new java.util.HashMap<String, Object>();
+        var body = new HashMap<String, Object>();
         body.put("account_bank", accountBank.toString());
         body.put("amount", amount);
         body.put("currency", EXPECTED_CURRENCY);
@@ -118,87 +119,17 @@ public class FlutterwaveNgDepositController extends AbstractFlutterwaveDepositCo
 
     // ─── Webhook ──────────────────────────────────────────────────────────────
 
+    /**
+     * Standalone NG webhook endpoint. Kept for direct testing (e.g. curl),
+     * but Flutterwave itself should be pointed at
+     * FlutterwaveWebhookRouterController's /api/webhooks/flutterwave instead,
+     * since only one webhook URL can be registered per Flutterwave account.
+     */
     @PostMapping("/api/webhooks/flutterwave/ng")
     public ResponseEntity<String> webhook(
             @RequestHeader(value = "verif-hash", required = false) String verifHash,
-            HttpServletRequest request) {
-
-        byte[] rawBody;
-        try {
-            rawBody = request.getInputStream().readAllBytes();
-        } catch (Exception e) {
-            log.error("Flutterwave NG webhook: failed to read request body", e);
-            return ResponseEntity.status(400).body("Failed to read body");
-        }
-
-        if (!verifyWebhookHash(verifHash)) {
-            log.warn("Flutterwave NG webhook: invalid or missing verif-hash");
-            return ResponseEntity.status(400).body("Invalid signature");
-        }
-
-        try {
-            @SuppressWarnings("unchecked")
-            var event = (Map<String, Object>) objectMapper()
-                    .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
-
-            var eventType = String.valueOf(event.get("event"));
-            log.info("Flutterwave NG webhook: received event='{}'", eventType);
-
-            if (!"charge.completed".equals(eventType)) {
-                log.info("Flutterwave NG webhook: ignoring event='{}'", eventType);
-                return ResponseEntity.ok("Ignored");
-            }
-
-            @SuppressWarnings("unchecked")
-            var webhookData = (Map<String, Object>) event.get("data");
-            if (webhookData == null || webhookData.get("id") == null) {
-                log.error("Flutterwave NG webhook: missing data.id in payload");
-                return ResponseEntity.status(400).body("Missing transaction id");
-            }
-
-            var flwTransactionId = Long.parseLong(webhookData.get("id").toString());
-
-            // Do NOT trust webhookData directly — re-verify against Flutterwave's API.
-            var verified = verifyTransaction(flwTransactionId);
-
-            var status   = String.valueOf(verified.get("status"));
-            var currency = String.valueOf(verified.get("currency"));
-
-            if (!"successful".equals(status)) {
-                log.info("Flutterwave NG webhook: flwTransactionId={} verified status='{}' — not crediting",
-                        flwTransactionId, status);
-                return ResponseEntity.ok("Not successful, ignored");
-            }
-
-            if (!EXPECTED_CURRENCY.equals(currency)) {
-                log.error("Flutterwave NG webhook: flwTransactionId={} unexpected currency='{}' (expected {})",
-                        flwTransactionId, currency, EXPECTED_CURRENCY);
-                return ResponseEntity.status(400).body("Unexpected currency");
-            }
-
-            @SuppressWarnings("unchecked")
-            var meta = (Map<String, Object>) verified.get("meta");
-            if (meta == null || meta.get("userId") == null) {
-                log.error("Flutterwave NG webhook: verified data missing meta.userId, flwTransactionId={}",
-                        flwTransactionId);
-                return ResponseEntity.status(400).body("Missing userId in meta");
-            }
-
-            var userId = UUID.fromString(meta.get("userId").toString());
-            var ref    = String.valueOf(verified.get("tx_ref"));
-            var amount = new BigDecimal(verified.get("amount").toString());
-
-            handleVerifiedDeposit(userId, ref, amount, EXPECTED_CURRENCY, PROVIDER_TAG);
-
-        } catch (ApiException e) {
-            log.error("Flutterwave NG webhook: bad request — {}", e.getMessage(), e);
-            return ResponseEntity.status(400).body("Bad request: " + e.getMessage());
-        } catch (Exception e) {
-            log.error("Flutterwave NG webhook: unexpected error — will retry", e);
-            return ResponseEntity.status(500).body("Processing error");
-        }
-
-        return ResponseEntity.ok("OK");
+            @RequestBody byte[] rawBody) {
+        return processWebhook(verifHash, rawBody, EXPECTED_CURRENCY, PROVIDER_TAG);
     }
 
     // ─── Helpers ────────────────────────────────────────────────────────────
