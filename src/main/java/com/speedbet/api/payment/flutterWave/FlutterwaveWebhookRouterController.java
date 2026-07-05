@@ -23,6 +23,24 @@ import java.nio.charset.StandardCharsets;
  * + wallet credit via the shared processWebhook() logic in
  * AbstractFlutterwaveDepositController.
  *
+ * Routing is by CURRENCY only, not charge type. This is intentional:
+ *   - GHS  -> FlutterwaveGhDepositController      (Mobile Money)
+ *   - NGN  -> FlutterwaveNgDepositController       (USSD *and* Pay with
+ *             Bank / "mono" charges both land here — processWebhook() only
+ *             needs currency + tx id to verify and credit, so it doesn't
+ *             matter which NGN charge type produced the event.
+ *             FlutterwaveNgBankDepositController's own standalone
+ *             /api/webhooks/flutterwave/ng-bank endpoint exists only for
+ *             manual curl testing and is never hit by real traffic through
+ *             this router.)
+ *
+ * ngBankController is currently unused by route() below — it's injected so
+ * it's one line to wire up if NGN charge types ever need to be split apart
+ * (e.g. different fraud handling for USSD vs. bank-authorized charges).
+ * Until then, adding it as a case here would be redundant: both paths would
+ * call into logic backed by the same processWebhook()/verifyTransaction()
+ * behavior.
+ *
  * Safe by construction: even if the currency sniff below is ever wrong,
  * the delegated controller re-checks expectedCurrency against Flutterwave's
  * own verify response and rejects a mismatch with 400 "Unexpected currency"
@@ -31,17 +49,19 @@ import java.nio.charset.StandardCharsets;
  * IMPORTANT: register only THIS controller's URL —
  *   https://<your-domain>/api/webhooks/flutterwave
  * in the Flutterwave dashboard. Do NOT register
- * /api/webhooks/flutterwave/gh or /api/webhooks/flutterwave/ng directly;
- * those still work for manual testing (e.g. curl) but Flutterwave itself
- * will only ever call one URL, and this is that URL.
+ * /api/webhooks/flutterwave/gh, /api/webhooks/flutterwave/ng, or
+ * /api/webhooks/flutterwave/ng-bank directly; those still work for manual
+ * testing (e.g. curl) but Flutterwave itself will only ever call one URL,
+ * and this is that URL.
  */
 @Slf4j
 @RestController
 @RequiredArgsConstructor
 public class FlutterwaveWebhookRouterController {
 
-    private final FlutterwaveGhDepositController ghController;
-    private final FlutterwaveNgDepositController ngController;
+    private final FlutterwaveGhDepositController     ghController;
+    private final FlutterwaveNgDepositController     ngController;
+    private final FlutterwaveNgBankDepositController ngBankController; // see class doc — reserved for future use
 
     @PostMapping("/api/webhooks/flutterwave")
     public ResponseEntity<String> route(
@@ -61,6 +81,8 @@ public class FlutterwaveWebhookRouterController {
         }
 
         if (containsCurrency(bodyStr, "NGN")) {
+            // Covers both USSD and Pay-with-Bank (mono) NGN charges — see
+            // class-level doc for why this doesn't need to distinguish them.
             log.info("Flutterwave webhook router: routing to NG handler");
             return ngController.webhook(verifHash, rawBody);
         }

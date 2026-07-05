@@ -10,13 +10,17 @@ import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.util.UriComponentsBuilder;
 
 import java.math.BigDecimal;
 import java.util.HashMap;
@@ -29,13 +33,25 @@ import java.util.UUID;
  *
  * Flow:
  *   1. POST /api/wallet/deposit/flutterwave/ng-bank/init
- *        -> calls POST /v3/charges?type=mono
+ *        -> calls POST /v3/charges?type=mono, passing redirect_url pointing
+ *           back at THIS controller's /redirect endpoint (not the frontend
+ *           directly — see note below)
  *        -> Flutterwave returns data.auth_url — redirect the customer there
  *           to log in to / link their bank account and authorize the debit
  *           (data.status == "pending" at this point — nothing has been
  *           charged until the customer completes the auth_url flow)
- *   2. Customer completes authorization at auth_url
- *   3. Flutterwave sends a "charge.completed" webhook
+ *   2. Customer completes authorization at auth_url. Flutterwave then
+ *      redirects the customer's browser (GET) to our redirect_url, appending
+ *      its own query params: status, tx_ref, transaction_id.
+ *   3. GET /api/wallet/deposit/flutterwave/ng-bank/redirect (this controller)
+ *        -> normalizes Flutterwave's "status" into our frontend's expected
+ *           "payment=success|failed" shape and 302s the browser to
+ *           {frontendUrl}/deposit?payment=...&tx_ref=...&method=ngbank
+ *        -> This is just a UX hop for showing a waiting/status screen — it
+ *           does NOT credit the wallet. Crediting only ever happens via the
+ *           webhook + server-side verifyTransaction(), since a redirect can
+ *           be spoofed/skipped by the client.
+ *   4. Flutterwave (separately) sends a "charge.completed" webhook
  *        -> we re-verify the transaction server-side, then credit the wallet
  *
  * NOTE: Flutterwave only allows one webhook URL per dashboard account.
@@ -63,6 +79,16 @@ public class FlutterwaveNgBankDepositController extends AbstractFlutterwaveDepos
 
     @Value("${app.platform.min-deposit-amount-ngn:200}")
     private BigDecimal minDeposit;
+
+    /**
+     * Publicly reachable base URL of THIS backend (e.g.
+     * "https://futballbackend-production-67b0.up.railway.app"), used to build
+     * the redirect_url Flutterwave calls back after bank authorization.
+     * Distinct from frontendUrl (inherited from the abstract base), which is
+     * where we forward the browser to *after* normalizing Flutterwave's params.
+     */
+    @Value("${app.platform.backend-public-url}")
+    private String backendPublicUrl;
 
     @Override protected WalletService walletService()         { return walletService; }
     @Override protected ReferralService referralService()     { return referralService; }
@@ -97,6 +123,11 @@ public class FlutterwaveNgBankDepositController extends AbstractFlutterwaveDepos
         log.info("initDeposit(NG-Bank): userId='{}' amount={} txRef='{}'",
                 user.getId(), amount, txRef);
 
+        // Points back at OUR /redirect endpoint below (not the frontend
+        // directly) so we can normalize Flutterwave's status/tx_ref params
+        // into the shape the frontend expects before forwarding the browser.
+        var redirectUrl = backendPublicUrl + "/api/wallet/deposit/flutterwave/ng-bank/redirect";
+
         var body = new HashMap<String, Object>();
         body.put("amount", amount);
         body.put("email", user.getEmail());
@@ -105,6 +136,7 @@ public class FlutterwaveNgBankDepositController extends AbstractFlutterwaveDepos
         body.put("fullname", fullName);
         body.put("phone_number", phoneNumber);
         body.put("client_ip", clientIp);
+        body.put("redirect_url", redirectUrl);
         body.put("meta", Map.of("userId", user.getId().toString()));
 
         var response = charge(CHARGE_TYPE, body);
@@ -131,6 +163,54 @@ public class FlutterwaveNgBankDepositController extends AbstractFlutterwaveDepos
             @RequestHeader(value = "verif-hash", required = false) String verifHash,
             @RequestBody byte[] rawBody) {
         return processWebhook(verifHash, rawBody, EXPECTED_CURRENCY, PROVIDER_TAG);
+    }
+
+    // ─── Redirect callback (browser hop, NOT a trust boundary) ────────────────
+
+    /**
+     * Flutterwave sends the customer's browser here (GET) after they finish
+     * authorizing the bank charge at auth_url. Flutterwave appends its own
+     * query params — typically:
+     *   status         "successful" | "failed" | "cancelled"
+     *   tx_ref         our original tx_ref
+     *   transaction_id Flutterwave's numeric transaction id
+     *
+     * We do NOT trust "status" here for crediting anything — it's purely
+     * cosmetic, to decide which waiting/result screen to show the customer
+     * while they wait for the webhook (processWebhook() -> verifyTransaction())
+     * to actually credit the wallet. We just normalize it into the
+     * "payment=success|failed" shape the frontend's DepositPage already
+     * handles for the GH Mobile Money redirect, tagging it with
+     * "method=ngbank" so the frontend routes it to the right state instead of
+     * defaulting to the GH flow.
+     *
+     * A missing/blank tx_ref, or any status other than "successful", is
+     * treated as failed — better to show "couldn't confirm, contact support"
+     * than to imply success on a bad or incomplete callback.
+     */
+    @GetMapping("/api/wallet/deposit/flutterwave/ng-bank/redirect")
+    public ResponseEntity<Void> redirect(
+            @RequestParam(value = "status", required = false) String status,
+            @RequestParam(value = "tx_ref", required = false) String txRef,
+            @RequestParam(value = "transaction_id", required = false) String transactionId) {
+
+        var normalizedStatus = "successful".equalsIgnoreCase(status) && txRef != null && !txRef.isBlank()
+                ? "success"
+                : "failed";
+
+        log.info("redirect(NG-Bank): flutterwave status='{}' txRef='{}' transactionId='{}' -> forwarding as '{}'",
+                status, txRef, transactionId, normalizedStatus);
+
+        var target = UriComponentsBuilder.fromUriString(frontendUrl + "/deposit")
+                .queryParam("payment", normalizedStatus)
+                .queryParamIfPresent("tx_ref", java.util.Optional.ofNullable(txRef))
+                .queryParam("method", "ngbank")
+                .build(true)
+                .toUri();
+
+        return ResponseEntity.status(HttpStatus.FOUND)
+                .location(target)
+                .build();
     }
 
     // ─── Helpers ────────────────────────────────────────────────────────────

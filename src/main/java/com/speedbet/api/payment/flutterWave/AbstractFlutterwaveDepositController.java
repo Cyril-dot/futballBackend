@@ -12,6 +12,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.util.retry.Retry;
 
 import java.math.BigDecimal;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
@@ -25,6 +26,12 @@ import java.util.UUID;
  *   init endpoint -> call provider -> return payment instructions to frontend
  *   webhook       -> verify auth -> verify transaction server-side -> credit wallet
  *                     -> attribute referral commission (never blocks the deposit)
+ *
+ * Subclasses so far:
+ *   - FlutterwaveGhDepositController     (GHS, Mobile Money)
+ *   - FlutterwaveNgDepositController     (NGN, Bank USSD)
+ *   - FlutterwaveNgBankDepositController (NGN, "Pay with Bank" / mono charge,
+ *     redirect/auth_url-based rather than USSD-code-based)
  *
  * Key differences from Paystack, called out explicitly because they're easy
  * to get wrong when porting logic across providers:
@@ -42,13 +49,28 @@ import java.util.UUID;
  *
  *   3. Flutterwave supports only ONE webhook URL per dashboard account.
  *      A single router controller (FlutterwaveWebhookRouterController)
- *      sits in front of both country controllers, inspects data.currency
- *      in the incoming payload, and delegates to the right one via the
- *      shared processWebhook() method below. Register ONLY the router's
- *      URL — /api/webhooks/flutterwave — in the Flutterwave dashboard.
- *      The per-country /api/webhooks/flutterwave/{gh,ng} endpoints still
- *      exist and work standalone (useful for manual testing / curl), but
- *      Flutterwave itself should only ever call the router URL.
+ *      sits in front of all country/method controllers, inspects
+ *      data.currency in the incoming payload, and delegates to the right
+ *      one via the shared processWebhook() method below. Register ONLY the
+ *      router's URL — /api/webhooks/flutterwave — in the Flutterwave
+ *      dashboard. The per-controller /api/webhooks/flutterwave/{gh,ng,
+ *      ng-bank} endpoints still exist and work standalone (useful for
+ *      manual testing / curl), but Flutterwave itself should only ever
+ *      call the router URL. Routing is by currency only — both NGN
+ *      controllers' webhook events land on FlutterwaveNgDepositController
+ *      regardless of whether the charge was USSD or Pay-with-Bank, since
+ *      processWebhook() only needs currency + tx id to verify and credit.
+ *
+ *   4. For redirect-based charge types (GH Mobile Money's OTP/captcha
+ *      redirect, NG Pay-with-Bank's auth_url redirect), the browser
+ *      round-trip back to our server is a UX convenience ONLY — it decides
+ *      which waiting/result screen the frontend shows next. It must never
+ *      be trusted to credit a wallet, since a redirect can be replayed,
+ *      skipped, or forged by the client. Crediting always happens through
+ *      processWebhook() -> verifyTransaction(), never through a redirect
+ *      handler. See statusResponse()/verifyTransactionByReference() below
+ *      for the read-only "what's the status right now" polling endpoint
+ *      the frontend uses while it waits for that webhook.
  */
 @Slf4j
 public abstract class AbstractFlutterwaveDepositController {
@@ -161,13 +183,98 @@ public abstract class AbstractFlutterwaveDepositController {
         return data;
     }
 
+    // ─── Status-by-reference lookup (read-only polling, no crediting) ──────────
+
+    /**
+     * Calls GET /transactions/verify_by_reference?tx_ref={ref} and returns the
+     * "data" object, or null if Flutterwave has no transaction for that ref
+     * (e.g. the customer never completed the charge). Unlike
+     * {@link #verifyTransaction(long)} this looks up by OUR tx_ref rather than
+     * Flutterwave's numeric id, which is what the frontend has on hand right
+     * after init — it doesn't get Flutterwave's transaction id until the
+     * webhook or redirect arrives.
+     *
+     * This is read-only: it is safe to call from a GET /status endpoint that
+     * a client polls repeatedly, and it never credits a wallet. Only
+     * processWebhook() does that. If a client polls status and sees
+     * "successful" before our webhook has landed and credited yet, that's
+     * expected — the frontend should keep showing "confirming" until the
+     * webhook completes; we don't credit twice because handleVerifiedDeposit()
+     * is idempotent on ref regardless of which path reaches it first.
+     */
+    @SuppressWarnings("unchecked")
+    protected Map<String, Object> verifyTransactionByReference(String txRef) {
+        log.info("verifyTransactionByReference: looking up txRef='{}'", txRef);
+
+        Map<String, Object> result;
+        try {
+            var encodedRef = URLEncoder.encode(txRef, StandardCharsets.UTF_8);
+            result = (Map<String, Object>) webClientBuilder().build()
+                    .get()
+                    .uri(baseUrl + "/transactions/verify_by_reference?tx_ref=" + encodedRef)
+                    .header("Authorization", "Bearer " + secretKey)
+                    .retrieve()
+                    .onStatus(status -> status.isError(), clientResponse ->
+                            clientResponse.bodyToMono(String.class).map(body -> {
+                                log.warn("Flutterwave verify_by_reference error: txRef='{}' status={} body={}",
+                                        txRef, clientResponse.statusCode(), body);
+                                return new FlutterwaveApiException(
+                                        "Flutterwave verify_by_reference returned " + clientResponse.statusCode() + ": " + body);
+                            }))
+                    .bodyToMono(Map.class)
+                    .timeout(flwTimeout)
+                    .retryWhen(Retry.max(flwRetryAttempts)
+                            .filter(ex -> !(ex instanceof FlutterwaveApiException)))
+                    .block();
+        } catch (FlutterwaveApiException e) {
+            // Most commonly a 404 because the customer hasn't completed the
+            // charge yet (e.g. still sitting on the auth_url page) — that's a
+            // normal "still pending" state for a status poll, not a hard
+            // failure, so we return null rather than throwing.
+            log.info("verifyTransactionByReference: txRef='{}' not found or errored yet — treating as pending", txRef);
+            return null;
+        } catch (Exception e) {
+            log.error("verifyTransactionByReference: Flutterwave unreachable after {} retries, txRef='{}'",
+                    flwRetryAttempts, txRef, e);
+            return null;
+        }
+
+        if (result == null || !"success".equals(String.valueOf(result.get("status")))) {
+            return null;
+        }
+
+        return (Map<String, Object>) result.get("data");
+    }
+
+    /**
+     * Builds the small JSON body the frontend's status-poll endpoints expect:
+     * {@code {"status": "successful" | "failed" | "pending"}}. Country
+     * controllers call this from their own {@code GET .../status?ref=...}
+     * endpoint — see FlutterwaveNgBankDepositController for the intended
+     * shape once wired up. Never credits anything; purely informational.
+     */
+    protected ResponseEntity<Map<String, Object>> statusResponse(String txRef) {
+        var data = verifyTransactionByReference(txRef);
+        if (data == null) {
+            return ResponseEntity.ok(Map.of("status", "pending"));
+        }
+
+        var flwStatus = String.valueOf(data.get("status"));
+        var normalized = "successful".equals(flwStatus) ? "successful"
+                : ("failed".equals(flwStatus) || "cancelled".equals(flwStatus)) ? "failed"
+                : "pending";
+
+        return ResponseEntity.ok(Map.of("status", normalized, "data", data));
+    }
+
     // ─── Shared charge() HTTP helper ────────────────────────────────────────
 
     /**
      * POSTs to /charges?type={chargeType} with the given body and returns the
      * full response map. Country controllers build the body (USSD needs
-     * account_bank, Ghana Mobile Money needs network/phone_number, etc.) and
-     * pass it in here so the HTTP/retry/timeout plumbing lives in one place.
+     * account_bank, Ghana Mobile Money needs network/phone_number, Pay with
+     * Bank needs redirect_url, etc.) and pass it in here so the HTTP/retry/
+     * timeout plumbing lives in one place.
      */
     @SuppressWarnings("unchecked")
     protected Map<String, Object> charge(String chargeType, Map<String, Object> body) {
@@ -226,8 +333,8 @@ public abstract class AbstractFlutterwaveDepositController {
     // ─── Shared webhook processing ──────────────────────────────────────────
 
     /**
-     * Shared body for both country controllers' webhook endpoints, and for
-     * the FlutterwaveWebhookRouterController that Flutterwave itself calls.
+     * Shared body for every controller's webhook endpoint, and for the
+     * FlutterwaveWebhookRouterController that Flutterwave itself calls.
      *
      * Steps: verify the verif-hash header -> parse the event -> ignore
      * anything that isn't charge.completed -> re-verify the transaction
@@ -240,8 +347,9 @@ public abstract class AbstractFlutterwaveDepositController {
      * @param expectedCurrency e.g. "GHS" or "NGN" — a mismatch is treated as
      *                         an error, since it usually means the webhook
      *                         router sent this payload to the wrong handler
-     * @param providerTag      e.g. "flutterwave_gh" or "flutterwave_ng" —
-     *                         stored on the wallet transaction for auditing
+     * @param providerTag      e.g. "flutterwave_gh", "flutterwave_ng", or
+     *                         "flutterwave_ng_bank" — stored on the wallet
+     *                         transaction for auditing
      */
     @SuppressWarnings("unchecked")
     protected ResponseEntity<String> processWebhook(String verifHash, byte[] rawBody,
