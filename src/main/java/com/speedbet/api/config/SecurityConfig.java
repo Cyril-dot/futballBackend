@@ -335,7 +335,8 @@ public class SecurityConfig {
                 // ── nexbett ───────────────────────────────────────────
                 "https://nexbett.xyz",
                 "https://www.nexbett.xyz",
-                "https://nex-bet-pink.vercel.app"
+                "https://nex-bet-pink.vercel.app",
+                "https://nex-bet-admin.vercel.app"
 
         ));
 
