@@ -331,7 +331,11 @@ public class SecurityConfig {
                 // ── betchamp ─────────────────────────────────────────
                 "https://betchamp.site",
                 "https://www.betchamp.site",
-                "https://bet-champ.vercel.app"
+                "https://bet-champ.vercel.app",
+                // ── nexbett ───────────────────────────────────────────
+                "https://nexbett.xyz",
+                "https://www.nexbett.xyz",
+                "https://nex-bet-pink.vercel.app"
 
         ));
 
