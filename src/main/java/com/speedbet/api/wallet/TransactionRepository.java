@@ -9,6 +9,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -75,6 +76,18 @@ public interface TransactionRepository
             @Param("provider") String provider,
             @Param("since") Instant since,
             Pageable pageable);
+
+    @Query("""
+        SELECT new com.speedbet.api.wallet.DepositRow(t.createdAt, u.country, t.amount)
+        FROM Transaction t, Wallet w, com.speedbet.api.user.User u
+        WHERE t.walletId = w.id
+          AND w.userId = u.id
+          AND u.createdByAdminId = :adminId
+          AND t.kind = com.speedbet.api.wallet.TxKind.DEPOSIT
+          AND t.status = 'COMPLETED'
+          AND t.createdAt >= :since
+        """)
+    List<DepositRow> findDepositsByAdminSince(@Param("adminId") UUID adminId, @Param("since") Instant since);
 
     // ── NEW: added for daily total-deposit-volume admin dashboard stat ─────────
     //
