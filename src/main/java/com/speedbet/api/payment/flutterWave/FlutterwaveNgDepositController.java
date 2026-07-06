@@ -57,7 +57,7 @@ public class FlutterwaveNgDepositController extends AbstractFlutterwaveDepositCo
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
 
-    @Value("${app.platform.min-deposit-amount-ngn:100}")
+    @Value("${app.platform.min-deposit-amount-ngn:20000}")
     private BigDecimal minDeposit;
 
     @Override protected WalletService walletService()         { return walletService; }
