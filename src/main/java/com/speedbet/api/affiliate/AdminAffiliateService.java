@@ -28,7 +28,7 @@ public class AdminAffiliateService {
     // (live mid-market rate was ~120.5 NGN/GHS as of Jul 2026). Since this is
     // hardcoded, it WILL drift from the real rate over time and needs to be
     // manually updated here if/when the business wants to re-peg it.
-    private static final BigDecimal NGN_PER_GHS = BigDecimal.valueOf(120);
+    private static final BigDecimal NGN_PER_GHS = BigDecimal.valueOf(135);
     private static final String NG_COUNTRY_CODE = "NG";
 
     private final ReferralRepository          referralRepo;
