@@ -3,6 +3,8 @@ package com.speedbet.api.affiliate;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.referral.Referral;
 import com.speedbet.api.referral.ReferralRepository;
+import com.speedbet.api.wallet.DepositRow;
+import com.speedbet.api.wallet.TransactionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -11,6 +13,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -20,9 +23,18 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class AdminAffiliateService {
 
+    // Hardcoded NGN -> GHS conversion rate: 1 GHS = 120 NGN (i.e. cedis = naira / 120).
+    // NOTE: this is a fixed approximation of the market rate at time of writing
+    // (live mid-market rate was ~120.5 NGN/GHS as of Jul 2026). Since this is
+    // hardcoded, it WILL drift from the real rate over time and needs to be
+    // manually updated here if/when the business wants to re-peg it.
+    private static final BigDecimal NGN_PER_GHS = BigDecimal.valueOf(120);
+    private static final String NG_COUNTRY_CODE = "NG";
+
     private final ReferralRepository          referralRepo;
     private final PayoutRequestRepository     payoutRequestRepo;
     private final AffiliateCommissionService  commissionService;
+    private final TransactionRepository       transactionRepo;
 
     // ─── Stats ────────────────────────────────────────────────────────────────
 
@@ -58,13 +70,28 @@ public class AdminAffiliateService {
     // ─── Payout Requests ─────────────────────────────────────────────────────
 
     /**
-     * Submit a payout request for the admin's full current commission balance.
+     * Convert a Nigerian-country deposit total (NGN) into Cedis (GHS).
+     * 1 GHS = 120 NGN (hardcoded), i.e. cedis = naira / 120.
+     */
+    private BigDecimal ngnDepositsToGhs(UUID adminId, Instant since) {
+        BigDecimal totalNaira = transactionRepo.findDepositsByAdminSince(adminId, since).stream()
+                .filter(row -> NG_COUNTRY_CODE.equalsIgnoreCase(row.country()))
+                .map(DepositRow::amount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        return totalNaira.divide(NGN_PER_GHS, 2, RoundingMode.HALF_UP);
+    }
+
+    /**
+     * Submit a payout request for the admin's full current commission balance,
+     * PLUS any Nigerian-deposit-derived amount (converted NGN → GHS at the
+     * hardcoded rate) accrued since their last payout.
      *
      * Admin can request any day — no day-of-week restriction.
      *
      * Rules:
      *   - No existing REQUESTED or APPROVED payout already pending
-     *   - Commission balance must be > 0
+     *   - Combined amount (commission balance + converted NG deposits) must be > 0
      *
      * Commission balance is NOT swept here — it is swept when super admin
      * calls markPaid(), so the admin keeps earning between request and payment.
@@ -82,20 +109,24 @@ public class AdminAffiliateService {
                             + "Please wait for it to be resolved before submitting a new one.");
 
         var commBalance = commissionService.getOrCreate(adminId);
+        Instant since = commBalance.getLastPayoutAt() != null ? commBalance.getLastPayoutAt() : Instant.EPOCH;
 
-        if (commBalance.getBalance().compareTo(BigDecimal.ZERO) <= 0)
+        BigDecimal ngDepositsInGhs = ngnDepositsToGhs(adminId, since);
+        BigDecimal payoutAmount = commBalance.getBalance().add(ngDepositsInGhs);
+
+        if (payoutAmount.compareTo(BigDecimal.ZERO) <= 0)
             throw ApiException.badRequest("No commission balance available to request a payout.");
 
         var request = payoutRequestRepo.save(
                 PayoutRequest.builder()
                         .adminId(adminId)
-                        .amount(commBalance.getBalance())
+                        .amount(payoutAmount)
                         .status(PayoutStatus.REQUESTED)
                         .periodEnd(Instant.now())
                         .build());
 
-        log.info("requestPayout: created id={} adminId={} commissionAmount={}",
-                request.getId(), adminId, request.getAmount());
+        log.info("requestPayout: created id={} adminId={} commissionBalance={} ngDepositsInGhs={} totalAmount={}",
+                request.getId(), adminId, commBalance.getBalance(), ngDepositsInGhs, payoutAmount);
 
         return request;
     }
@@ -138,10 +169,11 @@ public class AdminAffiliateService {
     }
 
     /**
-     * Mark an APPROVED payout as PAID and sweep the commission balance.
-     *
-     * Sweeps the FULL current commission balance at time of payment
-     * (may be more than the snapshotted amount if more commission
+     * Mark an APPROVED payout as PAID: sweeps the commission balance AND
+     * recomputes the NG-deposit conversion (NGN → GHS at the hardcoded rate)
+     * for the same "since" window used at request time, so the final paid
+     * amount = swept commission + converted NG deposits (may be slightly more
+     * than the snapshotted request amount if more commission or NG deposits
      * accrued between request and payment — admin gets it all).
      *
      * Main wallet is never touched.
@@ -154,17 +186,23 @@ public class AdminAffiliateService {
         if (request.getStatus() != PayoutStatus.APPROVED)
             throw ApiException.badRequest("Payout must be APPROVED before marking as PAID.");
 
-        BigDecimal actualSwept = commissionService.sweepCommissionBalance(request.getAdminId());
+        var commBalanceBefore = commissionService.getOrCreate(request.getAdminId());
+        Instant since = commBalanceBefore.getLastPayoutAt() != null
+                ? commBalanceBefore.getLastPayoutAt() : Instant.EPOCH;
 
-        if (actualSwept.compareTo(BigDecimal.ZERO) <= 0)
-            throw ApiException.badRequest("Commission balance is already zero — nothing to pay out.");
+        BigDecimal ngDepositsInGhs = ngnDepositsToGhs(request.getAdminId(), since);
+        BigDecimal sweptCommission = commissionService.sweepCommissionBalance(request.getAdminId());
+        BigDecimal totalPaid = sweptCommission.add(ngDepositsInGhs);
+
+        if (totalPaid.compareTo(BigDecimal.ZERO) <= 0)
+            throw ApiException.badRequest("Nothing to pay out — commission balance and NG deposits are both zero.");
 
         request.setStatus(PayoutStatus.PAID);
         request.setPaidAt(Instant.now());
-        request.setAmount(actualSwept);
+        request.setAmount(totalPaid);
 
-        log.info("markPaid: payoutId={} adminId={} commissionSwept={} marked PAID",
-                payoutId, request.getAdminId(), actualSwept);
+        log.info("markPaid: payoutId={} adminId={} sweptCommission={} ngDepositsInGhs={} totalPaid={} marked PAID",
+                payoutId, request.getAdminId(), sweptCommission, ngDepositsInGhs, totalPaid);
 
         return payoutRequestRepo.save(request);
     }
