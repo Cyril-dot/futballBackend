@@ -86,6 +86,8 @@ public class AdminAffiliateService {
      * after crediting into it any Nigerian-deposit-derived amount (converted
      * NGN → GHS at the hardcoded rate) accrued since their last payout.
      *
+     * Admin can request any day — no day-of-week restriction.
+     *
      * Rules:
      *   - No existing REQUESTED or APPROVED payout already pending
      *   - Balance (existing commission + freshly-credited NG deposits) must be > 0
@@ -112,7 +114,7 @@ public class AdminAffiliateService {
         BigDecimal ngDepositsInGhs = ngnDepositsToGhs(adminId, since);
 
         BigDecimal currentBalance = ngDepositsInGhs.compareTo(BigDecimal.ZERO) > 0
-                ? commissionService.creditCommission(adminId, ngDepositsInGhs)
+                ? commissionService.creditCommission(adminId, ngDepositsInGhs, commBalance.getCurrency()).getBalance()
                 : commBalance.getBalance();
 
         if (currentBalance.compareTo(BigDecimal.ZERO) <= 0)
@@ -174,7 +176,9 @@ public class AdminAffiliateService {
      *
      * NG-deposit conversion already happened at the hardcoded rate back in
      * requestPayout and was credited into the balance, so there is nothing
-     * left to recompute here — just sweep.
+     * left to recompute here — just sweep. (Recomputing with the same
+     * `since` cutoff here would double-count, since lastPayoutAt only
+     * advances when the sweep actually happens.)
      *
      * Main wallet is never touched.
      */
