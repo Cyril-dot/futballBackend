@@ -84,7 +84,8 @@ public class AdminAffiliateService {
     /**
      * Submit a payout request for the admin's current commission balance,
      * after crediting into it any Nigerian-deposit-derived amount (converted
-     * NGN → GHS at the hardcoded rate) accrued since their last payout.
+     * NGN → GHS at the hardcoded rate) accrued since the NG deposits were
+     * last swept up for this admin.
      *
      * Admin can request any day — no day-of-week restriction.
      *
@@ -92,8 +93,21 @@ public class AdminAffiliateService {
      *   - No existing REQUESTED or APPROVED payout already pending
      *   - Balance (existing commission + freshly-credited NG deposits) must be > 0
      *
-     * NG deposits are converted and credited exactly once per payout cycle,
-     * right here. markPaid() does not recompute them — it just sweeps the
+     * IMPORTANT — the "since" cutoff below is deliberately based on the
+     * creation time of the admin's most recent payout request (of ANY
+     * status), not on commBalance.getLastPayoutAt().
+     *
+     * commBalance.getLastPayoutAt() only advances when a payout is actually
+     * swept in markPaid(). If we used it here, a REJECTED request would
+     * leave lastPayoutAt untouched, so the very next requestPayout() call
+     * would recompute ngnDepositsToGhs() over the same window and credit
+     * the same Nigerian deposits into the balance a second time. Anchoring
+     * on the last PayoutRequest.createdAt instead means every request —
+     * approved, rejected, or paid — permanently closes off that window, so
+     * NG deposits are converted and credited exactly once, ever, no matter
+     * what happens to the request afterwards.
+     *
+     * markPaid() does not recompute NG deposits — it just sweeps the
      * balance this call already topped up.
      */
     @Transactional
@@ -109,7 +123,10 @@ public class AdminAffiliateService {
                             + "Please wait for it to be resolved before submitting a new one.");
 
         var commBalance = commissionService.getOrCreate(adminId);
-        Instant since = commBalance.getLastPayoutAt() != null ? commBalance.getLastPayoutAt() : Instant.EPOCH;
+
+        Instant since = payoutRequestRepo.findTopByAdminIdOrderByCreatedAtDesc(adminId)
+                .map(PayoutRequest::getCreatedAt)
+                .orElse(Instant.EPOCH);
 
         BigDecimal ngDepositsInGhs = ngnDepositsToGhs(adminId, since);
 
@@ -156,6 +173,9 @@ public class AdminAffiliateService {
     /**
      * Reject a payout. Commission balance is untouched —
      * the admin keeps their commission and can request again immediately.
+     * Their next request will NOT re-credit the NG deposits already folded
+     * into this rejected request's balance, since the "since" cutoff in
+     * requestPayout() is anchored on this request's createdAt.
      */
     @Transactional
     public PayoutRequest reject(UUID payoutId, String reason) {
@@ -176,9 +196,7 @@ public class AdminAffiliateService {
      *
      * NG-deposit conversion already happened at the hardcoded rate back in
      * requestPayout and was credited into the balance, so there is nothing
-     * left to recompute here — just sweep. (Recomputing with the same
-     * `since` cutoff here would double-count, since lastPayoutAt only
-     * advances when the sweep actually happens.)
+     * left to recompute here — just sweep.
      *
      * Main wallet is never touched.
      */
