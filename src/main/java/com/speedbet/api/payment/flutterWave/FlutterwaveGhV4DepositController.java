@@ -81,6 +81,34 @@ import java.util.UUID;
  *  relying on this in production.
  * ══════════════════════════════════════════════════════════════════════════
  *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  FIX (this revision) — Ghana mobile money network lineup updated.
+ *
+ *  Flutterwave's Ghana mobile money support is currently MTN, AirtelTigo,
+ *  and Telecel (Telecel Cash is the post-acquisition rebrand of Vodafone
+ *  Ghana; AirtelTigo is the merged Airtel/Tigo brand — the old standalone
+ *  "Tigo" network no longer exists on its own). The previous
+ *  VALID_NETWORKS = {"MTN", "VODAFONE", "TIGO"} was stale on both counts
+ *  and would have sent a network value Flutterwave no longer recognizes
+ *  for two of the three networks.
+ *
+ *  CAVEAT: Flutterwave's published v4 orchestrator docs only show a
+ *  confirmed literal example of `"network": "MTN"` in a real request/
+ *  response sample. I could not find a published, confirmed v4 sample
+ *  showing the exact string Flutterwave expects for AirtelTigo or
+ *  Telecel specifically (only their v3/legacy docs and marketing copy,
+ *  which describe the networks by name but don't show the raw API
+ *  enum value). NETWORK_API_VALUE below sends "AIRTELTIGO" and
+ *  "TELECEL" as the most likely values, following Flutterwave's own
+ *  naming — confirm the exact accepted strings against the v4 sandbox
+ *  (or Flutterwave support) before relying on this in production, same
+ *  as the other v4 caveats flagged in the abstract class.
+ *
+ *  Backward compatibility: resolveNetwork() below still accepts the old
+ *  "VODAFONE" and "TIGO" values from any client that hasn't been updated
+ *  yet, and maps them onto the new networks, rather than rejecting them.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
  * ─── Flow ─────────────────────────────────────────────────────────────────
  *
  *  1. Initiate charge — Deposit
@@ -112,8 +140,10 @@ import java.util.UUID;
  *   owning userId is resolved via the pendingCharges cache, not parsed
  *   out of this string (see FIX note above).
  *
- * ─── network values accepted by frontend ─────────────────────────────────
- *   "MTN", "VODAFONE", "TIGO"
+ * ─── network values accepted from the frontend ───────────────────────────
+ *   "MTN", "AIRTELTIGO", "TELECEL" — plus the legacy "VODAFONE" and "TIGO"
+ *   values, accepted for backward compatibility and mapped onto "TELECEL"
+ *   and "AIRTELTIGO" respectively (see FIX note above and resolveNetwork()).
  *
  * ─── application.properties keys needed ──────────────────────────────────
  *   See AbstractFlutterwaveV4DepositController for the shared v4 keys
@@ -128,7 +158,16 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
 
     private static final String EXPECTED_CURRENCY   = "GHS";
     private static final String GH_DIAL_CODE        = "233";
-    private static final Set<String> VALID_NETWORKS = Set.of("MTN", "VODAFONE", "TIGO");
+
+    /**
+     * Networks accepted from the frontend, including legacy values kept
+     * for backward compatibility (see resolveNetwork()). Validation
+     * happens against this full set; the value actually sent to
+     * Flutterwave is always the resolved/current network name.
+     */
+    private static final Set<String> VALID_NETWORKS =
+            Set.of("MTN", "AIRTELTIGO", "TELECEL", "VODAFONE", "TIGO", "AIRTEL");
+
     private static final String TXREF_PREFIX        = "GHV4-";
     private static final String PROVIDER_TAG        = "flutterwave_gh_v4";
 
@@ -164,10 +203,13 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
             throw ApiException.badRequest("phoneNumber is required");
         }
 
-        var network = req.get("network");
-        if (network == null || !VALID_NETWORKS.contains(network.toString().toUpperCase())) {
-            throw ApiException.badRequest("network must be one of " + VALID_NETWORKS);
+        var rawNetwork = req.get("network");
+        if (rawNetwork == null || !VALID_NETWORKS.contains(rawNetwork.toString().toUpperCase())) {
+            throw ApiException.badRequest("network must be one of MTN, AIRTELTIGO, TELECEL");
         }
+        // Resolves legacy "VODAFONE"/"TIGO"/"AIRTEL" onto the current
+        // network names Flutterwave expects — see class javadoc FIX note.
+        var network = resolveNetwork(rawNetwork.toString());
 
         // FIX: Flutterwave v4 requires `reference` to be 6–42 characters.
         // The old format ("SPB-GH-V4-" + userId UUID + "-" + random UUID,
@@ -183,7 +225,7 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
 
         var mobileMoney = new LinkedHashMap<String, Object>();
         mobileMoney.put("country_code", GH_DIAL_CODE);
-        mobileMoney.put("network", network.toString().toUpperCase());
+        mobileMoney.put("network", network);
         mobileMoney.put("phone_number", normalizeLocalPhone(phoneNumber));
 
         var paymentMethod = new LinkedHashMap<String, Object>();
@@ -306,6 +348,29 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
             return null;
         }
         return pending.userId();
+    }
+
+    /**
+     * Maps an accepted frontend network value onto the current network
+     * name Flutterwave expects on the wire.
+     *
+     * Ghana mobile money on Flutterwave is currently MTN, AirtelTigo, and
+     * Telecel (see class javadoc FIX note). "VODAFONE" and "TIGO" (and
+     * "AIRTEL") are accepted here purely for backward compatibility with
+     * any client still sending the old values, and are mapped onto their
+     * current equivalents rather than rejected.
+     *
+     * CAVEAT: the exact literal strings Flutterwave's v4 orchestrator API
+     * expects for AirtelTigo/Telecel aren't confirmed against a published
+     * v4 sample (only "MTN" is) — confirm "AIRTELTIGO"/"TELECEL" against
+     * the sandbox before relying on this in production.
+     */
+    private static String resolveNetwork(String rawNetwork) {
+        return switch (rawNetwork.toUpperCase()) {
+            case "VODAFONE", "TELECEL" -> "TELECEL";
+            case "TIGO", "AIRTEL", "AIRTELTIGO" -> "AIRTELTIGO";
+            default -> "MTN";
+        };
     }
 
     /** Strips a leading "233"/"+233"/"0" prefix, since the country code is sent separately. */
