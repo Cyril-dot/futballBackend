@@ -37,21 +37,19 @@ import java.util.concurrent.locks.ReentrantLock;
  * a multiplier the server hasn't reached yet, and can never cash out past
  * the (hidden) crash point.
  *
- * CRASH DETECTION VS. DISPLAY CAP — these are two different numbers:
- *   - CrashPointGenerator.computeCrashPoint() is allowed to return crash
- *     points far above MAX_MULTIPLIER (it only clamps to the much larger
- *     MAX_HOUSE_MULTIPLIER — see that class's comment: "independent of any
- *     UI cap"). A meaningful fraction of rounds will have a real crash
- *     point above 50x.
- *   - MAX_MULTIPLIER (50) is purely a display/cashout ceiling: what the
- *     client ever gets to see or cash out at.
- *   Because of that, the tick() loop must compare the round's actual,
- *   UNCLAMPED elapsed growth against the actual crashPoint — not the
- *   clamped value. Comparing the clamped value (as this file used to)
- *   means any round whose real crash point is above 50x can never reach
- *   it, since the clamped multiplier plateaus at 50 forever: the round
- *   gets stuck in RUNNING indefinitely, which is exactly the "stuck at
- *   50.00x, never crashes, no countdown ever comes back" symptom.
+ * CRASH DETECTION VS. DISPLAY CAP — see rawMultiplierUnlocked()/
+ * currentMultiplierUnlocked() below: crash detection must use the raw,
+ * unclamped growth curve since crashPoint itself can exceed MAX_MULTIPLIER.
+ *
+ * MULTIPLE BETS PER USER PER ROUND:
+ * Bets are keyed by a per-bet UUID (`betId`), NOT by userId. This lets one
+ * user place more than one bet in the same round (the frontend exposes two
+ * bet panels). Each BetSlip records its owning userId so cashout can verify
+ * ownership. `placeBet` returns the generated betId — the controller/DTOs
+ * still call this field "roundId" on the wire for backward compatibility
+ * with the existing frontend contract (POST /play -> { id }, POST /cashout
+ * { roundId, cashoutAt }); functionally it now identifies the bet, not the
+ * round. Don't be misled by the wire field name when reading the controller.
  */
 @Service
 @RequiredArgsConstructor
@@ -68,7 +66,11 @@ public class AviatorRoundService {
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Deque<Double> history = new ArrayDeque<>();
-    private final Map<UUID, BetSlip> betsByUserInCurrentRound = new ConcurrentHashMap<>();
+
+    // Keyed by a unique per-bet id (NOT userId) so a single user can hold
+    // more than one concurrent bet slip in the same round. Cleared whenever
+    // a fresh round starts.
+    private final Map<UUID, BetSlip> betsById = new ConcurrentHashMap<>();
 
     private long nonce = 0;
     private RoundPhase phase = RoundPhase.WAITING;
@@ -79,9 +81,10 @@ public class AviatorRoundService {
 
     public enum RoundPhase { WAITING, RUNNING, CRASHED }
 
-    private record BetSlip(UUID roundId, BigDecimal stake, boolean cashedOut, double cashoutMultiplier, BigDecimal payout) {
+    private record BetSlip(UUID userId, UUID roundId, BigDecimal stake, boolean cashedOut,
+                            double cashoutMultiplier, BigDecimal payout) {
         BetSlip withCashout(double multiplier, BigDecimal payout) {
-            return new BetSlip(roundId, stake, true, multiplier, payout);
+            return new BetSlip(userId, roundId, stake, true, multiplier, payout);
         }
     }
 
@@ -102,10 +105,10 @@ public class AviatorRoundService {
                     if (elapsed >= WAITING_MS) startRunning();
                 }
                 case RUNNING -> {
-                    // Must compare against the RAW (unclamped) multiplier here.
-                    // crashPoint itself is not limited to MAX_MULTIPLIER, so
-                    // comparing the clamped value would let rounds with a real
-                    // crash point above 50x run forever. See class-level note.
+                    // Compare against the RAW (unclamped) multiplier — crashPoint
+                    // is not limited to MAX_MULTIPLIER, so comparing the clamped
+                    // value would let rounds whose real crash point is >50x run
+                    // forever (previously observed as "stuck at 50.00x").
                     if (rawMultiplierUnlocked() >= crashPoint) crashNow();
                 }
                 case CRASHED -> {
@@ -118,7 +121,7 @@ public class AviatorRoundService {
     }
 
     private void startWaiting() {
-        betsByUserInCurrentRound.clear();
+        betsById.clear();
         roundId = UUID.randomUUID();
         commit = crashGen.newCommit();
         phase = RoundPhase.WAITING;
@@ -162,15 +165,17 @@ public class AviatorRoundService {
 
     // ── Public API used by the controller ───────────────────────────────
 
-    /** Places a bet for the current WAITING round. Debits the wallet first — no bet is recorded if the debit fails. */
+    /**
+     * Places a bet for the current WAITING round. Debits the wallet first —
+     * no bet is recorded if the debit fails. Returns a unique betId; a given
+     * user may call this more than once per round (one call per bet panel),
+     * each producing an independent slip.
+     */
     public UUID placeBet(UUID userId, BigDecimal stake) {
         lock.lock();
         try {
             if (phase != RoundPhase.WAITING) {
                 throw ApiException.unprocessable("Betting is closed for this round.");
-            }
-            if (betsByUserInCurrentRound.containsKey(userId)) {
-                throw ApiException.conflict("You already have a bet on this round.");
             }
             if (stake == null || stake.signum() <= 0) {
                 throw ApiException.unprocessable("Invalid stake amount.");
@@ -179,8 +184,9 @@ public class AviatorRoundService {
             // Debit first. If this throws (e.g. insufficient balance) no bet is ever recorded.
             walletService.debit(userId, stake, TxKind.GAME_STAKE);
 
-            betsByUserInCurrentRound.put(userId, new BetSlip(roundId, stake, false, 0, BigDecimal.ZERO));
-            return roundId;
+            UUID betId = UUID.randomUUID();
+            betsById.put(betId, new BetSlip(userId, roundId, stake, false, 0, BigDecimal.ZERO));
+            return betId;
         } finally {
             lock.unlock();
         }
@@ -189,24 +195,27 @@ public class AviatorRoundService {
     public record CashoutResult(BigDecimal payout, double multiplier, BigDecimal walletBalance) {}
 
     /**
-     * Cashes out a user's bet. The requested multiplier is clamped to what the
-     * server has actually reached "right now" — a client cannot cash out at a
-     * multiplier the round hasn't hit yet, and once CRASHED, cashout is refused.
+     * Cashes out a single bet slip, identified by betId (the value returned
+     * from placeBet / POST /play, called "roundId" on the wire for backward
+     * compatibility — see class-level note). The requested multiplier is
+     * clamped to what the server has actually reached "right now" — a
+     * client cannot cash out at a multiplier the round hasn't hit yet, and
+     * once CRASHED, cashout is refused.
      */
-    public CashoutResult cashout(UUID userId, UUID requestedRoundId, double requestedMultiplier) {
+    public CashoutResult cashout(UUID userId, UUID betId, double requestedMultiplier) {
         BigDecimal payout;
         double confirmedMultiplier;
 
         lock.lock();
         try {
-            BetSlip slip = betsByUserInCurrentRound.get(userId);
-            if (slip == null || !slip.roundId().equals(requestedRoundId)) {
+            BetSlip slip = betsById.get(betId);
+            if (slip == null || !slip.userId().equals(userId)) {
                 throw ApiException.unprocessable("No active bet found for this round.");
             }
             if (slip.cashedOut()) {
                 throw ApiException.conflict("Already cashed out.");
             }
-            if (phase != RoundPhase.RUNNING) {
+            if (phase != RoundPhase.RUNNING || !slip.roundId().equals(roundId)) {
                 throw ApiException.unprocessable("Round is not currently running.");
             }
 
@@ -217,7 +226,7 @@ public class AviatorRoundService {
                     .multiply(BigDecimal.valueOf(confirmedMultiplier))
                     .setScale(2, RoundingMode.DOWN);
 
-            betsByUserInCurrentRound.put(userId, slip.withCashout(confirmedMultiplier, payout));
+            betsById.put(betId, slip.withCashout(confirmedMultiplier, payout));
         } finally {
             lock.unlock();
         }
