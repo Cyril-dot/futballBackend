@@ -28,6 +28,34 @@ public class WalletService {
                 .orElseThrow(() -> ApiException.notFound("Wallet not found"));
     }
 
+    // ── ADDED ────────────────────────────────────────────────────────
+    // Everything below this line is new. Nothing above it was touched.
+
+    /** Convenience read — same lookup as getWallet(), just returns the balance directly. */
+    public BigDecimal getBalance(UUID userId) {
+        return getWallet(userId).getBalance();
+    }
+
+    /**
+     * Lean debit for callers that don't have a provider reference or extra
+     * metadata to attach (e.g. an in-game stake). Delegates to the full
+     * debit() below, so it gets the same SERIALIZABLE isolation, pessimistic
+     * row lock, and insufficient-balance check — this is not a separate
+     * code path, just a shorter call for the common case.
+     */
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public Transaction debit(UUID userId, BigDecimal amount, TxKind kind) {
+        return debit(userId, amount, kind, null, Map.of());
+    }
+
+    /** Lean credit counterpart — e.g. a game payout with no external provider ref. */
+    @Transactional
+    public Transaction credit(UUID userId, BigDecimal amount, TxKind kind) {
+        return credit(userId, amount, kind, null, Map.of());
+    }
+
+    // ── END ADDED ────────────────────────────────────────────────────
+
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public Transaction debit(UUID userId, BigDecimal amount, TxKind kind,
                              String providerRef, Map<String, Object> metadata) {
