@@ -4,6 +4,7 @@ import com.speedbet.api.common.ApiException;
 import com.speedbet.api.wallet.Transaction;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -57,15 +58,21 @@ public class AviatorRoundService {
     private RoundPhase phase = RoundPhase.WAITING;
     private Instant phaseStartedAt = Instant.now();
     private UUID roundId = UUID.randomUUID();
-    private CrashPointGenerator.Commit commit = crashGen.newCommit();
+    private CrashPointGenerator.Commit commit; // initialized in init(), after DI completes
     private double crashPoint = 0; // hidden until CRASHED
 
     public enum RoundPhase { WAITING, RUNNING, CRASHED }
 
     private record BetSlip(UUID roundId, BigDecimal stake, boolean cashedOut, double cashoutMultiplier, BigDecimal payout) {
-        BetSlip withCashout(double mult, BigDecimal payout) {
-            return new BetSlip(roundId, stake, true, mult, payout);
+        BetSlip withCashout(double multiplier, BigDecimal payout) {
+            return new BetSlip(roundId, stake, true, multiplier, payout);
         }
+    }
+
+    /** Runs once, after Spring has injected walletService/crashGen, so it's safe to use crashGen here. */
+    @PostConstruct
+    private void init() {
+        this.commit = crashGen.newCommit();
     }
 
     // ── Scheduler: the only place phase transitions happen ─────────────
@@ -117,8 +124,8 @@ public class AviatorRoundService {
     private double currentMultiplierUnlocked() {
         if (phase != RoundPhase.RUNNING) return 1.0;
         long elapsed = Instant.now().toEpochMilli() - phaseStartedAt.toEpochMilli();
-        double mult = Math.exp(GROWTH_RATE * elapsed);
-        return Math.max(1.0, Math.min(mult, MAX_MULTIPLIER));
+        double multiplier = Math.exp(GROWTH_RATE * elapsed);
+        return Math.max(1.0, Math.min(multiplier, MAX_MULTIPLIER));
     }
 
     // ── Public API used by the controller ───────────────────────────────
@@ -189,7 +196,7 @@ public class AviatorRoundService {
     }
 
     public record RoundView(String state, Double multiplier, Double crashPoint, String hash,
-                             String serverSeed, String clientSeed, int countdownSecondsRemaining) {}
+                            String serverSeed, String clientSeed, int countdownSecondsRemaining) {}
 
     public RoundView getCurrentRoundView() {
         lock.lock();
