@@ -12,17 +12,6 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 
-/**
- * POST /api/games/football/play
- * POST /api/games/football/settle
- * GET  /api/games/football/current-round
- * GET  /api/games/football/history
- * GET  /api/games/football/balance
- *
- * userId always comes from @AuthenticationPrincipal — never from the
- * request body — so a client can never place or settle a bet on someone
- * else's wallet.
- */
 @RestController
 @RequestMapping("/api/games/football")
 @RequiredArgsConstructor
@@ -46,15 +35,28 @@ public class FootballGameController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
+    /** Kept for backward compatibility — only the most recent open round. */
     @GetMapping("/current-round")
     public ResponseEntity<ApiResponse<RoundView>> currentRound(@AuthenticationPrincipal User user) {
         RoundView view = gameService.currentRound(user.getId());
         return ResponseEntity.ok(ApiResponse.ok(view));
     }
 
+    /** ALL open rounds — use this on page load to resume every live bet. */
+    @GetMapping("/open-rounds")
+    public ResponseEntity<ApiResponse<List<RoundView>>> openRounds(@AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(gameService.openRounds(user.getId())));
+    }
+
     @GetMapping("/odds")
     public ResponseEntity<ApiResponse<OddsQuote>> odds() {
         return ResponseEntity.ok(ApiResponse.ok(gameService.previewOdds()));
+    }
+
+    /** Full roster, e.g. for a "pick your matchup" picker. */
+    @GetMapping("/teams")
+    public ResponseEntity<ApiResponse<List<Team>>> teams() {
+        return ResponseEntity.ok(ApiResponse.ok(gameService.teams()));
     }
 
     @GetMapping("/history")

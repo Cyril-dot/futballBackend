@@ -5,21 +5,10 @@ import org.springframework.stereotype.Component;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-/**
- * In-memory round + per-user history. No JPA entities, per requirement —
- * the wallet ledger (Transaction table) is already your source of truth
- * for money movement; this store only tracks the ephemeral "which match
- * is this round about, and what did it resolve to" state needed between
- * play() and settle(). If you later want rounds to survive a restart,
- * swap the two maps below for Redis — the call sites don't change.
- */
 @Component
 public class RoundStore {
 
@@ -36,8 +25,28 @@ public class RoundStore {
 
     public Optional<FootballRound> findLatestOpenForUser(UUID userId) {
         return rounds.values().stream()
-            .filter(r -> r.userId.equals(userId) && !r.isSettled())
-            .max((a, b) -> a.createdAt.compareTo(b.createdAt));
+                .filter(r -> r.userId.equals(userId) && !r.isSettled())
+                .max((a, b) -> a.createdAt.compareTo(b.createdAt));
+    }
+
+    /** ALL open rounds for a user, newest first — used to resume every
+     *  live bet after a page reload, not just the latest one. */
+    public List<FootballRound> findAllOpenForUser(UUID userId) {
+        return rounds.values().stream()
+                .filter(r -> r.userId.equals(userId) && !r.isSettled())
+                .sorted((a, b) -> b.createdAt.compareTo(a.createdAt))
+                .toList();
+    }
+
+    /** Open rounds older than maxAge, across ALL users — feeds the
+     *  auto-settle job in FootballGameService so an abandoned bet
+     *  (tab closed, app crashed, client never calls settle()) doesn't
+     *  sit forever with its stake already debited and nothing resolved. */
+    public List<FootballRound> findStaleOpenRounds(java.time.Duration maxAge) {
+        Instant cutoff = Instant.now().minus(maxAge);
+        return rounds.values().stream()
+                .filter(r -> !r.isSettled() && r.createdAt.isBefore(cutoff))
+                .toList();
     }
 
     public void addHistory(UUID userId, HistoryEntry entry) {
@@ -48,12 +57,13 @@ public class RoundStore {
 
     public List<HistoryEntry> history(UUID userId, int limit) {
         return historyByUser.getOrDefault(userId, new CopyOnWriteArrayList<>())
-            .stream().limit(limit).toList();
+                .stream().limit(limit).toList();
     }
 
-    /** Sweep settled rounds older than an hour so the map doesn't grow unbounded.
-     *  Unsettled rounds are deliberately left alone here — see README for the
-     *  auto-loss-settle job you should add before going live. */
+    /** Sweep settled rounds older than an hour so the map doesn't grow
+     *  unbounded. Safe to also catch anything the auto-settle job below
+     *  handles, since by the time it's an hour old it'll be settled either
+     *  way (auto-settle runs on a much shorter grace period). */
     @Scheduled(fixedDelay = 5 * 60 * 1000)
     void sweepStale() {
         Instant cutoff = Instant.now().minus(1, ChronoUnit.HOURS);

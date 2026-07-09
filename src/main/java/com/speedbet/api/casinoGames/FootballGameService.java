@@ -4,35 +4,35 @@ import com.speedbet.api.common.ApiException;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Orchestrates a football round end to end:
- *   previewOdds() → generate a fresh, throwaway odds quote for display in
- *                   the bet slip before the user commits. Does NOT create
- *                   a round or touch the wallet — purely informational.
- *                   The odds actually locked in at play() are generated
- *                   again independently at that point (see play() below),
- *                   so this quote is a preview only and can drift slightly
- *                   between preview and commit — play() tolerates that via
- *                   ODDS_DRIFT_TOLERANCE.
- *   play()         → validate bet, debit stake via WalletService, pick teams,
- *                    simulate the ENTIRE match right now, freeze the outcome,
- *                    store the round.
- *   settle()       → reveal the frozen outcome, credit payout via WalletService
- *                    if it won. Never trusts a client-supplied score.
+ * Orchestrates football rounds end to end. A user may have several rounds
+ * open at once — every operation is keyed by roundId, so placing bet #2
+ * while bet #1 is still unsettled is safe.
  *
- * TxKind.GAME_STAKE / TxKind.GAME_PAYOUT are assumed to already exist on
- * your TxKind enum (shared across Aviator/other games). If they don't yet,
- * add them — everything else here is generic and doesn't care which game
- * a ledger row came from; that's what the metadata map is for.
+ *   previewOdds() → fresh, throwaway odds quote for the bet slip. Does NOT
+ *                   create a round or touch the wallet.
+ *   play()        → validate bet, debit stake, pick/select teams, simulate
+ *                    the ENTIRE match now, freeze the outcome, store the
+ *                    round. Safe to call again immediately for another bet.
+ *   settle()      → reveal the frozen outcome for one specific roundId,
+ *                    credit payout if it won. Never trusts a client score.
+ *   autoSettleAbandonedRounds() → same settlement logic as settle(), run
+ *                    on a schedule for any round nobody ever came back to
+ *                    settle (closed tab, crashed app, etc). Without this,
+ *                    an abandoned round leaves its stake debited forever
+ *                    with no win/loss ever resolved.
  */
 @Service
 @RequiredArgsConstructor
@@ -40,20 +40,15 @@ public class FootballGameService {
 
     private static final int MATCH_DURATION_SECONDS = 30;
     private static final BigDecimal MIN_STAKE = BigDecimal.ONE;
-    // How far a client's displayed odds may drift from a freshly generated
-    // quote before play() rejects it as stale.
-    private static final BigDecimal ODDS_DRIFT_TOLERANCE = BigDecimal.valueOf(0.05);
+    // Grace period before an unsettled round is force-settled by the
+    // server itself. Generous relative to MATCH_DURATION_SECONDS (30s)
+    // since the outcome is already frozen at play() time either way —
+    // this only exists to catch rounds nobody ever calls settle() for.
+    private static final Duration AUTO_SETTLE_GRACE = Duration.ofMinutes(2);
 
     private final WalletService walletService;
     private final RoundStore roundStore;
 
-    /**
-     * Generates a fresh odds quote for all five markets, purely for display
-     * in the bet slip before the user has committed to anything. No wallet
-     * access, no round created, no user context needed — this is why the
-     * corresponding controller endpoint has no @AuthenticationPrincipal
-     * parameter.
-     */
     public OddsQuote previewOdds() {
         Odds odds = Odds.generate();
         return new OddsQuote(
@@ -65,24 +60,38 @@ public class FootballGameService {
         );
     }
 
-
+    /** Full roster, for a "pick your matchup" screen. */
+    public List<Team> teams() {
+        return Arrays.asList(Team.ROSTER);
+    }
 
     public PlayResponse play(UUID userId, PlayRequest request) {
         if (request.stake().compareTo(MIN_STAKE) < 0) {
             throw ApiException.unprocessable("Minimum stake is " + MIN_STAKE);
         }
 
-        Team[] pair = pickTwoDistinctTeams();
-        Team home = pair[0];
-        Team away = pair[1];
+        Team home;
+        Team away;
+        if (request.homeTeam() != null || request.awayTeam() != null) {
+            if (request.homeTeam() == null || request.awayTeam() == null) {
+                throw ApiException.unprocessable("Provide both homeTeam and awayTeam, or neither for a random matchup");
+            }
+            home = findTeam(request.homeTeam());
+            away = findTeam(request.awayTeam());
+            if (home.name().equals(away.name())) {
+                throw ApiException.unprocessable("homeTeam and awayTeam must be different");
+            }
+        } else {
+            Team[] pair = pickTwoDistinctTeams();
+            home = pair[0];
+            away = pair[1];
+        }
 
+        // serverOdds is always what actually gets used/settled with — any
+        // client-supplied odds value is display-only and never checked
+        // against a second random draw.
         Odds freshOdds = Odds.generate();
         BigDecimal serverOdds = freshOdds.forBetType(request.betType());
-
-        if (request.odds() != null
-                && request.odds().subtract(serverOdds).abs().compareTo(ODDS_DRIFT_TOLERANCE) > 0) {
-            throw ApiException.unprocessable("Odds have moved, please refresh and try again");
-        }
 
         String roundId = UUID.randomUUID().toString();
 
@@ -120,25 +129,37 @@ public class FootballGameService {
         FootballRound round = roundStore.find(request.roundId())
                 .orElseThrow(() -> ApiException.notFound("No round found with id " + request.roundId()));
 
-        // Don't distinguish "not found" from "not yours" in the message —
-        // avoids leaking round existence to a user who doesn't own it.
+        // Don't distinguish "not found" from "not yours" — avoids leaking
+        // round existence to a user who doesn't own it.
         if (!round.userId.equals(userId)) {
             throw ApiException.notFound("No round found with id " + request.roundId());
         }
+        return doSettle(round);
+    }
+
+    /**
+     * Shared settlement path for both the user-initiated settle() above
+     * and the scheduled auto-settle job below. markSettled() is what
+     * actually guards against double-settling — whichever caller wins the
+     * race does the crediting, the other gets ApiException.conflict (for
+     * the user path) or is simply skipped (for the scheduled path, which
+     * checks isSettled() again right before calling this).
+     */
+    private SettleResponse doSettle(FootballRound round) {
         if (!round.markSettled()) {
-            throw ApiException.conflict("Round " + request.roundId() + " has already been settled");
+            throw ApiException.conflict("Round " + round.id + " has already been settled");
         }
 
         var outcome = round.outcome;
         boolean won = outcome.wins(round.betType);
 
         BigDecimal payout = BigDecimal.ZERO;
-        BigDecimal newBalance = walletService.getBalance(userId);
+        BigDecimal newBalance = walletService.getBalance(round.userId);
 
         if (won) {
             payout = round.stake.multiply(round.oddsAtBet).setScale(2, RoundingMode.HALF_UP);
             var tx = walletService.credit(
-                    userId, payout, TxKind.GAME_PAYOUT,
+                    round.userId, payout, TxKind.GAME_PAYOUT,
                     "football:payout:" + round.id,
                     Map.of(
                             "game", "football",
@@ -151,7 +172,7 @@ public class FootballGameService {
             newBalance = tx.getBalanceAfter();
         }
 
-        roundStore.addHistory(userId, new RoundStore.HistoryEntry(
+        roundStore.addHistory(round.userId, new RoundStore.HistoryEntry(
                 round.home.name(), round.away.name(),
                 outcome.homeScore() + "-" + outcome.awayScore(),
                 won, java.time.Instant.now()
@@ -160,8 +181,33 @@ public class FootballGameService {
         return new SettleResponse(won, outcome.homeScore(), outcome.awayScore(), payout, newBalance);
     }
 
+    /**
+     * Force-settles any round still open past AUTO_SETTLE_GRACE. Runs
+     * independently of any user request — this is what prevents a closed
+     * tab or crashed client from leaving a debited stake in limbo forever.
+     * Uses the exact same doSettle() path as a normal settle() call, so
+     * there is only one place money actually moves for a round.
+     */
+    @Scheduled(fixedDelay = 60 * 1000)
+    void autoSettleAbandonedRounds() {
+        for (FootballRound round : roundStore.findStaleOpenRounds(AUTO_SETTLE_GRACE)) {
+            if (round.isSettled()) continue; // already handled by a real settle() call in the meantime
+            try {
+                doSettle(round);
+            } catch (ApiException e) {
+                // Lost the race to a concurrent settle() — fine, skip it.
+            }
+        }
+    }
+
+    /** Kept for backward compatibility — only the most recent open round. */
     public RoundView currentRound(UUID userId) {
         return roundStore.findLatestOpenForUser(userId).map(RoundView::of).orElse(null);
+    }
+
+    /** ALL open rounds for a user, so the frontend can resume every live bet. */
+    public List<RoundView> openRounds(UUID userId) {
+        return roundStore.findAllOpenForUser(userId).stream().map(RoundView::of).toList();
     }
 
     public List<RoundStore.HistoryEntry> history(UUID userId, int limit) {
@@ -170,6 +216,13 @@ public class FootballGameService {
 
     public BigDecimal balance(UUID userId) {
         return walletService.getBalance(userId);
+    }
+
+    private Team findTeam(String name) {
+        return Arrays.stream(Team.ROSTER)
+                .filter(t -> t.name().equalsIgnoreCase(name))
+                .findFirst()
+                .orElseThrow(() -> ApiException.unprocessable("Unknown team: " + name));
     }
 
     private Team[] pickTwoDistinctTeams() {

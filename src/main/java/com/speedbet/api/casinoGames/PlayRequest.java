@@ -8,5 +8,7 @@ import java.math.BigDecimal;
 public record PlayRequest(
     @NotNull @DecimalMin(value = "1.0", message = "Minimum stake is 1.00") BigDecimal stake,
     @NotNull BetType betType,
-    BigDecimal odds
+    BigDecimal odds,
+    String homeTeam,  // optional — omit both for a random matchup
+    String awayTeam
 ) {}
