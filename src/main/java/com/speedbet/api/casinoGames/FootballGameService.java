@@ -65,6 +65,8 @@ public class FootballGameService {
         );
     }
 
+
+
     public PlayResponse play(UUID userId, PlayRequest request) {
         if (request.stake().compareTo(MIN_STAKE) < 0) {
             throw ApiException.unprocessable("Minimum stake is " + MIN_STAKE);
