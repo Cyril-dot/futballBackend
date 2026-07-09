@@ -36,13 +36,29 @@ import java.util.concurrent.locks.ReentrantLock;
  * same growth formula the client renders, so a client cannot cash out past
  * a multiplier the server hasn't reached yet, and can never cash out past
  * the (hidden) crash point.
+ *
+ * CRASH DETECTION VS. DISPLAY CAP — these are two different numbers:
+ *   - CrashPointGenerator.computeCrashPoint() is allowed to return crash
+ *     points far above MAX_MULTIPLIER (it only clamps to the much larger
+ *     MAX_HOUSE_MULTIPLIER — see that class's comment: "independent of any
+ *     UI cap"). A meaningful fraction of rounds will have a real crash
+ *     point above 50x.
+ *   - MAX_MULTIPLIER (50) is purely a display/cashout ceiling: what the
+ *     client ever gets to see or cash out at.
+ *   Because of that, the tick() loop must compare the round's actual,
+ *   UNCLAMPED elapsed growth against the actual crashPoint — not the
+ *   clamped value. Comparing the clamped value (as this file used to)
+ *   means any round whose real crash point is above 50x can never reach
+ *   it, since the clamped multiplier plateaus at 50 forever: the round
+ *   gets stuck in RUNNING indefinitely, which is exactly the "stuck at
+ *   50.00x, never crashes, no countdown ever comes back" symptom.
  */
 @Service
 @RequiredArgsConstructor
 public class AviatorRoundService {
 
     private static final double GROWTH_RATE = 0.00006;   // must match frontend GROWTH_RATE
-    private static final double MAX_MULTIPLIER = 50.0;    // must match frontend MAX_MULTIPLIER (display/cashout cap)
+    private static final double MAX_MULTIPLIER = 50.0;    // must match frontend MAX_MULTIPLIER (display/cashout cap ONLY — not a crash-detection cap)
     private static final long WAITING_MS = 6_000;
     private static final long CRASHED_HOLD_MS = 2_800;
     private static final String DEFAULT_CLIENT_SEED = "aviator-public-seed-v1";
@@ -59,7 +75,7 @@ public class AviatorRoundService {
     private Instant phaseStartedAt = Instant.now();
     private UUID roundId = UUID.randomUUID();
     private CrashPointGenerator.Commit commit; // initialized in init(), after DI completes
-    private double crashPoint = 0; // hidden until CRASHED
+    private double crashPoint = 0; // hidden until CRASHED — NOT clamped to MAX_MULTIPLIER, can exceed it
 
     public enum RoundPhase { WAITING, RUNNING, CRASHED }
 
@@ -86,8 +102,11 @@ public class AviatorRoundService {
                     if (elapsed >= WAITING_MS) startRunning();
                 }
                 case RUNNING -> {
-                    double liveMultiplier = currentMultiplierUnlocked();
-                    if (liveMultiplier >= crashPoint) crashNow();
+                    // Must compare against the RAW (unclamped) multiplier here.
+                    // crashPoint itself is not limited to MAX_MULTIPLIER, so
+                    // comparing the clamped value would let rounds with a real
+                    // crash point above 50x run forever. See class-level note.
+                    if (rawMultiplierUnlocked() >= crashPoint) crashNow();
                 }
                 case CRASHED -> {
                     if (elapsed >= CRASHED_HOLD_MS) startWaiting();
@@ -120,12 +139,25 @@ public class AviatorRoundService {
         while (history.size() > 15) history.removeLast();
     }
 
-    /** Authoritative multiplier at "now", using the same growth curve the client animates. Caller must hold the lock. */
-    private double currentMultiplierUnlocked() {
+    /**
+     * Raw, unclamped multiplier at "now" — the true growth curve, used ONLY
+     * to decide whether the round has reached its (possibly >50x) hidden
+     * crashPoint. Never expose this value directly to a client. Caller must
+     * hold the lock.
+     */
+    private double rawMultiplierUnlocked() {
         if (phase != RoundPhase.RUNNING) return 1.0;
         long elapsed = Instant.now().toEpochMilli() - phaseStartedAt.toEpochMilli();
-        double multiplier = Math.exp(GROWTH_RATE * elapsed);
-        return Math.max(1.0, Math.min(multiplier, MAX_MULTIPLIER));
+        return Math.max(1.0, Math.exp(GROWTH_RATE * elapsed));
+    }
+
+    /**
+     * Multiplier clamped to MAX_MULTIPLIER — this is what's exposed to
+     * clients (RoundView) and what cashout payouts are capped at. Caller
+     * must hold the lock.
+     */
+    private double currentMultiplierUnlocked() {
+        return Math.min(rawMultiplierUnlocked(), MAX_MULTIPLIER);
     }
 
     // ── Public API used by the controller ───────────────────────────────
