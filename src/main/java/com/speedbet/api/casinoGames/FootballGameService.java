@@ -15,11 +15,19 @@ import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Orchestrates a football round end to end:
- *   play()    → validate bet, debit stake via WalletService, pick teams,
- *               simulate the ENTIRE match right now, freeze the outcome,
- *               store the round.
- *   settle()  → reveal the frozen outcome, credit payout via WalletService
- *               if it won. Never trusts a client-supplied score.
+ *   previewOdds() → generate a fresh, throwaway odds quote for display in
+ *                   the bet slip before the user commits. Does NOT create
+ *                   a round or touch the wallet — purely informational.
+ *                   The odds actually locked in at play() are generated
+ *                   again independently at that point (see play() below),
+ *                   so this quote is a preview only and can drift slightly
+ *                   between preview and commit — play() tolerates that via
+ *                   ODDS_DRIFT_TOLERANCE.
+ *   play()         → validate bet, debit stake via WalletService, pick teams,
+ *                    simulate the ENTIRE match right now, freeze the outcome,
+ *                    store the round.
+ *   settle()       → reveal the frozen outcome, credit payout via WalletService
+ *                    if it won. Never trusts a client-supplied score.
  *
  * TxKind.GAME_STAKE / TxKind.GAME_PAYOUT are assumed to already exist on
  * your TxKind enum (shared across Aviator/other games). If they don't yet,
@@ -28,8 +36,7 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 @Service
 @RequiredArgsConstructor
-public class
-FootballGameService {
+public class FootballGameService {
 
     private static final int MATCH_DURATION_SECONDS = 30;
     private static final BigDecimal MIN_STAKE = BigDecimal.ONE;
@@ -39,6 +46,24 @@ FootballGameService {
 
     private final WalletService walletService;
     private final RoundStore roundStore;
+
+    /**
+     * Generates a fresh odds quote for all five markets, purely for display
+     * in the bet slip before the user has committed to anything. No wallet
+     * access, no round created, no user context needed — this is why the
+     * corresponding controller endpoint has no @AuthenticationPrincipal
+     * parameter.
+     */
+    public OddsQuote previewOdds() {
+        Odds odds = Odds.generate();
+        return new OddsQuote(
+                odds.forBetType(BetType.HOME),
+                odds.forBetType(BetType.DRAW),
+                odds.forBetType(BetType.AWAY),
+                odds.forBetType(BetType.OVER),
+                odds.forBetType(BetType.UNDER)
+        );
+    }
 
     public PlayResponse play(UUID userId, PlayRequest request) {
         if (request.stake().compareTo(MIN_STAKE) < 0) {
@@ -63,35 +88,35 @@ FootballGameService {
         // via WalletService if the stake can't be covered. Nothing below runs
         // if this throws, so no round/outcome is ever created for an unfunded bet.
         walletService.debit(
-            userId, request.stake(), TxKind.GAME_STAKE,
-            "football:stake:" + roundId,
-            Map.of(
-                "game", "football",
-                "roundId", roundId,
-                "betType", request.betType().toJson(),
-                "homeTeam", home.name(),
-                "awayTeam", away.name()
-            )
+                userId, request.stake(), TxKind.GAME_STAKE,
+                "football:stake:" + roundId,
+                Map.of(
+                        "game", "football",
+                        "roundId", roundId,
+                        "betType", request.betType().toJson(),
+                        "homeTeam", home.name(),
+                        "awayTeam", away.name()
+                )
         );
 
         MatchSimulator.MatchOutcome outcome = MatchSimulator.simulate(home, away);
 
         FootballRound round = new FootballRound(
-            roundId, userId, request.stake(), request.betType(), serverOdds, home, away, outcome
+                roundId, userId, request.stake(), request.betType(), serverOdds, home, away, outcome
         );
         roundStore.save(round);
 
         BigDecimal walletBalance = walletService.getBalance(userId);
 
         return new PlayResponse(
-            roundId, walletBalance, request.stake(), request.betType(), serverOdds,
-            home.name(), away.name(), MATCH_DURATION_SECONDS
+                roundId, walletBalance, request.stake(), request.betType(), serverOdds,
+                home.name(), away.name(), MATCH_DURATION_SECONDS
         );
     }
 
     public SettleResponse settle(UUID userId, SettleRequest request) {
         FootballRound round = roundStore.find(request.roundId())
-            .orElseThrow(() -> ApiException.notFound("No round found with id " + request.roundId()));
+                .orElseThrow(() -> ApiException.notFound("No round found with id " + request.roundId()));
 
         // Don't distinguish "not found" from "not yours" in the message —
         // avoids leaking round existence to a user who doesn't own it.
@@ -111,23 +136,23 @@ FootballGameService {
         if (won) {
             payout = round.stake.multiply(round.oddsAtBet).setScale(2, RoundingMode.HALF_UP);
             var tx = walletService.credit(
-                userId, payout, TxKind.GAME_PAYOUT,
-                "football:payout:" + round.id,
-                Map.of(
-                    "game", "football",
-                    "roundId", round.id,
-                    "betType", round.betType.toJson(),
-                    "homeScore", outcome.homeScore(),
-                    "awayScore", outcome.awayScore()
-                )
+                    userId, payout, TxKind.GAME_PAYOUT,
+                    "football:payout:" + round.id,
+                    Map.of(
+                            "game", "football",
+                            "roundId", round.id,
+                            "betType", round.betType.toJson(),
+                            "homeScore", outcome.homeScore(),
+                            "awayScore", outcome.awayScore()
+                    )
             );
             newBalance = tx.getBalanceAfter();
         }
 
         roundStore.addHistory(userId, new RoundStore.HistoryEntry(
-            round.home.name(), round.away.name(),
-            outcome.homeScore() + "-" + outcome.awayScore(),
-            won, java.time.Instant.now()
+                round.home.name(), round.away.name(),
+                outcome.homeScore() + "-" + outcome.awayScore(),
+                won, java.time.Instant.now()
         ));
 
         return new SettleResponse(won, outcome.homeScore(), outcome.awayScore(), payout, newBalance);

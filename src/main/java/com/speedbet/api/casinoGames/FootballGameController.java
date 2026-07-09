@@ -52,6 +52,11 @@ public class FootballGameController {
         return ResponseEntity.ok(ApiResponse.ok(view));
     }
 
+    @GetMapping("/odds")
+    public ResponseEntity<ApiResponse<OddsQuote>> odds() {
+        return ResponseEntity.ok(ApiResponse.ok(gameService.previewOdds()));
+    }
+
     @GetMapping("/history")
     public ResponseEntity<ApiResponse<List<RoundStore.HistoryEntry>>> history(
             @AuthenticationPrincipal User user,
