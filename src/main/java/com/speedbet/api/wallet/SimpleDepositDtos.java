@@ -21,8 +21,14 @@ public class SimpleDepositDtos {
         @DecimalMin(value = "0.01", message = "Amount must be greater than zero")
         private BigDecimal amount;
 
-        @NotBlank
-        @Pattern(regexp = "^\\+?[0-9]{7,15}$", message = "Invalid phone number")
+        // Optional — the current frontend does not collect a MoMo number
+        // from the user (account name + amount is enough to match the
+        // payment for admin review), so this is no longer required. Left
+        // in place in case a future frontend revision re-adds the field, or
+        // in case it's useful for admins to have. When present, it's
+        // validated as a phone number; when blank/omitted, it's simply
+        // stored as blank.
+        @Pattern(regexp = "^$|^\\+?[0-9]{7,15}$", message = "Invalid phone number")
         private String phoneNumber;
 
         @NotBlank
