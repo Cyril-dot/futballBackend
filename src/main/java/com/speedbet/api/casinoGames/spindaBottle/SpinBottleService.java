@@ -69,7 +69,7 @@ public class SpinBottleService {
         String clientSeed = (request.getClientSeed() == null || request.getClientSeed().isBlank())
                 ? randomHex(8)
                 : request.getClientSeed();
-        long nonce = Math.abs(SECURE_RANDOM.nextInt(100_000));
+        long nonce = SECURE_RANDOM.nextInt(100_000);
 
         String resultHash = hmacSha256Hex(serverSeed, clientSeed + nonce);
         SpinBottleOutcome outcome = resolveOutcome(resultHash);
@@ -171,7 +171,18 @@ public class SpinBottleService {
 
     private static String toHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) sb.append(String.format("%02x", b));
+        for (byte b : bytes) {
+            // IMPORTANT: mask to 0xFF before formatting. A raw `byte` is
+            // signed, so passing it directly to String.format("%02x", b)
+            // autoboxes to Byte and sign-extends negative values (any byte
+            // with its high bit set) out to a 16-character run of "f"s
+            // instead of a clean 2-character hex pair. That corrupted the
+            // fixed-length structure of every hash this method produced,
+            // which in turn biased resolveOutcome()'s substring(0, 8) read
+            // toward "ffffffff" (r ≈ 1.0) far more often than the intended
+            // 3% MIDDLE probability — that was the "only middle" bug.
+            sb.append(String.format("%02x", b & 0xFF));
+        }
         return sb.toString();
     }
 }
