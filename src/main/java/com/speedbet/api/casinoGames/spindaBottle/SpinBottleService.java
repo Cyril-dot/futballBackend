@@ -4,6 +4,7 @@ import com.speedbet.api.common.ApiException;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -39,7 +40,21 @@ import java.util.UUID;
  * NOTE: assumes TxKind has GAME_STAKE / GAME_PAYOUT constants (or your
  * existing equivalents) — swap these for whatever this codebase already
  * uses for other games such as Mines.
+ *
+ * LOGGING: temporary trace-level logging was added around play() to help
+ * diagnose a frontend symptom where the UI occasionally parses an empty
+ * {} response for a round immediately after a round that returned full,
+ * correct data. If this method is only ever invoked once per client
+ * spin, the logs below will show a single "play() called" line per round
+ * and a single "play() returning" line with a populated outcome — which
+ * would prove the empty object is NOT coming from the backend, and the
+ * frontend/network layer is the one worth chasing next. If instead you
+ * see two "play() called" lines close together for what the user
+ * experienced as one click, that points to the frontend firing the
+ * request twice (e.g. a double-bound click handler or a race in the
+ * spin-lock state) rather than anything happening here.
  */
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class SpinBottleService {
@@ -53,6 +68,11 @@ public class SpinBottleService {
 
     @Transactional
     public SpinBottlePlayResponse play(UUID userId, SpinBottlePlayRequest request) {
+        long startedAt = System.nanoTime();
+        log.info("play() called userId={} choice={} stake={} clientSeed={} thread={}",
+                userId, request.getChoice(), request.getStake(), request.getClientSeed(),
+                Thread.currentThread().getName());
+
         BigDecimal stake = request.getStake();
         if (stake == null || stake.signum() <= 0)
             throw ApiException.unprocessable("Stake must be greater than zero");
@@ -63,6 +83,7 @@ public class SpinBottleService {
         // pessimistic row lock and throws if the balance is insufficient,
         // so there's no way to spin without the stake actually being taken.
         walletService.debit(userId, stake, TxKind.GAME_STAKE);
+        log.debug("play() debited userId={} stake={}", userId, stake);
 
         String serverSeed = randomHex(16);
         String serverSeedHash = sha256Hex(serverSeed);
@@ -81,6 +102,7 @@ public class SpinBottleService {
 
         if (won) {
             walletService.credit(userId, payout, TxKind.GAME_PAYOUT);
+            log.debug("play() credited userId={} payout={}", userId, payout);
         }
 
         SpinBottleRound round = roundRepo.save(SpinBottleRound.builder()
@@ -97,7 +119,7 @@ public class SpinBottleService {
                 .resultHash(resultHash)
                 .build());
 
-        return SpinBottlePlayResponse.builder()
+        SpinBottlePlayResponse response = SpinBottlePlayResponse.builder()
                 .roundId(round.getId())
                 .choice(round.getChoice())
                 .outcome(round.getOutcome())
@@ -114,6 +136,12 @@ public class SpinBottleService {
                         .build())
                 .createdAt(round.getCreatedAt())
                 .build();
+
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000;
+        log.info("play() returning userId={} roundId={} outcome={} won={} payout={} elapsedMs={}",
+                userId, round.getId(), outcome, won, payout, elapsedMs);
+
+        return response;
     }
 
     public List<SpinBottleHistoryEntry> history(UUID userId, int limit) {
@@ -136,12 +164,17 @@ public class SpinBottleService {
     private SpinBottleOutcome resolveOutcome(String hash) {
         // Same technique the old client used: first 8 hex chars as a
         // uint32, normalized to [0, 1).
+        log.debug("resolveOutcome hash={} len={} first8={}", hash, hash.length(), hash.substring(0, 8));
         long num = Long.parseLong(hash.substring(0, 8), 16);
         double r = num / 4294967295.0; // 0xffffffff
 
-        if (r < 0.485) return SpinBottleOutcome.UP;
-        if (r < 0.970) return SpinBottleOutcome.DOWN;
-        return SpinBottleOutcome.MIDDLE;
+        SpinBottleOutcome outcome;
+        if (r < 0.485) outcome = SpinBottleOutcome.UP;
+        else if (r < 0.970) outcome = SpinBottleOutcome.DOWN;
+        else outcome = SpinBottleOutcome.MIDDLE;
+
+        log.debug("resolveOutcome r={} -> outcome={}", r, outcome);
+        return outcome;
     }
 
     private static String randomHex(int len) {
@@ -181,6 +214,9 @@ public class SpinBottleService {
             // which in turn biased resolveOutcome()'s substring(0, 8) read
             // toward "ffffffff" (r ≈ 1.0) far more often than the intended
             // 3% MIDDLE probability — that was the "only middle" bug.
+            // This part is already fixed and confirmed working (production
+            // resultHash values are a clean 64 hex chars). Left in place,
+            // not the current suspect.
             sb.append(String.format("%02x", b & 0xFF));
         }
         return sb.toString();
