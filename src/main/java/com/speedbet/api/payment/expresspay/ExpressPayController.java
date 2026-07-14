@@ -1,5 +1,6 @@
 package com.speedbet.api.payment.expresspay;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.speedbet.api.chat.AdminUpgradeChatService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
@@ -49,6 +50,9 @@ public class ExpressPayController {
      */
     private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
 
+    /** Shared, reusable ObjectMapper for manual JSON parsing (see expressPayPost). */
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
     /** How long to wait for expressPay to respond before timing out. */
     private final Duration expressPayTimeout = Duration.ofSeconds(10);
 
@@ -68,7 +72,7 @@ public class ExpressPayController {
     @Value("${app.expresspay.merchant-id}")                       private String     merchantId;
     @Value("${app.expresspay.api-key}")                           private String     apiKey;
     @Value("${app.expresspay.base-url:https://expresspaygh.com}") private String     baseUrl;
-    @Value("${app.platform.min-deposit-amount:300}")              private BigDecimal minDeposit;
+    @Value("${app.platform.min-deposit-amount:3}")              private BigDecimal minDeposit;
     @Value("${app.platform.backend-url}")                         private String     backendUrl; // used to build the post-url callback
 
     /**
@@ -438,7 +442,7 @@ public class ExpressPayController {
      * here identically, there is no separate USSD endpoint.
      */
     private Map<String, Object> expressPayCheckoutMomo(String token, String mobileNumber,
-                                                         String mobileNetwork, String mobileAuthToken) {
+                                                       String mobileNetwork, String mobileAuthToken) {
 
         var form = new LinkedMultiValueMap<String, String>();
         form.add("token", token);
@@ -481,30 +485,60 @@ public class ExpressPayController {
 
     // ─── HTTP helper ─────────────────────────────────────────────────────────
 
+    /**
+     * Posts a form to expressPay and parses the response as JSON.
+     *
+     * IMPORTANT: expressPay sometimes returns a 200 OK with Content-Type
+     * text/html even though the body is valid JSON (or, when something is
+     * genuinely wrong — bad credentials, IP not whitelisted, WAF challenge —
+     * an actual HTML error page). Relying on retrieve().bodyToMono(Map.class)
+     * throws UnsupportedMediaTypeException in both cases and hides the real
+     * body from the logs.
+     *
+     * To fix this we use exchangeToMono to read the body as a raw String
+     * first, regardless of the declared Content-Type, and parse it as JSON
+     * ourselves. If parsing fails, we log the raw body (truncated) so the
+     * actual HTML/error text is visible for diagnosis, instead of surfacing
+     * only a generic UnsupportedMediaTypeException / RetryExhaustedException.
+     */
     @SuppressWarnings("unchecked")
     private Map<String, Object> expressPayPost(String path, MultiValueMap<String, String> form) {
 
         Map<String, Object> result;
         try {
-            result = (Map<String, Object>) webClientBuilder.build()
+            result = webClientBuilder.build()
                     .post()
                     .uri(baseUrl + path)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .bodyValue(form)
-                    .retrieve()
-                    .onStatus(status -> status.isError(), clientResponse ->
-                            clientResponse.bodyToMono(String.class).map(respBody -> {
+                    .exchangeToMono(clientResponse -> {
+                        if (clientResponse.statusCode().isError()) {
+                            return clientResponse.bodyToMono(String.class).map(body -> {
                                 log.error("expressPay API error: path='{}' status={} body={}",
-                                        path, clientResponse.statusCode(), respBody);
-                                return new RuntimeException(
-                                        "expressPay returned " + clientResponse.statusCode() + ": " + respBody);
-                            }))
-                    .bodyToMono(Map.class)
+                                        path, clientResponse.statusCode(), body);
+                                throw new RuntimeException(
+                                        "expressPay returned " + clientResponse.statusCode() + ": " + body);
+                            });
+                        }
+                        // Read as raw text first — ignore the declared Content-Type, since
+                        // expressPay sometimes mislabels JSON as text/html.
+                        return clientResponse.bodyToMono(String.class).map(raw -> {
+                            try {
+                                return (Map<String, Object>) OBJECT_MAPPER.readValue(raw, Map.class);
+                            } catch (Exception parseEx) {
+                                log.error("expressPay returned non-JSON body: path='{}' raw='{}'",
+                                        path, truncate(raw, 300));
+                                throw new RuntimeException(
+                                        "expressPay returned an unexpected response (not JSON): "
+                                                + truncate(raw, 300));
+                            }
+                        });
+                    })
                     // Fail fast so we never hold a request thread indefinitely.
                     .timeout(expressPayTimeout)
                     // Retry only transient network failures (e.g. connection reset). The
-                    // RuntimeException thrown directly by onStatus above has no wrapped
-                    // cause, so genuine 4xx/5xx responses are excluded from retry.
+                    // RuntimeException thrown directly above has no wrapped cause, so
+                    // genuine 4xx/5xx responses and non-JSON bodies are excluded from retry.
                     .retryWhen(Retry.max(expressPayRetryAttempts)
                             .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
                     .onErrorMap(
@@ -562,5 +596,10 @@ public class ExpressPayController {
     private String maskPhone(String phone) {
         if (phone == null || phone.length() < 4) return "****";
         return "*".repeat(Math.max(0, phone.length() - 4)) + phone.substring(phone.length() - 4);
+    }
+
+    private String truncate(String s, int maxLen) {
+        if (s == null) return "";
+        return s.length() <= maxLen ? s : s.substring(0, maxLen) + "...";
     }
 }
