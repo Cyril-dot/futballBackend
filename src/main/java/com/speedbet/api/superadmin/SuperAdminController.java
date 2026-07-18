@@ -4,6 +4,7 @@ import com.speedbet.api.affiliate.AffiliateWithdrawalRequest;
 import com.speedbet.api.affiliate.AffiliateWithdrawalStatus;
 import com.speedbet.api.audit.AuditLog;
 import com.speedbet.api.audit.AuditService;
+import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.common.PageResponse;
 import com.speedbet.api.user.User;
@@ -11,6 +12,7 @@ import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserRole;
 import com.speedbet.api.user.UserService;
 import com.speedbet.api.wallet.TxKind;
+import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
@@ -36,6 +38,7 @@ public class SuperAdminController {
     private final UserService userService;
     private final AuditService auditService;
     private final SuperAdminQueryService queryService;
+    private final WalletService walletService;
 
     // ══════════════════════════════════════════════════════════════════════════
     // EXISTING ENDPOINTS (unchanged)
@@ -129,6 +132,63 @@ public class SuperAdminController {
                 null, Map.of("commissionRate", rate.toPlainString()), null);
 
         return ResponseEntity.ok(ApiResponse.ok(admin, "Commission rate updated to " + rate + "%"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // NEW: ADD FUNDS TO AN ADMIN'S WALLET
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * POST /api/super-admin/admins/{adminId}/add-funds
+     *
+     * Credits a super-admin-initiated amount directly to an existing admin's
+     * wallet balance — e.g. topping up an admin so they can pay out affiliate
+     * withdrawals. Confirms the target is actually an ADMIN (not a regular
+     * USER or another SUPER_ADMIN) before touching any wallet, then delegates
+     * to WalletService.credit(...), which handles the balance update and
+     * writes the resulting Transaction row.
+     *
+     * NOTE: TxKind.ADMIN_CREDIT below is a placeholder — swap it for whatever
+     * your TxKind enum actually names this kind of internal top-up if the
+     * name differs (I didn't have the enum source to confirm it).
+     *
+     * Required body fields:
+     *   amount — plain numeric string, e.g. "500.00". Must be > 0.
+     *   reason — optional free-text note, stored in the transaction metadata.
+     */
+    @PostMapping("/admins/{adminId}/add-funds")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> addFundsToAdmin(
+            @AuthenticationPrincipal User actor,
+            @PathVariable UUID adminId,
+            @RequestBody Map<String, String> req) {
+
+        var amount = new BigDecimal(req.get("amount"));
+        if (amount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw ApiException.unprocessable("Amount must be greater than zero");
+        }
+
+        var target = userRepo.findById(adminId)
+                .orElseThrow(() -> ApiException.notFound("User not found"));
+        if (target.getRole() != UserRole.ADMIN) {
+            throw ApiException.unprocessable("Target user is not an admin");
+        }
+
+        var reason = req.getOrDefault("reason", null);
+        var metadata = reason != null
+                ? Map.<String, Object>of("addedBy", actor.getId().toString(), "reason", reason)
+                : Map.<String, Object>of("addedBy", actor.getId().toString());
+
+        var tx = walletService.credit(adminId, amount, TxKind.ADMIN_CREDIT, null, metadata);
+
+        auditService.log(actor.getId(), "ADD_FUNDS_TO_ADMIN", "users", adminId,
+                null, Map.of("amount", amount.toPlainString()), null);
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "transactionId", tx.getId(),
+                "adminId", adminId,
+                "amountAdded", amount,
+                "balanceAfter", tx.getBalanceAfter()
+        ), "Added " + amount + " to admin's wallet"));
     }
 
     @GetMapping("/metrics")
