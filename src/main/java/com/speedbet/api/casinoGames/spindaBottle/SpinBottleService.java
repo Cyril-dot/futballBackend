@@ -5,6 +5,7 @@ import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -24,35 +25,23 @@ import java.util.UUID;
 /**
  * Server-authoritative game logic for Spin Da' Bottle.
  *
- * This replaces the old client-side RNG.generateOutcome() in game.js /
- * SpinDaBottleGame.tsx. In the old build the outcome, the "server seed",
- * and the fairness hash were all generated in the browser — a player
- * could trivially patch their own client to always win. Here the wallet
- * debit, the RNG roll, and the wallet credit all happen in one backend
- * transaction; the client only receives the result afterward and uses it
- * to drive the spin animation.
+ * CHANGE (this revision): play() no longer lets a transient DB lock
+ * conflict escape as a raw 500. WalletService.debit() takes a
+ * PESSIMISTIC_WRITE row lock on the wallet under SERIALIZABLE isolation
+ * (see WalletService), which means any other transaction touching the
+ * same wallet row at the same instant — most notably the settlement
+ * scheduler crediting/debiting wallets during bet settlement — can
+ * cause Postgres/Hibernate to throw a lock-acquisition or serialization
+ * failure. That is a genuinely transient condition (the same request
+ * would very likely succeed a few hundred ms later), not a real error,
+ * so play() now retries it a small, bounded number of times before
+ * giving up and returning a clean 409-style ApiException instead of an
+ * unhandled 500.
  *
  * Distribution is unchanged from the original client-side version:
  *   UP     0.000–0.485 (48.5%)
  *   DOWN   0.485–0.970 (48.5%)
  *   MIDDLE 0.970–1.000 (3.0%)  — house edge, ~97% RTP
- *
- * NOTE: assumes TxKind has GAME_STAKE / GAME_PAYOUT constants (or your
- * existing equivalents) — swap these for whatever this codebase already
- * uses for other games such as Mines.
- *
- * LOGGING: temporary trace-level logging was added around play() to help
- * diagnose a frontend symptom where the UI occasionally parses an empty
- * {} response for a round immediately after a round that returned full,
- * correct data. If this method is only ever invoked once per client
- * spin, the logs below will show a single "play() called" line per round
- * and a single "play() returning" line with a populated outcome — which
- * would prove the empty object is NOT coming from the backend, and the
- * frontend/network layer is the one worth chasing next. If instead you
- * see two "play() called" lines close together for what the user
- * experienced as one click, that points to the frontend firing the
- * request twice (e.g. a double-bound click handler or a race in the
- * spin-lock state) rather than anything happening here.
  */
 @Slf4j
 @Service
@@ -63,21 +52,64 @@ public class SpinBottleService {
     private static final BigDecimal PAYOUT_MULTIPLIER = new BigDecimal("2");
     private static final BigDecimal ZERO = BigDecimal.ZERO;
 
+    // Retry tuning for transient lock/serialization conflicts on the
+    // wallet row. Kept small — this is meant to smooth over a brief
+    // collision with the settlement scheduler, not mask a real bug.
+    private static final int MAX_LOCK_RETRIES = 3;
+    private static final long RETRY_BASE_DELAY_MS = 75;
+
     private final WalletService walletService;
     private final SpinBottleRoundRepository roundRepo;
 
-    @Transactional
     public SpinBottlePlayResponse play(UUID userId, SpinBottlePlayRequest request) {
-        long startedAt = System.nanoTime();
-        log.info("play() called userId={} choice={} stake={} clientSeed={} thread={}",
-                userId, request.getChoice(), request.getStake(), request.getClientSeed(),
-                Thread.currentThread().getName());
-
         BigDecimal stake = request.getStake();
         if (stake == null || stake.signum() <= 0)
             throw ApiException.unprocessable("Stake must be greater than zero");
         if (request.getChoice() == null)
             throw ApiException.unprocessable("choice is required");
+
+        int attempt = 0;
+        while (true) {
+            attempt++;
+            try {
+                return playOnce(userId, request, stake, attempt);
+            } catch (PessimisticLockingFailureException e) {
+                // Catches CannotAcquireLockException too — it's a subclass
+                // of PessimisticLockingFailureException, so a multi-catch
+                // listing both is a compile error (types must be disjoint).
+                // Catching the parent type covers both cases.
+                // Wallet row was locked by a concurrent transaction (most
+                // likely settlement touching the same wallet). Safe to
+                // retry: playOnce() hasn't committed anything on this path
+                // — the exception surfaces from the debit() transaction
+                // itself failing to acquire/hold its lock, so no stake was
+                // taken and no round was recorded.
+                if (attempt >= MAX_LOCK_RETRIES) {
+                    log.error("play() giving up after {} attempts for userId={} — wallet row contention",
+                            attempt, userId, e);
+                    throw ApiException.conflict(
+                            "The table is busy right now — please try your spin again in a moment.");
+                }
+                long delay = RETRY_BASE_DELAY_MS * attempt;
+                log.warn("play() lock conflict for userId={} attempt={}/{} — retrying in {}ms",
+                        userId, attempt, MAX_LOCK_RETRIES, delay);
+                sleepQuietly(delay);
+            }
+        }
+    }
+
+    /**
+     * One full attempt at a round: debit, roll, credit if won, persist.
+     * Runs in its own transaction so a failed/retried attempt doesn't
+     * hold a half-open transaction across the retry loop above.
+     */
+    @Transactional
+    protected SpinBottlePlayResponse playOnce(UUID userId, SpinBottlePlayRequest request,
+                                              BigDecimal stake, int attempt) {
+        long startedAt = System.nanoTime();
+        log.info("play() called userId={} choice={} stake={} clientSeed={} attempt={} thread={}",
+                userId, request.getChoice(), stake, request.getClientSeed(), attempt,
+                Thread.currentThread().getName());
 
         // Debit first. WalletService.debit() runs SERIALIZABLE with a
         // pessimistic row lock and throws if the balance is insufficient,
@@ -162,8 +194,6 @@ public class SpinBottleService {
     // ── RNG / provably-fair helpers ─────────────────────────────────
 
     private SpinBottleOutcome resolveOutcome(String hash) {
-        // Same technique the old client used: first 8 hex chars as a
-        // uint32, normalized to [0, 1).
         log.debug("resolveOutcome hash={} len={} first8={}", hash, hash.length(), hash.substring(0, 8));
         long num = Long.parseLong(hash.substring(0, 8), 16);
         double r = num / 4294967295.0; // 0xffffffff
@@ -205,20 +235,16 @@ public class SpinBottleService {
     private static String toHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
         for (byte b : bytes) {
-            // IMPORTANT: mask to 0xFF before formatting. A raw `byte` is
-            // signed, so passing it directly to String.format("%02x", b)
-            // autoboxes to Byte and sign-extends negative values (any byte
-            // with its high bit set) out to a 16-character run of "f"s
-            // instead of a clean 2-character hex pair. That corrupted the
-            // fixed-length structure of every hash this method produced,
-            // which in turn biased resolveOutcome()'s substring(0, 8) read
-            // toward "ffffffff" (r ≈ 1.0) far more often than the intended
-            // 3% MIDDLE probability — that was the "only middle" bug.
-            // This part is already fixed and confirmed working (production
-            // resultHash values are a clean 64 hex chars). Left in place,
-            // not the current suspect.
             sb.append(String.format("%02x", b & 0xFF));
         }
         return sb.toString();
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }
