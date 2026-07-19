@@ -5,7 +5,10 @@ import com.speedbet.api.user.User;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.TaskScheduler;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -44,46 +47,53 @@ import java.util.concurrent.ScheduledFuture;
  *     regeneration, and the FINISHED terminal guard all apply automatically
  *     with zero duplicated logic here.
  *
- * ── FIX (see notes below scheduleMatch) ──────────────────────────────────
+ * ── FIX (previous revision) ───────────────────────────────────────────────
  *   Previously, scheduled jobs were registered with the TaskScheduler
  *   *inside* the @Transactional method, before the transaction that
  *   created the Match row had committed. Because kickoffAt is frequently
  *   "now" or very soon, the kickoff job could fire on the scheduler's
  *   thread before the row was visible to other DB connections, causing
  *   updateStatus() to fail. That failure was swallowed by safeRun()
- *   (logged only), so the match silently got stuck in SCHEDULED — and
- *   because every later step assumed the previous one had succeeded,
- *   the whole lifecycle (half-time / second-half / finish) then also
- *   failed silently, leaving matches stuck mid-lifecycle forever.
+ *   (logged only), so the match silently got stuck in SCHEDULED.
  *
  *   Jobs are now registered via TransactionSynchronizationManager so they
  *   are only scheduled AFTER the surrounding transaction commits.
  *
+ * ── FIX (this revision) — matches scheduled hours ahead never kicking off ──
+ *   Root cause: this service was relying on *whatever* TaskScheduler bean
+ *   Spring happened to inject. If no dedicated TaskScheduler bean was
+ *   defined elsewhere in the app, Spring Boot's auto-configured default
+ *   applies — a SINGLE-THREADED scheduler shared by every @Scheduled job
+ *   and every TaskScheduler-using service in the whole application.
+ *
+ *   Quick kickoffs (seconds/minutes out — the kind used when manually
+ *   testing this feature) tend to fire fine because the queue is short and
+ *   nothing's contending for the thread yet. A kickoff scheduled 5 hours
+ *   out sits in that single thread's queue behind every other job the app
+ *   schedules in the meantime; if even one of those blocks, runs long, or
+ *   the thread is otherwise busy exactly when this job's trigger time
+ *   arrives, this match's kickoff can be starved indefinitely — and
+ *   because safeRun() only logs failures rather than surfacing them, that
+ *   failure mode is completely silent: the match just sits in SCHEDULED
+ *   forever with no error anywhere.
+ *
+ *   Fix: this service now defines and injects its OWN dedicated
+ *   TaskScheduler bean (see adminMatchTaskScheduler() below), sized for
+ *   real concurrent-match volume and named/qualified so it can never
+ *   silently fall back to the application's shared default scheduler.
+ *
  * ── Operational notes ────────────────────────────────────────────────────
  *   - Scheduling is in-memory via Spring's TaskScheduler. A restart before
  *     a job fires loses that job — the match is simply left at whatever
- *     stage it last reached. For multi-instance/durable deployments, persist
- *     the computed event list to a table and replace TaskScheduler with a
- *     periodic poller instead.
+ *     stage it last reached. If your deploys/restarts happen more often
+ *     than "rarely," this is a SEPARATE risk from the thread-starvation
+ *     bug fixed above, and needs a durable fix (persist the computed
+ *     event list to a table and replace TaskScheduler with a periodic
+ *     poller, or re-hydrate scheduledJobs from persisted state on
+ *     startup). Flagging this explicitly — happy to build it out if
+ *     you're seeing missed kickoffs correlate with deploys/restarts
+ *     rather than thread contention.
  *   - Jobs run off the request thread, so failures are logged, not thrown.
- *   - IMPORTANT: make sure the injected TaskScheduler bean has a thread
- *     pool sized for your real concurrent-match volume. Spring Boot's
- *     default TaskScheduler auto-configuration uses a pool size of 1,
- *     which means every match's kickoff/goal/half-time/finish jobs across
- *     the WHOLE application share a single thread. With more than a
- *     handful of matches scheduled at once, jobs queue up behind each
- *     other and fire late — which looks exactly like "matches that start
- *     but never seem to finish." If you don't already have one, add:
- *
- *       @Bean
- *       public TaskScheduler taskScheduler() {
- *           ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
- *           scheduler.setPoolSize(20); // size to your expected concurrent matches
- *           scheduler.setThreadNamePrefix("match-sched-");
- *           scheduler.setRemoveOnCancelPolicy(true);
- *           scheduler.initialize();
- *           return scheduler;
- *       }
  */
 @Slf4j
 @Service
@@ -96,11 +106,45 @@ public class AdminMatchScheduleService {
     private static final int MATCH_MINUTES       = FIRST_HALF_MINUTES + SECOND_HALF_MINUTES; // 90
 
     private final AdminMatchService adminMatchService;
+
+    /**
+     * Dedicated scheduler for this service — see class javadoc "FIX (this
+     * revision)". @Qualifier guards against Spring silently wiring in some
+     * other TaskScheduler bean (e.g. the app-wide default) instead of this
+     * one if bean names ever collide.
+     */
+    @Qualifier("adminMatchTaskScheduler")
     private final TaskScheduler taskScheduler;
+
     private final Random random = new Random();
 
     /** matchId → active jobs + the schedule that produced them, for cancel/inspect. */
     private final Map<UUID, ScheduleHandle> scheduledJobs = new ConcurrentHashMap<>();
+
+    /**
+     * Dedicated thread pool for match-lifecycle jobs (kickoff / goals /
+     * half-time / second-half / finish), completely separate from
+     * whatever TaskScheduler (if any) the rest of the app uses for other
+     * @Scheduled work. Sized generously since jobs are short (a single
+     * DB-backed service call each) — 20 concurrent matches × ~5-9 jobs
+     * each is comfortably covered, and idle threads cost nothing.
+     *
+     * Bump poolSize further if you regularly run more than ~20 matches
+     * concurrently with overlapping schedules.
+     */
+    @Bean(name = "adminMatchTaskScheduler")
+    public TaskScheduler adminMatchTaskScheduler() {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(20);
+        scheduler.setThreadNamePrefix("match-sched-");
+        scheduler.setRemoveOnCancelPolicy(true);
+        // Don't let one hung job (e.g. a slow/blocked downstream call)
+        // silently starve every other match's jobs on the same thread.
+        scheduler.setErrorHandler(t ->
+                log.error("AdminMatchScheduleService: uncaught scheduler error", t));
+        scheduler.initialize();
+        return scheduler;
+    }
 
     @Getter
     @RequiredArgsConstructor
@@ -172,13 +216,6 @@ public class AdminMatchScheduleService {
      * transaction has committed. If there is no active transaction (e.g.
      * called from a test or a non-transactional caller), the jobs are
      * registered immediately instead.
-     *
-     * This is the fix for matches that never left SCHEDULED: previously
-     * these jobs were scheduled synchronously inside the @Transactional
-     * method, so a kickoff time of "now" (or a few seconds out) could fire
-     * the kickoff job before the INSERT for the Match row had committed,
-     * making the row invisible to the job's own DB call and causing it to
-     * fail silently.
      */
     private void registerScheduleAfterCommit(UUID matchId, Instant kickoffAt, Instant halfTimeAt,
                                              Instant secondHalfAt, Instant finishedAt,
@@ -321,8 +358,6 @@ public class AdminMatchScheduleService {
         for (int minute : uniqueRandomMinutes(finalHome)) raw.add(new int[]{minute, 0});
         for (int minute : uniqueRandomMinutes(finalAway)) raw.add(new int[]{minute, 1});
 
-        // Sort by minute; break ties with a stable secondary order so we can
-        // offset colliding minutes by a few seconds to avoid identical timestamps.
         raw.sort(Comparator.comparingInt(a -> a[0]));
 
         List<GoalEvent> events = new ArrayList<>();
@@ -334,7 +369,6 @@ public class AdminMatchScheduleService {
             String team = entry[1] == 0 ? "HOME" : "AWAY";
 
             Instant at = minuteToInstant(minute, kickoffAt, secondHalfAt);
-            // Guarantee strictly increasing timestamps even if two goals share a minute.
             if (lastAt != null && !at.isAfter(lastAt)) {
                 at = lastAt.plusSeconds(5);
             }
@@ -350,8 +384,6 @@ public class AdminMatchScheduleService {
     /** Random, unique minutes (1..MATCH_MINUTES) for a given number of goals. */
     private List<Integer> uniqueRandomMinutes(int count) {
         if (count <= 0) return List.of();
-        // Defensive cap — never realistically hit, but avoids an infinite
-        // loop if someone schedules an absurd score line.
         int max = Math.min(count, MATCH_MINUTES);
         Set<Integer> minutes = new LinkedHashSet<>();
         while (minutes.size() < max) {
