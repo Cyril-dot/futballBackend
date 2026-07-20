@@ -511,9 +511,20 @@ public class PaystackMobileMoneyController {
      * Shared implementation for all three read-only verify endpoints above.
      * {@code /transaction/verify/:reference} is channel-agnostic on Paystack's
      * side, so one call works for MoMo, bank, and card references alike.
+     *
+     * NOTE: if {@code reference} is blank/empty, we fail fast with a 400
+     * instead of forwarding an empty value to Paystack. Historically an empty
+     * reference here has surfaced client-side as a generic 500 with no useful
+     * detail — this makes the failure mode explicit and traceable back to the
+     * caller instead.
      */
     private ResponseEntity<ApiResponse<Map<String, Object>>> verifyGeneric(
             String tag, User user, String reference) {
+
+        if (reference == null || reference.isBlank()) {
+            log.warn("[{}][verify] REJECTED — blank/empty reference from userId='{}'", tag, user.getId());
+            throw ApiException.badRequest("reference is required.");
+        }
 
         log.info("[{}][verify] START — userId='{}' ref='{}'", tag, user.getId(), reference);
 
