@@ -113,7 +113,17 @@ public class EspnFootballDataService {
         CHAMPIONS_LEAGUE ("uefa.champions_league",  "UEFA Champions League", true),
         EUROPA_LEAGUE    ("uefa.europa",             "UEFA Europa League",    true),
         CONFERENCE_LEAGUE("uefa.europa.conference", "UEFA Conference League",true),
-        WORLD_CUP        ("fifa.world",              "FIFA World Cup",        false);
+        WORLD_CUP        ("fifa.world",              "FIFA World Cup",        false),
+
+        // ── PRESEASON / CLUB FRIENDLIES ─────────────────────────
+        // Soccer has no discrete "preseason" the way American sports do — preseason
+        // fixtures (summer tours, warm-up games) are published by ESPN under these
+        // friendly / exhibition competition slugs instead.
+        CLUB_FRIENDLY            ("club.friendly",         "Club Friendly",                false),
+        INTERNATIONAL_CHAMPS_CUP ("global.champs_cup",     "International Champions Cup",  false),
+        EMIRATES_CUP             ("friendly.emirates_cup", "Emirates Cup",                 false),
+        INTERNATIONAL_FRIENDLY   ("fifa.friendly",         "International Friendly",       false),
+        NON_FIFA_FRIENDLY        ("nonfifa",               "Non-FIFA Friendly",            false);
 
         private final String  slug;
         private final String  displayName;
@@ -141,7 +151,15 @@ public class EspnFootballDataService {
             return Arrays.stream(values()).filter(EspnCup::isTop6Related).collect(Collectors.toList());
         }
 
-        /** All cups including World Cup — used for upcoming fixture and live scanning. */
+        /** Preseason / club friendly / exhibition competitions (ICC, Emirates Cup, etc). */
+        public static List<EspnCup> preseasonAndFriendlies() {
+            return List.of(
+                    CLUB_FRIENDLY, INTERNATIONAL_CHAMPS_CUP, EMIRATES_CUP,
+                    INTERNATIONAL_FRIENDLY, NON_FIFA_FRIENDLY
+            );
+        }
+
+        /** All cups including World Cup and preseason/friendlies — used for upcoming fixture and live scanning. */
         public static List<EspnCup> allIncludingWorldCup() {
             return Arrays.asList(values());
         }
@@ -319,7 +337,7 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Also scan cups (World Cup, UCL, etc.) for live matches
+            // Also scan cups (World Cup, UCL, preseason/club friendlies, etc.) for live matches
             for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
                 try {
                     List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
@@ -353,7 +371,7 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Include cups (World Cup, UCL, domestic cups) for upcoming today
+            // Include cups (World Cup, UCL, domestic cups, preseason/club friendlies) for upcoming today
             for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
                 try {
                     List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
@@ -373,7 +391,7 @@ public class EspnFootballDataService {
 
     public List<Map<String, Object>> getAllFinishedMatchesToday() {
         return cachedStd("today:all:finished", () -> {
-            log.info("ESPN getAllFinishedMatchesToday: scanning all leagues");
+            log.info("ESPN getAllFinishedMatchesToday: scanning all leagues + cups");
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -387,8 +405,21 @@ public class EspnFootballDataService {
                 }
             }
 
+            // Cups (World Cup, UCL, domestic cups, preseason/club friendlies) were previously
+            // missing from this bucket even though the live/upcoming buckets included them.
+            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+                try {
+                    List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
+                    for (Map<String, Object> e : events) {
+                        if (isFinished(e)) all.add(e);
+                    }
+                } catch (Exception e) {
+                    log.warn("ESPN getAllFinishedMatchesToday: error fetching cup {} — {}", cup.displayName(), e.getMessage());
+                }
+            }
+
             List<Map<String, Object>> merged = mergeByEventId(all);
-            log.info("ESPN getAllFinishedMatchesToday: {} finished event(s) across all leagues", merged.size());
+            log.info("ESPN getAllFinishedMatchesToday: {} finished event(s) across all leagues + cups", merged.size());
             return merged;
         });
     }
@@ -411,7 +442,7 @@ public class EspnFootballDataService {
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
         return cachedStd(cacheKey, () -> {
-            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups incl. World Cup", yyyymmdd);
+            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups incl. World Cup and preseason/friendlies", yyyymmdd);
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -423,7 +454,7 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Include ALL cups — World Cup, Champions League, domestic cups, etc.
+            // Include ALL cups — World Cup, Champions League, domestic cups, preseason/club friendlies, etc.
             for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
                 try {
                     all.addAll(extractEvents(fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd)));
@@ -616,6 +647,57 @@ public class EspnFootballDataService {
             all = mergeByEventId(all);
             log.info("ESPN getAllCupsTodayMatches: {} deduplicated event(s)", all.size());
             return all;
+        });
+    }
+
+    // ── SECTION 2B: PRESEASON / CLUB FRIENDLIES ───────────────────────────
+
+    public List<Map<String, Object>> getPreseasonFriendliesTodayMatches() {
+        return cachedStd("today:preseason:all", () -> {
+            List<Map<String, Object>> merged = new ArrayList<>();
+            for (EspnCup cup : EspnCup.preseasonAndFriendlies()) {
+                merged.addAll(getCupScoreboard(cup));
+            }
+            merged = mergeByEventId(merged);
+            log.info("ESPN getPreseasonFriendliesTodayMatches: {} deduplicated event(s)", merged.size());
+            return merged;
+        });
+    }
+
+    public List<Map<String, Object>> getPreseasonFriendliesLiveMatches() {
+        return cachedLive("live:preseason:all", () -> {
+            List<Map<String, Object>> live = new ArrayList<>();
+            for (EspnCup cup : EspnCup.preseasonAndFriendlies()) {
+                live.addAll(getCupLiveMatches(cup));
+            }
+            live = mergeByEventId(live);
+            log.info("ESPN getPreseasonFriendliesLiveMatches: {} live event(s)", live.size());
+            return live;
+        });
+    }
+
+    public List<Map<String, Object>> getPreseasonFriendliesUpcomingMatches() {
+        return cachedStd("upcoming:preseason:all", () -> {
+            List<Map<String, Object>> upcoming = new ArrayList<>();
+            for (EspnCup cup : EspnCup.preseasonAndFriendlies()) {
+                upcoming.addAll(getCupUpcomingMatches(cup));
+            }
+            upcoming = mergeByEventId(upcoming);
+            log.info("ESPN getPreseasonFriendliesUpcomingMatches: {} upcoming event(s)", upcoming.size());
+            return upcoming;
+        });
+    }
+
+    public List<Map<String, Object>> getPreseasonFriendliesByDate(String yyyymmdd) {
+        String cacheKey = "preseason:date:" + yyyymmdd;
+        return cachedStd(cacheKey, () -> {
+            List<Map<String, Object>> merged = new ArrayList<>();
+            for (EspnCup cup : EspnCup.preseasonAndFriendlies()) {
+                merged.addAll(getCupScoreboardByDate(cup, yyyymmdd));
+            }
+            merged = mergeByEventId(merged);
+            log.info("ESPN getPreseasonFriendliesByDate({}): {} event(s)", yyyymmdd, merged.size());
+            return merged;
         });
     }
 
