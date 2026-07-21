@@ -300,6 +300,7 @@ public class SecurityConfig {
                 "https://championbetadmin.vercel.app",
                 "https://pulsebetui.vercel.app",
                 "https://winningbetadmin.vercel.app",
+                "https://nexbetadmin.vercel.app",
                 // ── pulsebett ─────────────────────────────────────────────
                 "https://pulsebett.site",
                 "https://www.pulsebett.site",
