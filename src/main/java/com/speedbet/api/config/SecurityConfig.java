@@ -335,7 +335,8 @@ public class SecurityConfig {
                 // ── crownbett ─────────────────────────────────────────
                 "https://crown-bet-xi.vercel.app",
                 "https://crownbett.xyz",
-                "https://www.crownbett.xyz"
+                "https://www.crownbett.xyz",
+                "https://betnova-seven.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
