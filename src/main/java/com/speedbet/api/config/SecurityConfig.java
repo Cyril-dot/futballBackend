@@ -285,13 +285,14 @@ public class SecurityConfig {
                 "https://www.winningbbet.site",
                 "https://winningbetadmin.vercel.app",
                 "https://championbet-jade.vercel.app",
+
                 // ── zynobet ───────────────────────────────────────────
                 "https://zynobet.site",
                 "https://www.zynobet.site",
                 "https://oddsking-ui.vercel.app",
                 "https://zynobetadmin.vercel.app",
 
-// ── zynobett (new) ───────────────────────────────────────────
+                // ── zynobett (new) ────────────────────────────────────
                 "https://zynobett.site",
                 "https://www.zynobett.site",
                 "https://championbett.site",
@@ -301,48 +302,40 @@ public class SecurityConfig {
                 "https://pulsebetui.vercel.app",
                 "https://winningbetadmin.vercel.app",
                 "https://nexbetadmin.vercel.app",
-                // ── pulsebett ─────────────────────────────────────────────
-                "https://pulsebett.site",
-                "https://www.pulsebett.site",
-                "https://pulsebetui.vercel.app",
-                // ── pulsebett ─────────────────────────────────────────────
+
+                // ── pulsebett ─────────────────────────────────────────
                 "https://pulsebett.site",
                 "https://www.pulsebett.site",
                 "https://pulsebetui.vercel.app",
                 "https://pulsebetadmin.vercel.app",
+
+                // ── omegabett ─────────────────────────────────────────
                 "https://omega-bet-gh.vercel.app",
                 "https://omegabett.site",
                 "https://www.omegabett.site",
-                "https://omega-bet-gh.vercel.app",
-                "https://omegabett.site",
-                "https://www.omegabett.site",
-                "https://omega-bet-gh.vercel.app",
                 "https://omega-bet-admin.vercel.app",
-                "https://africa-bet-ten.vercel.app",
-                "https://omega-bet-admin.vercel.app",
-                "https://africa-bet-ten.vercel.app",
 
-                // ── africabet ─────────────────────────────────────────
-                "https://africabet.site",
-                "https://www.africabet.site",
-                "https://nex-bet-pink.vercel.app",
-                "https://africabet-admin.vercel.app",
+                // ── africabett (NEW) ──────────────────────────────────
+                "https://africabett.site",
+                "https://www.africabett.site",
+                "https://africa-bet-ten.vercel.app",
+                "https://africabett-admin.vercel.app",
 
+                // ── betchamp ──────────────────────────────────────────
                 "https://bet-champ.vercel.app",
-                // ── betchamp ─────────────────────────────────────────
                 "https://betchamp.site",
                 "https://www.betchamp.site",
-                "https://bet-champ.vercel.app",
+
                 // ── nexbett ───────────────────────────────────────────
                 "https://nexbett.xyz",
                 "https://www.nexbett.xyz",
                 "https://nex-bet-pink.vercel.app",
                 "https://nex-bet-admin.vercel.app",
+
+                // ── crownbett ─────────────────────────────────────────
                 "https://crown-bet-xi.vercel.app",
                 "https://crownbett.xyz",
-                "https://www.crownbett.xyz",
-                "https://crown-bet-xi.vercel.app"
-
+                "https://www.crownbett.xyz"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
@@ -368,7 +361,7 @@ public class SecurityConfig {
 
         return source;
     }
-    
+
     @Bean
     public AuthenticationProvider authenticationProvider() {
         var provider = new DaoAuthenticationProvider();
