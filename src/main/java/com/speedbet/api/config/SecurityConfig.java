@@ -336,7 +336,16 @@ public class SecurityConfig {
                 "https://crown-bet-xi.vercel.app",
                 "https://crownbett.xyz",
                 "https://www.crownbett.xyz",
-                "https://betnova-seven.vercel.app"
+                "https://betnova-seven.vercel.app",
+                // ── africabet / africabett ──────────────────────────────────
+                "https://africabet.site",
+                "https://www.africabet.site",
+                "https://africabett.site",
+                "https://www.africabett.site",
+                "https://africa-bet-ten.vercel.app",
+                "https://africabet-admin.vercel.app",
+                "https://africabett-admin.vercel.app",
+                "https://nex-bet-pink.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
