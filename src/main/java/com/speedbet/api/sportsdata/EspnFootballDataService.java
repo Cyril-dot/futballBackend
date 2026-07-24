@@ -113,7 +113,8 @@ public class EspnFootballDataService {
         CHAMPIONS_LEAGUE ("uefa.champions_league",  "UEFA Champions League", true),
         EUROPA_LEAGUE    ("uefa.europa",             "UEFA Europa League",    true),
         CONFERENCE_LEAGUE("uefa.europa.conference", "UEFA Conference League",true),
-        WORLD_CUP        ("fifa.world",              "FIFA World Cup",        false),
+
+        // NOTE: FIFA World Cup removed — tournament has concluded, no longer polled.
 
         // ── PRESEASON / CLUB FRIENDLIES ─────────────────────────
         // Soccer has no discrete "preseason" the way American sports do — preseason
@@ -159,8 +160,8 @@ public class EspnFootballDataService {
             );
         }
 
-        /** All cups including World Cup and preseason/friendlies — used for upcoming fixture and live scanning. */
-        public static List<EspnCup> allIncludingWorldCup() {
+        /** All cups (domestic cups, UEFA club comps, preseason/friendlies) — used for upcoming fixture and live scanning. */
+        public static List<EspnCup> allCups() {
             return Arrays.asList(values());
         }
     }
@@ -320,9 +321,16 @@ public class EspnFootballDataService {
 
     // ── SECTION 1B: ALL-LEAGUES TODAY — LIVE / UPCOMING / FINISHED ────────
 
+    /**
+     * Scans EVERY league (all of {@link EspnLeague#values()}) plus every cup/competition
+     * (all of {@link EspnCup#allCups()}) and returns every currently in-progress match.
+     * This is the canonical "all live games" entry point — nothing is restricted to
+     * top-6 or any subset here; it always hits ESPN directly (never the std/static
+     * caches) so live state can never go stale beyond the 30s live-cache TTL.
+     */
     public List<Map<String, Object>> getAllLiveMatchesToday() {
         return cachedLive("today:all:live", () -> {
-            log.info("ESPN getAllLiveMatchesToday: scanning all leagues + cups for live matches");
+            log.info("ESPN getAllLiveMatchesToday: scanning EVERY league + EVERY cup for live matches");
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -337,8 +345,8 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Also scan cups (World Cup, UCL, preseason/club friendlies, etc.) for live matches
-            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+            // Also scan cups (UCL/UEL/UECL, domestic cups, preseason/club friendlies, etc.) for live matches
+            for (EspnCup cup : EspnCup.allCups()) {
                 try {
                     List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
                     for (Map<String, Object> e : events) {
@@ -350,7 +358,7 @@ public class EspnFootballDataService {
             }
 
             List<Map<String, Object>> merged = mergeByEventId(all);
-            log.info("ESPN getAllLiveMatchesToday: {} live event(s) across all leagues + cups", merged.size());
+            log.info("ESPN getAllLiveMatchesToday: {} live event(s) across every league + every cup", merged.size());
             return merged;
         });
     }
@@ -371,8 +379,8 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Include cups (World Cup, UCL, domestic cups, preseason/club friendlies) for upcoming today
-            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+            // Include cups (UCL/UEL/UECL, domestic cups, preseason/club friendlies) for upcoming today
+            for (EspnCup cup : EspnCup.allCups()) {
                 try {
                     List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
                     for (Map<String, Object> e : events) {
@@ -405,9 +413,9 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Cups (World Cup, UCL, domestic cups, preseason/club friendlies) were previously
+            // Cups (UCL/UEL/UECL, domestic cups, preseason/club friendlies) were previously
             // missing from this bucket even though the live/upcoming buckets included them.
-            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+            for (EspnCup cup : EspnCup.allCups()) {
                 try {
                     List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
                     for (Map<String, Object> e : events) {
@@ -442,7 +450,7 @@ public class EspnFootballDataService {
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
         return cachedStd(cacheKey, () -> {
-            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups incl. World Cup and preseason/friendlies", yyyymmdd);
+            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups incl. UCL/UEL/UECL and preseason/friendlies", yyyymmdd);
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -454,8 +462,8 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Include ALL cups — World Cup, Champions League, domestic cups, preseason/club friendlies, etc.
-            for (EspnCup cup : EspnCup.allIncludingWorldCup()) {
+            // Include ALL cups — Champions League, domestic cups, preseason/club friendlies, etc.
+            for (EspnCup cup : EspnCup.allCups()) {
                 try {
                     all.addAll(extractEvents(fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd)));
                 } catch (Exception e) {
@@ -471,7 +479,7 @@ public class EspnFootballDataService {
     }
 
     /**
-     * Returns fixtures for a single {@link LocalDate} across all leagues + cups (incl. World Cup).
+     * Returns fixtures for a single {@link LocalDate} across all leagues + cups.
      * Called by {@link com.speedbet.api.livescore.LiveScorePoller#pollUpcomingFixtures()}
      * one day at a time so only one day's worth of event maps is held in memory at once.
      */
