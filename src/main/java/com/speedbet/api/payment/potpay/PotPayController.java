@@ -18,6 +18,7 @@ import reactor.util.retry.Retry;
 
 import java.math.BigDecimal;
 import java.math.MathContext;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
@@ -100,7 +101,13 @@ public class PotPayController {
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
-        var amount = new BigDecimal(req.get("amount").toString());
+        // ── FIX (amount format) ──────────────────────────────────────────────
+        // PotPay's docs specify `amount: decimal` and their cURL examples always
+        // show two decimal places (e.g. "amount": 100.00). new BigDecimal("1")
+        // serializes to a raw integer 1, which strict gateways reject with a 400.
+        // Force scale(2) so WebClient always sends "amount": 1.00.
+        var amount = new BigDecimal(req.get("amount").toString()).setScale(2, RoundingMode.HALF_UP);
+        // ─────────────────────────────────────────────────────────────────────
         if (amount.compareTo(minGhsDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minGhsDeposit);
 
@@ -472,7 +479,26 @@ public class PotPayController {
 
         var result = (Map<String, Object>) spec
                 .retrieve()
-                .onStatus(HttpStatusCode::isError,
+                // ── FIX (surface PotPay 4xx to the client) ───────────────────────
+                // A 400/4xx from PotPay is a client-facing rejection (bad network
+                // code, unregistered MoMo number, amount rejected, etc.), NOT an
+                // internal server fault. Previously any error status was wrapped in
+                // a plain RuntimeException, which the global handler turned into an
+                // opaque 500 "An internal error occurred" — hiding PotPay's actual
+                // message. Catch 4xx separately and re-throw as ApiException.badRequest
+                // so the real PotPay rejection reaches the frontend as a 400.
+                .onStatus(HttpStatusCode::is4xxClientError,
+                        clientResponse -> clientResponse.bodyToMono(String.class)
+                                .map(respBody -> {
+                                    log.error("PotPay API error: method={} path='{}' status={} body={}",
+                                            method, path, clientResponse.statusCode(), respBody);
+                                    return ApiException.badRequest(
+                                            "Payment gateway rejected the request: " + respBody);
+                                })
+                )
+                // 5xx and any other error status remain a RuntimeException (→ 500),
+                // since those are genuinely PotPay-side / server faults.
+                .onStatus(HttpStatusCode::is5xxServerError,
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(respBody -> {
                                     log.error("PotPay API error: method={} path='{}' status={} body={}",
@@ -481,6 +507,7 @@ public class PotPayController {
                                             "PotPay returned " + clientResponse.statusCode() + ": " + respBody);
                                 })
                 )
+                // ─────────────────────────────────────────────────────────────────
                 .bodyToMono(Map.class)
                 .timeout(potpayTimeout)
                 .retryWhen(Retry.max(potpayRetryAttempts)
@@ -491,9 +518,15 @@ public class PotPayController {
                         // RetryExhaustedException (a RuntimeException with a non-null
                         // message like "Retries exhausted: 2/2"), which surfaced to the
                         // client as a confusing internal string. Also catch that case.
-                        ex -> !(ex instanceof RuntimeException)
+                        //
+                        // NOTE: ApiException (thrown by the 4xx handler above) must be
+                        // allowed to propagate unchanged so the client still receives the
+                        // real PotPay rejection as a 400 — never remap it to the generic
+                        // "unavailable" message.
+                        ex -> !(ex instanceof ApiException)
+                                && (!(ex instanceof RuntimeException)
                                 || ex.getMessage() == null
-                                || ex.getClass().getSimpleName().contains("RetryExhausted"),
+                                || ex.getClass().getSimpleName().contains("RetryExhausted")),
                         ex -> {
                             log.error("PotPay API unreachable after {} retries: method={} path='{}'",
                                     potpayRetryAttempts, method, path, ex);
