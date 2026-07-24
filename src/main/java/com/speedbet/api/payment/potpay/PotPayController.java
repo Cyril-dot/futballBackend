@@ -25,30 +25,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * PotPay integration controller.
- *
- * Handles both markets exposed by PotPay's merchant API:
- *   - Ghana  (GHS, mobile money via USSD "Collect" — MTN / Vodafone / AirtelTigo)
- *   - Nigeria (NGN, redirect checkout via Flutterwave — card / bank transfer / USSD)
- *
- * Auth: PotPay uses the Merchant ID itself as the bearer token
- *   Authorization: Bearer <merchantId>
- * (Not a secret API key exchange like Paystack — treat the Merchant ID as
- * sensitive anyway and never expose it to the frontend.)
- *
- * IMPORTANT — no server-to-server webhook exists for either market in the
- * documented API surface:
- *   - Ghana:   PotPay auto-verifies against the network every 30s internally,
- *              but that only updates *their* record — your server still has
- *              to call Verify to find out. We do this via a scheduled poller.
- *   - Nigeria: PotPay redirects the *customer's browser* to callback_url with
- *              status/tx_ref query params. Per PotPay's own docs those params
- *              must never be trusted directly — the callback handler here
- *              re-verifies server-side before crediting anything. A poller
- *              also runs as a safety net for customers who close the tab
- *              before the redirect completes.
- */
 @Slf4j
 @RestController
 @RequiredArgsConstructor
@@ -57,30 +33,19 @@ public class PotPayController {
     // ─── Config ─────────────────────────────────────────────────────────────
 
     @Value("${app.potpay.merchant-id}")            private String     merchantId;
-    @Value("${app.potpay.base-url}")                private String     baseUrl; // https://backendpay.tipsterhub.online
+    @Value("${app.potpay.base-url}")               private String     baseUrl; // https://backendpay.tipsterhub.online
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minGhsDeposit;
     @Value("${app.platform.min-deposit-amount-ngn:1000}") private BigDecimal minNgnDeposit;
-    @Value("${app.platform.frontend-url}")          private String     frontendUrl;
+    @Value("${app.platform.frontend-url}")         private String     frontendUrl;
 
     private static final BigDecimal NG_COMMISSION_RATE = new BigDecimal("0.15"); // 15%
 
-    /** Timeout for outbound calls to PotPay. */
     private final Duration potpayTimeout = Duration.ofSeconds(10);
-
-    /** Retries on transient network failures only — never on PotPay 4xx/5xx. */
     private final long potpayRetryAttempts = 2;
 
     private final WalletService     walletService;
     private final WebClient.Builder webClientBuilder;
 
-    /**
-     * In-memory tracking of PotPay transactions awaiting verification.
-     *
-     * NOTE: replace with a persisted table (e.g. PotPayPendingTransaction JPA
-     * entity + repository) before relying on this in production — an
-     * in-memory map does not survive an app restart, which would strand any
-     * transaction that was pending at the time of a deploy/crash.
-     */
     private final Map<String, PendingTx> pendingTransactions = new ConcurrentHashMap<>();
 
     private record PendingTx(UUID userId, BigDecimal grossAmount, String currency,
@@ -90,29 +55,19 @@ public class PotPayController {
     // GHANA (GHS · Mobile Money)
     // ════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Starts a GHS mobile money collection. Sends a USSD approval prompt to
-     * the customer's phone. Does NOT credit the wallet — that only happens
-     * once Verify confirms status == "success" (via the scheduled poller,
-     * or the manual verify endpoint below).
-     */
     @PostMapping("/api/wallet/deposit/potpay/gh/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initGhanaDeposit(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
-        // ── FIX (amount format) ──────────────────────────────────────────────
-        // PotPay's docs specify `amount: decimal` and their cURL examples always
-        // show two decimal places (e.g. "amount": 100.00). new BigDecimal("1")
-        // serializes to a raw integer 1, which strict gateways reject with a 400.
-        // Force scale(2) so WebClient always sends "amount": 1.00.
+        // FIX: Force exactly 2 decimal places (e.g. 10.00). PotPay rejects raw integers.
         var amount = new BigDecimal(req.get("amount").toString()).setScale(2, RoundingMode.HALF_UP);
-        // ─────────────────────────────────────────────────────────────────────
+
         if (amount.compareTo(minGhsDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minGhsDeposit);
 
         var phoneNumber = required(req, "phoneNumber");
-        var network     = (String) req.get("network"); // optional — auto-detected if omitted
+        var network     = (String) req.get("network"); // MTN, VDF, ATL
 
         log.info("initGhanaDeposit: userId='{}' amount={} phone='{}'",
                 user.getId(), amount, mask(phoneNumber));
@@ -123,30 +78,16 @@ public class PotPayController {
         if (!Boolean.TRUE.equals(response.get("success"))) {
             log.error("initGhanaDeposit: PotPay rejected collect request for userId='{}': {}",
                     user.getId(), response);
-            throw new RuntimeException("PotPay declined the collection request.");
+            throw ApiException.badRequest("PotPay declined the collection request.");
         }
 
-        // ── FIX ────────────────────────────────────────────────────────────
-        // PotPay's response shape isn't guaranteed to contain "transaction_id"
-        // on every call (or the field can come back null/blank depending on
-        // network/response variant). Previously this value was inserted
-        // directly as the key of `pendingTransactions`, which is a
-        // ConcurrentHashMap — ConcurrentHashMap.put(null, ...) throws an
-        // unchecked NullPointerException, which Spring turns into an opaque
-        // 500 with no useful detail on the client. Guard it, log the FULL
-        // raw response so the real field name can be confirmed, and fail
-        // with a clear, actionable error instead of an NPE.
         var transactionId = (String) response.get("transaction_id");
         var reference      = (String) response.get("reference");
 
         if (transactionId == null || transactionId.isBlank()) {
-            log.error("initGhanaDeposit: PotPay response missing 'transaction_id' for userId='{}'. " +
-                    "Full response was: {}", user.getId(), response);
-            throw new RuntimeException(
-                    "PotPay accepted the request but did not return a transaction id. " +
-                            "Check server logs for the raw PotPay response to confirm the correct field name.");
+            log.error("initGhanaDeposit: PotPay response missing 'transaction_id' for userId='{}'. Response: {}", user.getId(), response);
+            throw ApiException.badRequest("PotPay accepted the request but did not return a transaction id.");
         }
-        // ─────────────────────────────────────────────────────────────────
 
         pendingTransactions.put(transactionId,
                 new PendingTx(user.getId(), amount, "GHS", "gh", Instant.now()));
@@ -163,11 +104,6 @@ public class PotPayController {
         )));
     }
 
-    /**
-     * Manual verify — lets the frontend poll for a fast UX while the
-     * scheduled poller (below) acts as the source of truth in the background.
-     * Safe to call repeatedly; crediting is idempotent per transactionId.
-     */
     @GetMapping("/api/wallet/deposit/potpay/gh/verify/{transactionId}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> verifyGhanaDeposit(
             @AuthenticationPrincipal User user,
@@ -190,11 +126,6 @@ public class PotPayController {
         )));
     }
 
-    /**
-     * Background safety net: polls every pending GH transaction so a
-     * deposit still completes even if the customer never returns to the app
-     * to trigger a manual verify call.
-     */
     @Scheduled(fixedDelay = 30_000)
     public void pollPendingGhanaTransactions() {
         pendingTransactions.entrySet().stream()
@@ -206,14 +137,11 @@ public class PotPayController {
                         if ("success".equals(status)) {
                             settleGhanaDeposit(e.getKey(), result);
                         } else if ("failed".equals(status) || "decline".equals(status)) {
-                            log.info("pollPendingGhanaTransactions: txId='{}' ended with status='{}' — dropping",
-                                    e.getKey(), status);
+                            log.info("pollPendingGhanaTransactions: txId='{}' ended with status='{}' — dropping", e.getKey(), status);
                             pendingTransactions.remove(e.getKey());
                         }
-                        // still "pending" -> leave in map, try again next tick
                     } catch (Exception ex) {
-                        log.error("pollPendingGhanaTransactions: verify failed for txId='{}'",
-                                e.getKey(), ex);
+                        log.error("pollPendingGhanaTransactions: verify failed for txId='{}'", e.getKey(), ex);
                     }
                 });
     }
@@ -221,10 +149,7 @@ public class PotPayController {
     private void settleGhanaDeposit(String transactionId, Map<String, Object> verifyResult) {
         var pending = pendingTransactions.remove(transactionId);
         if (pending == null) {
-            // Already settled by a concurrent poll/manual-verify call, or we
-            // restarted and lost tracking — nothing safe to do but log it.
-            log.warn("settleGhanaDeposit: no pending record for txId='{}' — skipping credit " +
-                    "(already settled, or tracking was lost)", transactionId);
+            log.warn("settleGhanaDeposit: no pending record for txId='{}' — skipping credit", transactionId);
             return;
         }
 
@@ -250,10 +175,6 @@ public class PotPayController {
     // NIGERIA (NGN · Redirect checkout)
     // ════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Starts an NGN redirect-checkout payment. Returns checkout_url for the
-     * frontend to redirect the customer to.
-     */
     @PostMapping("/api/wallet/deposit/potpay/ng/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initNigeriaDeposit(
             @AuthenticationPrincipal User user,
@@ -278,20 +199,14 @@ public class PotPayController {
         );
 
         if (!Boolean.TRUE.equals(response.get("success"))) {
-            log.error("initNigeriaDeposit: PotPay rejected initiate request for userId='{}': {}",
-                    user.getId(), response);
-            throw new RuntimeException("PotPay declined the payment request.");
+            log.error("initNigeriaDeposit: PotPay rejected initiate request for userId='{}': {}", user.getId(), response);
+            throw ApiException.badRequest("PotPay declined the payment request.");
         }
 
-        // Same class of bug as Ghana above — guard against a missing tx_ref
-        // instead of letting ConcurrentHashMap.put(null, ...) NPE.
         var txRef = (String) response.get("tx_ref");
         if (txRef == null || txRef.isBlank()) {
-            log.error("initNigeriaDeposit: PotPay response missing 'tx_ref' for userId='{}'. " +
-                    "Full response was: {}", user.getId(), response);
-            throw new RuntimeException(
-                    "PotPay accepted the request but did not return a transaction reference. " +
-                            "Check server logs for the raw PotPay response to confirm the correct field name.");
+            log.error("initNigeriaDeposit: PotPay response missing 'tx_ref' for userId='{}'. Response: {}", user.getId(), response);
+            throw ApiException.badRequest("PotPay accepted the request but did not return a transaction reference.");
         }
 
         pendingTransactions.put(txRef,
@@ -307,19 +222,12 @@ public class PotPayController {
         )));
     }
 
-    /**
-     * Handles the browser redirect PotPay sends the customer back to after
-     * checkout. Per PotPay's docs, the status/tx_ref query params must never
-     * be trusted directly — this always re-verifies server-side before
-     * crediting, then redirects on to the real frontend result page.
-     */
     @GetMapping("/app/wallet/potpay/ng/callback")
     public ResponseEntity<Void> nigeriaCallback(
             @RequestParam("tx_ref") String txRef,
             @RequestParam(value = "status", required = false) String unverifiedStatus) {
 
-        log.info("nigeriaCallback: txRef='{}' unverifiedStatus='{}' (re-verifying server-side)",
-                txRef, unverifiedStatus);
+        log.info("nigeriaCallback: txRef='{}' unverifiedStatus='{}' (re-verifying server-side)", txRef, unverifiedStatus);
 
         String finalStatus;
         try {
@@ -337,7 +245,6 @@ public class PotPayController {
         return ResponseEntity.status(302).header("Location", redirectUrl).build();
     }
 
-    /** Manual verify endpoint, mirrors the Ghana one, for frontend polling. */
     @GetMapping("/api/wallet/deposit/potpay/ng/verify")
     public ResponseEntity<ApiResponse<Map<String, Object>>> verifyNigeriaDeposit(
             @AuthenticationPrincipal User user,
@@ -360,7 +267,6 @@ public class PotPayController {
         )));
     }
 
-    /** Safety-net poller for customers who never complete the browser redirect. */
     @Scheduled(fixedDelay = 15_000)
     public void pollPendingNigeriaTransactions() {
         pendingTransactions.entrySet().stream()
@@ -376,8 +282,7 @@ public class PotPayController {
                             pendingTransactions.remove(e.getKey());
                         }
                     } catch (Exception ex) {
-                        log.error("pollPendingNigeriaTransactions: verify failed for txRef='{}'",
-                                e.getKey(), ex);
+                        log.error("pollPendingNigeriaTransactions: verify failed for txRef='{}'", e.getKey(), ex);
                     }
                 });
     }
@@ -385,14 +290,12 @@ public class PotPayController {
     private void settleNigeriaDeposit(String txRef, Map<String, Object> verifyResult) {
         var pending = pendingTransactions.remove(txRef);
         if (pending == null) {
-            log.warn("settleNigeriaDeposit: no pending record for txRef='{}' — skipping credit " +
-                    "(already settled, or tracking was lost)", txRef);
+            log.warn("settleNigeriaDeposit: no pending record for txRef='{}' — skipping credit", txRef);
             return;
         }
 
         var grossAmount = new BigDecimal(verifyResult.get("amount").toString());
-        var netAmount = grossAmount
-                .multiply(BigDecimal.ONE.subtract(NG_COMMISSION_RATE), MathContext.DECIMAL64);
+        var netAmount = grossAmount.multiply(BigDecimal.ONE.subtract(NG_COMMISSION_RATE), MathContext.DECIMAL64);
 
         try {
             walletService.credit(pending.userId(), netAmount, TxKind.DEPOSIT, txRef,
@@ -415,7 +318,6 @@ public class PotPayController {
 
     private Map<String, Object> potpayCollect(String phoneNumber, BigDecimal amount,
                                               String network, String description) {
-
         var body = new java.util.HashMap<String, Object>(Map.of(
                 "phone_number", phoneNumber,
                 "amount",       amount,
@@ -433,9 +335,6 @@ public class PotPayController {
     private Map<String, Object> potpayInitiateNigeria(BigDecimal amount, String customerName,
                                                       String callbackUrl, String narration,
                                                       String merchantReference) {
-        // Built as a HashMap<String, Object> (not Map.of) because Map.of infers
-        // a common supertype across mixed value types (BigDecimal + String),
-        // which callPotPay's Map<String, Object> parameter can't accept.
         Map<String, Object> body = new java.util.HashMap<>();
         body.put("amount", amount);
         body.put("currency", "NGN");
@@ -449,21 +348,16 @@ public class PotPayController {
     }
 
     private Map<String, Object> potpayVerifyNigeria(String txRef) {
-        return callPotPay("GET",
-                "/api/merchant/ng/payments/verify/?tx_ref=" + txRef, null);
+        return callPotPay("GET", "/api/merchant/ng/payments/verify/?tx_ref=" + txRef, null);
     }
 
     /**
      * Shared HTTP helper for all PotPay calls.
-     *
-     * Resilience mirrors the Paystack controller's paystackInit helper:
-     *   - 10s timeout so no thread blocks indefinitely
-     *   - retries only transient network failures (never 4xx/5xx from PotPay,
-     *     which surface as an unwrapped RuntimeException with no cause)
+     * FIX: Separated 4xx and 5xx handling. 4xx errors are thrown as ApiException.badRequest
+     * so the real PotPay rejection message gets passed to the React frontend.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> callPotPay(String method, String path, Map<String, Object> body) {
-
         var client = webClientBuilder.build();
         WebClient.RequestHeadersSpec<?> spec;
 
@@ -479,50 +373,29 @@ public class PotPayController {
 
         var result = (Map<String, Object>) spec
                 .retrieve()
-                // ── FIX (surface PotPay 4xx to the client) ───────────────────────
-                // A 400/4xx from PotPay is a client-facing rejection (bad network
-                // code, unregistered MoMo number, amount rejected, etc.), NOT an
-                // internal server fault. Previously any error status was wrapped in
-                // a plain RuntimeException, which the global handler turned into an
-                // opaque 500 "An internal error occurred" — hiding PotPay's actual
-                // message. Catch 4xx separately and re-throw as ApiException.badRequest
-                // so the real PotPay rejection reaches the frontend as a 400.
                 .onStatus(HttpStatusCode::is4xxClientError,
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(respBody -> {
-                                    log.error("PotPay API error: method={} path='{}' status={} body={}",
+                                    log.error("PotPay API 4xx error: method={} path='{}' status={} body={}",
                                             method, path, clientResponse.statusCode(), respBody);
                                     return ApiException.badRequest(
                                             "Payment gateway rejected the request: " + respBody);
                                 })
                 )
-                // 5xx and any other error status remain a RuntimeException (→ 500),
-                // since those are genuinely PotPay-side / server faults.
                 .onStatus(HttpStatusCode::is5xxServerError,
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(respBody -> {
-                                    log.error("PotPay API error: method={} path='{}' status={} body={}",
+                                    log.error("PotPay API 5xx error: method={} path='{}' status={} body={}",
                                             method, path, clientResponse.statusCode(), respBody);
                                     return new RuntimeException(
                                             "PotPay returned " + clientResponse.statusCode() + ": " + respBody);
                                 })
                 )
-                // ─────────────────────────────────────────────────────────────────
                 .bodyToMono(Map.class)
                 .timeout(potpayTimeout)
                 .retryWhen(Retry.max(potpayRetryAttempts)
                         .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
                 .onErrorMap(
-                        // FIX: the previous predicate only caught raw non-RuntimeException
-                        // errors or ones with a null message. It missed reactor's own
-                        // RetryExhaustedException (a RuntimeException with a non-null
-                        // message like "Retries exhausted: 2/2"), which surfaced to the
-                        // client as a confusing internal string. Also catch that case.
-                        //
-                        // NOTE: ApiException (thrown by the 4xx handler above) must be
-                        // allowed to propagate unchanged so the client still receives the
-                        // real PotPay rejection as a 400 — never remap it to the generic
-                        // "unavailable" message.
                         ex -> !(ex instanceof ApiException)
                                 && (!(ex instanceof RuntimeException)
                                 || ex.getMessage() == null
@@ -551,7 +424,6 @@ public class PotPayController {
         return value.toString();
     }
 
-    /** Masks all but the last 3 digits of a phone number for logging. */
     private static String mask(String phone) {
         if (phone == null || phone.length() < 4) return "***";
         return "*".repeat(phone.length() - 3) + phone.substring(phone.length() - 3);
