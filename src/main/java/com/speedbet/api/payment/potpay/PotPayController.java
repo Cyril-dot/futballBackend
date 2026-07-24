@@ -21,6 +21,7 @@ import java.math.MathContext;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -30,16 +31,13 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class PotPayController {
 
-    // ─── Config ─────────────────────────────────────────────────────────────
-
     @Value("${app.potpay.merchant-id}")            private String     merchantId;
-    @Value("${app.potpay.base-url}")               private String     baseUrl; // https://backendpay.tipsterhub.online
+    @Value("${app.potpay.base-url}")               private String     baseUrl;
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minGhsDeposit;
     @Value("${app.platform.min-deposit-amount-ngn:1000}") private BigDecimal minNgnDeposit;
     @Value("${app.platform.frontend-url}")         private String     frontendUrl;
 
-    private static final BigDecimal NG_COMMISSION_RATE = new BigDecimal("0.15"); // 15%
-
+    private static final BigDecimal NG_COMMISSION_RATE = new BigDecimal("0.15");
     private final Duration potpayTimeout = Duration.ofSeconds(10);
     private final long potpayRetryAttempts = 2;
 
@@ -60,14 +58,12 @@ public class PotPayController {
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
-        // FIX: Force exactly 2 decimal places (e.g. 10.00). PotPay rejects raw integers.
         var amount = new BigDecimal(req.get("amount").toString()).setScale(2, RoundingMode.HALF_UP);
-
         if (amount.compareTo(minGhsDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minGhsDeposit);
 
         var phoneNumber = required(req, "phoneNumber");
-        var network     = (String) req.get("network"); // MTN, VDF, ATL
+        var network     = (String) req.get("network");
 
         log.info("initGhanaDeposit: userId='{}' amount={} phone='{}'",
                 user.getId(), amount, mask(phoneNumber));
@@ -76,13 +72,13 @@ public class PotPayController {
                 "Deposit for user " + user.getId());
 
         if (!Boolean.TRUE.equals(response.get("success"))) {
-            log.error("initGhanaDeposit: PotPay rejected collect request for userId='{}': {}",
-                    user.getId(), response);
+            log.error("initGhanaDeposit: PotPay rejected collect request for userId='{}': {}", user.getId(), response);
             throw ApiException.badRequest("PotPay declined the collection request.");
         }
 
-        var transactionId = (String) response.get("transaction_id");
-        var reference      = (String) response.get("reference");
+        // FIX: Use toString() to prevent ClassCastException if PotPay sends an integer ID.
+        var transactionId = response.get("transaction_id") != null ? response.get("transaction_id").toString() : null;
+        var reference      = response.get("reference") != null ? response.get("reference").toString() : null;
 
         if (transactionId == null || transactionId.isBlank()) {
             log.error("initGhanaDeposit: PotPay response missing 'transaction_id' for userId='{}'. Response: {}", user.getId(), response);
@@ -92,16 +88,17 @@ public class PotPayController {
         pendingTransactions.put(transactionId,
                 new PendingTx(user.getId(), amount, "GHS", "gh", Instant.now()));
 
-        log.info("initGhanaDeposit: pending txId='{}' reference='{}' userId='{}'",
-                transactionId, reference, user.getId());
+        log.info("initGhanaDeposit: pending txId='{}' reference='{}' userId='{}'", transactionId, reference, user.getId());
 
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "transactionId", transactionId,
-                "reference",     reference == null ? "" : reference,
-                "status",        "pending",
-                "grossAmount",   response.get("gross_amount"),
-                "netAmount",     response.get("net_amount")
-        )));
+        // FIX: Use HashMap instead of Map.of() because Map.of() throws NullPointerException on null values.
+        var resBody = new HashMap<String, Object>();
+        resBody.put("transactionId", transactionId);
+        resBody.put("reference", reference == null ? "" : reference);
+        resBody.put("status", "pending");
+        resBody.put("grossAmount", response.getOrDefault("gross_amount", ""));
+        resBody.put("netAmount", response.getOrDefault("net_amount", ""));
+
+        return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
     @GetMapping("/api/wallet/deposit/potpay/gh/verify/{transactionId}")
@@ -114,16 +111,17 @@ public class PotPayController {
             throw ApiException.badRequest("Transaction does not belong to this user.");
 
         var result = potpayVerifyGhana(transactionId);
-        var status = (String) result.get("status");
+        var status = result.get("status") != null ? result.get("status").toString() : "pending";
 
         if ("success".equals(status)) {
             settleGhanaDeposit(transactionId, result);
         }
 
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "transactionId", transactionId,
-                "status",        status
-        )));
+        var resBody = new HashMap<String, Object>();
+        resBody.put("transactionId", transactionId);
+        resBody.put("status", status);
+
+        return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
     @Scheduled(fixedDelay = 30_000)
@@ -133,7 +131,7 @@ public class PotPayController {
                 .forEach(e -> {
                     try {
                         var result = potpayVerifyGhana(e.getKey());
-                        var status = (String) result.get("status");
+                        var status = result.get("status") != null ? result.get("status").toString() : null;
                         if ("success".equals(status)) {
                             settleGhanaDeposit(e.getKey(), result);
                         } else if ("failed".equals(status) || "decline".equals(status)) {
@@ -154,14 +152,13 @@ public class PotPayController {
         }
 
         var netAmount = new BigDecimal(verifyResult.get("net_amount").toString());
-        var reference = (String) verifyResult.get("reference");
+        var reference = verifyResult.get("reference") != null ? verifyResult.get("reference").toString() : null;
 
         try {
             walletService.credit(pending.userId(), netAmount, TxKind.DEPOSIT, reference,
                     Map.of("provider", "potpay", "market", "gh",
-                            "transactionId", transactionId, "reference", reference));
-            log.info("settleGhanaDeposit: GHS {} credited to userId='{}' txId='{}'",
-                    netAmount, pending.userId(), transactionId);
+                            "transactionId", transactionId, "reference", reference == null ? "" : reference));
+            log.info("settleGhanaDeposit: GHS {} credited to userId='{}' txId='{}'", netAmount, pending.userId(), transactionId);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("settleGhanaDeposit: duplicate txId='{}' already processed — skipping", transactionId);
@@ -187,12 +184,10 @@ public class PotPayController {
         var customerName = required(req, "customerName");
         var merchantReference = "order-" + user.getId() + "-" + UUID.randomUUID();
 
-        log.info("initNigeriaDeposit: userId='{}' amount={} merchantReference='{}'",
-                user.getId(), amount, merchantReference);
+        log.info("initNigeriaDeposit: userId='{}' amount={} merchantReference='{}'", user.getId(), amount, merchantReference);
 
         var response = potpayInitiateNigeria(
-                amount,
-                customerName,
+                amount, customerName,
                 frontendUrl + "/app/wallet/potpay/ng/callback",
                 "Deposit for user " + user.getId(),
                 merchantReference
@@ -203,23 +198,22 @@ public class PotPayController {
             throw ApiException.badRequest("PotPay declined the payment request.");
         }
 
-        var txRef = (String) response.get("tx_ref");
+        var txRef = response.get("tx_ref") != null ? response.get("tx_ref").toString() : null;
         if (txRef == null || txRef.isBlank()) {
             log.error("initNigeriaDeposit: PotPay response missing 'tx_ref' for userId='{}'. Response: {}", user.getId(), response);
             throw ApiException.badRequest("PotPay accepted the request but did not return a transaction reference.");
         }
 
-        pendingTransactions.put(txRef,
-                new PendingTx(user.getId(), amount, "NGN", "ng", Instant.now()));
-
+        pendingTransactions.put(txRef, new PendingTx(user.getId(), amount, "NGN", "ng", Instant.now()));
         log.info("initNigeriaDeposit: pending txRef='{}' userId='{}'", txRef, user.getId());
 
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "txRef",       txRef,
-                "checkoutUrl", response.get("checkout_url"),
-                "amount",      response.get("amount"),
-                "currency",    response.get("currency")
-        )));
+        var resBody = new HashMap<String, Object>();
+        resBody.put("txRef", txRef);
+        resBody.put("checkoutUrl", response.get("checkout_url"));
+        resBody.put("amount", response.get("amount"));
+        resBody.put("currency", response.get("currency"));
+
+        return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
     @GetMapping("/app/wallet/potpay/ng/callback")
@@ -227,12 +221,12 @@ public class PotPayController {
             @RequestParam("tx_ref") String txRef,
             @RequestParam(value = "status", required = false) String unverifiedStatus) {
 
-        log.info("nigeriaCallback: txRef='{}' unverifiedStatus='{}' (re-verifying server-side)", txRef, unverifiedStatus);
+        log.info("nigeriaCallback: txRef='{}' unverifiedStatus='{}'", txRef, unverifiedStatus);
 
         String finalStatus;
         try {
             var result = potpayVerifyNigeria(txRef);
-            finalStatus = (String) result.get("status");
+            finalStatus = result.get("status") != null ? result.get("status").toString() : "unknown";
             if ("success".equals(finalStatus)) {
                 settleNigeriaDeposit(txRef, result);
             }
@@ -255,16 +249,17 @@ public class PotPayController {
             throw ApiException.badRequest("Transaction does not belong to this user.");
 
         var result = potpayVerifyNigeria(txRef);
-        var status = (String) result.get("status");
+        var status = result.get("status") != null ? result.get("status").toString() : "pending";
 
         if ("success".equals(status)) {
             settleNigeriaDeposit(txRef, result);
         }
 
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "txRef",  txRef,
-                "status", status
-        )));
+        var resBody = new HashMap<String, Object>();
+        resBody.put("txRef", txRef);
+        resBody.put("status", status);
+
+        return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
     @Scheduled(fixedDelay = 15_000)
@@ -274,7 +269,7 @@ public class PotPayController {
                 .forEach(e -> {
                     try {
                         var result = potpayVerifyNigeria(e.getKey());
-                        var status = (String) result.get("status");
+                        var status = result.get("status") != null ? result.get("status").toString() : null;
                         if ("success".equals(status)) {
                             settleNigeriaDeposit(e.getKey(), result);
                         } else if ("failed".equals(status)) {
@@ -301,8 +296,7 @@ public class PotPayController {
             walletService.credit(pending.userId(), netAmount, TxKind.DEPOSIT, txRef,
                     Map.of("provider", "potpay", "market", "ng",
                             "txRef", txRef, "paymentType", verifyResult.getOrDefault("payment_type", "unknown")));
-            log.info("settleNigeriaDeposit: NGN {} credited to userId='{}' txRef='{}'",
-                    netAmount, pending.userId(), txRef);
+            log.info("settleNigeriaDeposit: NGN {} credited to userId='{}' txRef='{}'", netAmount, pending.userId(), txRef);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("settleNigeriaDeposit: duplicate txRef='{}' already processed — skipping", txRef);
@@ -316,15 +310,13 @@ public class PotPayController {
     // PotPay API helpers
     // ════════════════════════════════════════════════════════════════════════
 
-    private Map<String, Object> potpayCollect(String phoneNumber, BigDecimal amount,
-                                              String network, String description) {
-        var body = new java.util.HashMap<String, Object>(Map.of(
+    private Map<String, Object> potpayCollect(String phoneNumber, BigDecimal amount, String network, String description) {
+        var body = new HashMap<String, Object>(Map.of(
                 "phone_number", phoneNumber,
                 "amount",       amount,
                 "description",  description
         ));
         if (network != null && !network.isBlank()) body.put("network", network);
-
         return callPotPay("POST", "/api/merchant/api/collect/", body);
     }
 
@@ -332,10 +324,8 @@ public class PotPayController {
         return callPotPay("GET", "/api/merchant/api/verify/" + transactionId + "/", null);
     }
 
-    private Map<String, Object> potpayInitiateNigeria(BigDecimal amount, String customerName,
-                                                      String callbackUrl, String narration,
-                                                      String merchantReference) {
-        Map<String, Object> body = new java.util.HashMap<>();
+    private Map<String, Object> potpayInitiateNigeria(BigDecimal amount, String customerName, String callbackUrl, String narration, String merchantReference) {
+        Map<String, Object> body = new HashMap<>();
         body.put("amount", amount);
         body.put("currency", "NGN");
         body.put("customer_name", customerName);
@@ -343,7 +333,6 @@ public class PotPayController {
         body.put("narration", narration);
         body.put("merchant_reference", merchantReference);
         body.put("payment_options", "card,banktransfer,ussd");
-
         return callPotPay("POST", "/api/merchant/ng/payments/initiate/", body);
     }
 
@@ -351,11 +340,6 @@ public class PotPayController {
         return callPotPay("GET", "/api/merchant/ng/payments/verify/?tx_ref=" + txRef, null);
     }
 
-    /**
-     * Shared HTTP helper for all PotPay calls.
-     * FIX: Separated 4xx and 5xx handling. 4xx errors are thrown as ApiException.badRequest
-     * so the real PotPay rejection message gets passed to the React frontend.
-     */
     @SuppressWarnings("unchecked")
     private Map<String, Object> callPotPay(String method, String path, Map<String, Object> body) {
         var client = webClientBuilder.build();
@@ -376,19 +360,15 @@ public class PotPayController {
                 .onStatus(HttpStatusCode::is4xxClientError,
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(respBody -> {
-                                    log.error("PotPay API 4xx error: method={} path='{}' status={} body={}",
-                                            method, path, clientResponse.statusCode(), respBody);
-                                    return ApiException.badRequest(
-                                            "Payment gateway rejected the request: " + respBody);
+                                    log.error("PotPay API 4xx error: method={} path='{}' status={} body={}", method, path, clientResponse.statusCode(), respBody);
+                                    return ApiException.badRequest("Payment gateway rejected the request: " + respBody);
                                 })
                 )
                 .onStatus(HttpStatusCode::is5xxServerError,
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(respBody -> {
-                                    log.error("PotPay API 5xx error: method={} path='{}' status={} body={}",
-                                            method, path, clientResponse.statusCode(), respBody);
-                                    return new RuntimeException(
-                                            "PotPay returned " + clientResponse.statusCode() + ": " + respBody);
+                                    log.error("PotPay API 5xx error: method={} path='{}' status={} body={}", method, path, clientResponse.statusCode(), respBody);
+                                    return new RuntimeException("PotPay returned " + clientResponse.statusCode() + ": " + respBody);
                                 })
                 )
                 .bodyToMono(Map.class)
@@ -401,8 +381,7 @@ public class PotPayController {
                                 || ex.getMessage() == null
                                 || ex.getClass().getSimpleName().contains("RetryExhausted")),
                         ex -> {
-                            log.error("PotPay API unreachable after {} retries: method={} path='{}'",
-                                    potpayRetryAttempts, method, path, ex);
+                            log.error("PotPay API unreachable after {} retries: method={} path='{}'", potpayRetryAttempts, method, path, ex);
                             return new RuntimeException("PotPay is currently unavailable. Please try again.");
                         }
                 )
@@ -411,11 +390,8 @@ public class PotPayController {
         if (result == null) {
             throw new RuntimeException("PotPay returned an empty response.");
         }
-
         return result;
     }
-
-    // ─── Small utils ────────────────────────────────────────────────────────
 
     private static String required(Map<String, Object> req, String field) {
         var value = req.get(field);
