@@ -57,7 +57,7 @@ public class PotPayController {
 
     @Value("${app.potpay.merchant-id}")            private String     merchantId;
     @Value("${app.potpay.base-url}")                private String     baseUrl; // https://backendpay.tipsterhub.online
-    @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minGhsDeposit;
+    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minGhsDeposit;
     @Value("${app.platform.min-deposit-amount-ngn:1000}") private BigDecimal minNgnDeposit;
     @Value("${app.platform.frontend-url}")          private String     frontendUrl;
 
@@ -119,8 +119,27 @@ public class PotPayController {
             throw new RuntimeException("PotPay declined the collection request.");
         }
 
+        // ── FIX ────────────────────────────────────────────────────────────
+        // PotPay's response shape isn't guaranteed to contain "transaction_id"
+        // on every call (or the field can come back null/blank depending on
+        // network/response variant). Previously this value was inserted
+        // directly as the key of `pendingTransactions`, which is a
+        // ConcurrentHashMap — ConcurrentHashMap.put(null, ...) throws an
+        // unchecked NullPointerException, which Spring turns into an opaque
+        // 500 with no useful detail on the client. Guard it, log the FULL
+        // raw response so the real field name can be confirmed, and fail
+        // with a clear, actionable error instead of an NPE.
         var transactionId = (String) response.get("transaction_id");
         var reference      = (String) response.get("reference");
+
+        if (transactionId == null || transactionId.isBlank()) {
+            log.error("initGhanaDeposit: PotPay response missing 'transaction_id' for userId='{}'. " +
+                    "Full response was: {}", user.getId(), response);
+            throw new RuntimeException(
+                    "PotPay accepted the request but did not return a transaction id. " +
+                            "Check server logs for the raw PotPay response to confirm the correct field name.");
+        }
+        // ─────────────────────────────────────────────────────────────────
 
         pendingTransactions.put(transactionId,
                 new PendingTx(user.getId(), amount, "GHS", "gh", Instant.now()));
@@ -130,7 +149,7 @@ public class PotPayController {
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "transactionId", transactionId,
-                "reference",     reference,
+                "reference",     reference == null ? "" : reference,
                 "status",        "pending",
                 "grossAmount",   response.get("gross_amount"),
                 "netAmount",     response.get("net_amount")
@@ -257,7 +276,16 @@ public class PotPayController {
             throw new RuntimeException("PotPay declined the payment request.");
         }
 
+        // Same class of bug as Ghana above — guard against a missing tx_ref
+        // instead of letting ConcurrentHashMap.put(null, ...) NPE.
         var txRef = (String) response.get("tx_ref");
+        if (txRef == null || txRef.isBlank()) {
+            log.error("initNigeriaDeposit: PotPay response missing 'tx_ref' for userId='{}'. " +
+                    "Full response was: {}", user.getId(), response);
+            throw new RuntimeException(
+                    "PotPay accepted the request but did not return a transaction reference. " +
+                            "Check server logs for the raw PotPay response to confirm the correct field name.");
+        }
 
         pendingTransactions.put(txRef,
                 new PendingTx(user.getId(), amount, "NGN", "ng", Instant.now()));
@@ -458,7 +486,14 @@ public class PotPayController {
                 .retryWhen(Retry.max(potpayRetryAttempts)
                         .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
                 .onErrorMap(
-                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        // FIX: the previous predicate only caught raw non-RuntimeException
+                        // errors or ones with a null message. It missed reactor's own
+                        // RetryExhaustedException (a RuntimeException with a non-null
+                        // message like "Retries exhausted: 2/2"), which surfaced to the
+                        // client as a confusing internal string. Also catch that case.
+                        ex -> !(ex instanceof RuntimeException)
+                                || ex.getMessage() == null
+                                || ex.getClass().getSimpleName().contains("RetryExhausted"),
                         ex -> {
                             log.error("PotPay API unreachable after {} retries: method={} path='{}'",
                                     potpayRetryAttempts, method, path, ex);
