@@ -73,7 +73,18 @@ public class ExpressPayController {
     @Value("${app.expresspay.api-key}")                           private String     apiKey;
     @Value("${app.expresspay.base-url:https://expresspaygh.com}") private String     baseUrl;
     @Value("${app.platform.min-deposit-amount:3}")              private BigDecimal minDeposit;
-    @Value("${app.platform.backend-url}")                         private String     backendUrl; // used to build the post-url callback
+
+    /**
+     * Public base URL of THIS backend, used to build the post-url callback that
+     * expressPay invokes when a pending mobile-money payment resolves.
+     *
+     * Defaults to the deployed Railway URL. Override per-environment via
+     * app.platform.backend-url (e.g. http://localhost:8080 for local dev — but
+     * note expressPay cannot reach localhost, so momo webhooks will not fire
+     * against a local instance).
+     */
+    @Value("${app.platform.backend-url:https://futballbackend-production-f14d.up.railway.app}")
+    private String backendUrl;
 
     /**
      * Transactions we've submitted to expressPay but not yet confirmed, keyed
@@ -108,19 +119,25 @@ public class ExpressPayController {
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
+        log.info("initDeposit: ▶ START userId='{}' rawAmount='{}'", user.getId(), req.get("amount"));
+
         var amount = new BigDecimal(req.get("amount").toString());
-        if (amount.compareTo(minDeposit) < 0)
+        if (amount.compareTo(minDeposit) < 0) {
+            log.warn("initDeposit: ✗ REJECTED amount={} below minDeposit={} userId='{}'",
+                    amount, minDeposit, user.getId());
             throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        }
 
         var orderId = UUID.randomUUID().toString();
         pendingTransactions.put(orderId, new PendingTx(user.getId(), amount, "deposit", new AtomicBoolean(false)));
 
-        log.info("initDeposit: userId='{}' amount={} orderId='{}'", user.getId(), amount, orderId);
+        log.info("initDeposit: pending record stored userId='{}' amount={} orderId='{}' pendingCount={}",
+                user.getId(), amount, orderId, pendingTransactions.size());
 
         var response = expressPaySubmit(amount, orderId);
 
-        log.info("initDeposit: expressPay responded status='{}' orderId='{}' userId='{}'",
-                response.get("status"), orderId, user.getId());
+        log.info("initDeposit: ✔ DONE expressPay status='{}' token-present={} orderId='{}' userId='{}'",
+                response.get("status"), response.get("token") != null, orderId, user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "token", response.get("token"),
@@ -134,19 +151,25 @@ public class ExpressPayController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> initAdminUpgrade(
             @AuthenticationPrincipal User user) {
 
-        if (user.getRole().name().equals("ADMIN"))
+        log.info("initAdminUpgrade: ▶ START userId='{}' email='{}' currentRole='{}'",
+                user.getId(), user.getEmail(), user.getRole().name());
+
+        if (user.getRole().name().equals("ADMIN")) {
+            log.warn("initAdminUpgrade: ✗ REJECTED userId='{}' is already ADMIN", user.getId());
             throw ApiException.badRequest("You are already an Admin.");
+        }
 
         var orderId = UUID.randomUUID().toString();
         var amount  = BigDecimal.valueOf(ADMIN_UPGRADE_FEE_GHS);
         pendingTransactions.put(orderId, new PendingTx(user.getId(), amount, UPGRADE_INTENT_ADMIN, new AtomicBoolean(false)));
 
-        log.info("initAdminUpgrade: userId='{}' email='{}' orderId='{}'", user.getId(), user.getEmail(), orderId);
+        log.info("initAdminUpgrade: pending record stored userId='{}' amount={} orderId='{}' intent='{}'",
+                user.getId(), amount, orderId, UPGRADE_INTENT_ADMIN);
 
         var response = expressPaySubmit(amount, orderId);
 
-        log.info("initAdminUpgrade: expressPay responded status='{}' orderId='{}' userId='{}'",
-                response.get("status"), orderId, user.getId());
+        log.info("initAdminUpgrade: ✔ DONE expressPay status='{}' token-present={} orderId='{}' userId='{}'",
+                response.get("status"), response.get("token") != null, orderId, user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "token", response.get("token"),
@@ -161,6 +184,8 @@ public class ExpressPayController {
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
+        log.info("chargeCard: ▶ START userId='{}'", user.getId());
+
         var token = require(req, "token");
         var card = new CardDetails(
                 require(req, "cardNumber"),
@@ -174,7 +199,8 @@ public class ExpressPayController {
                 (String) req.get("cardCountry")
         );
 
-        log.info("chargeCard: userId='{}' token='{}' country='{}'", user.getId(), mask(token), card.cardCountry());
+        log.info("chargeCard: userId='{}' token='{}' cardLast4='{}' country='{}'",
+                user.getId(), mask(token), last4(card.cardNumber()), card.cardCountry());
 
         var result = expressPayCheckoutCard(token, card);
         return handleCheckoutResult(user, result);
@@ -187,12 +213,15 @@ public class ExpressPayController {
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
+        log.info("chargeMomo: ▶ START userId='{}'", user.getId());
+
         var token           = require(req, "token");
         var mobileNumber    = require(req, "mobileNumber");
         var mobileNetwork   = require(req, "mobileNetwork"); // MTN_MM | AIRTEL_MM | TIGO_CASH | VODAFONE_CASH
         var mobileAuthToken = (String) req.get("mobileAuthToken");
 
-        log.info("chargeMomo: userId='{}' token='{}' network='{}'", user.getId(), mask(token), mobileNetwork);
+        log.info("chargeMomo: userId='{}' token='{}' network='{}' number='{}' authTokenPresent={}",
+                user.getId(), mask(token), mobileNetwork, maskPhone(mobileNumber), mobileAuthToken != null);
 
         var result = expressPayCheckoutMomo(token, mobileNumber, mobileNetwork, mobileAuthToken);
         return handleCheckoutResult(user, result);
@@ -204,14 +233,18 @@ public class ExpressPayController {
         var resultCode = String.valueOf(result.get("result"));
         var orderId    = String.valueOf(result.get("order-id"));
 
+        log.info("handleCheckoutResult: userId='{}' orderId='{}' resultCode='{}' text='{}'",
+                user.getId(), orderId, resultCode, result.get("result-text"));
+
         if (RESULT_APPROVED.equals(resultCode)) {
-            log.info("handleCheckoutResult: APPROVED orderId='{}' userId='{}'", orderId, user.getId());
+            log.info("handleCheckoutResult: ✔ APPROVED orderId='{}' userId='{}' — finalizing immediately",
+                    orderId, user.getId());
             finalizeTransaction(orderId, String.valueOf(result.get("transaction-id")));
         } else if (RESULT_PENDING.equals(resultCode)) {
-            log.info("handleCheckoutResult: PENDING orderId='{}' userId='{}' — awaiting webhook callback",
+            log.info("handleCheckoutResult: ⏳ PENDING orderId='{}' userId='{}' — awaiting webhook callback",
                     orderId, user.getId());
         } else {
-            log.warn("handleCheckoutResult: NOT APPROVED orderId='{}' userId='{}' result='{}' text='{}'",
+            log.warn("handleCheckoutResult: ✗ NOT APPROVED orderId='{}' userId='{}' result='{}' text='{}'",
                     orderId, user.getId(), resultCode, result.get("result-text"));
         }
 
@@ -233,38 +266,43 @@ public class ExpressPayController {
         var orderId = body.get("order-id") != null ? body.get("order-id").toString() : null;
         var token   = body.get("token") != null ? body.get("token").toString() : null;
 
-        log.info("expressPay webhook: received callback orderId='{}' token='{}'", orderId, mask(token));
+        log.info("webhook: ▶ RECEIVED callback orderId='{}' token='{}' payloadKeys={}",
+                orderId, mask(token), body.keySet());
 
         if (orderId == null || orderId.isBlank() || token == null || token.isBlank()) {
-            log.warn("expressPay webhook: missing order-id or token in payload");
+            log.warn("webhook: ✗ missing order-id or token in payload — rejecting");
             return ResponseEntity.status(400).body("Missing order-id or token");
         }
 
         var pending = pendingTransactions.get(orderId);
         if (pending == null) {
-            log.warn("expressPay webhook: unknown orderId='{}' — ignoring", orderId);
+            log.warn("webhook: ✗ unknown orderId='{}' (not in pending map, size={}) — ignoring",
+                    orderId, pendingTransactions.size());
             return ResponseEntity.ok("Ignored — unknown order");
         }
 
         try {
+            log.info("webhook: re-confirming orderId='{}' via server-to-server query", orderId);
             var queryResult = expressPayQuery(token);
             var resultCode   = String.valueOf(queryResult.get("result"));
 
-            log.info("expressPay webhook: query confirmed orderId='{}' result='{}' text='{}'",
+            log.info("webhook: query confirmed orderId='{}' result='{}' text='{}'",
                     orderId, resultCode, queryResult.get("result-text"));
 
             if (RESULT_APPROVED.equals(resultCode)) {
+                log.info("webhook: ✔ APPROVED orderId='{}' — finalizing", orderId);
                 finalizeTransaction(orderId, String.valueOf(queryResult.get("transaction-id")));
             } else {
-                log.warn("expressPay webhook: orderId='{}' not approved (result='{}') — no wallet action taken",
+                log.warn("webhook: ✗ orderId='{}' not approved (result='{}') — no wallet action taken",
                         orderId, resultCode);
             }
         } catch (Exception e) {
-            log.error("expressPay webhook: unexpected error confirming orderId='{}' — expressPay will retry callback",
+            log.error("webhook: ✗ unexpected error confirming orderId='{}' — expressPay will retry callback",
                     orderId, e);
             return ResponseEntity.status(500).body("Processing error");
         }
 
+        log.info("webhook: ✔ DONE orderId='{}'", orderId);
         return ResponseEntity.ok("OK");
     }
 
@@ -272,26 +310,31 @@ public class ExpressPayController {
 
     private void finalizeTransaction(String orderId, String transactionId) {
 
+        log.info("finalizeTransaction: ▶ orderId='{}' txId='{}'", orderId, transactionId);
+
         var pending = pendingTransactions.get(orderId);
         if (pending == null) {
-            log.warn("finalizeTransaction: orderId='{}' has no pending record — skipping", orderId);
+            log.warn("finalizeTransaction: ✗ orderId='{}' has no pending record — skipping", orderId);
             return;
         }
 
         if (!pending.processed().compareAndSet(false, true)) {
-            log.info("finalizeTransaction: orderId='{}' already processed — skipping duplicate", orderId);
+            log.info("finalizeTransaction: ⏩ orderId='{}' already processed — skipping duplicate (idempotency guard)",
+                    orderId);
             return;
         }
 
         if (UPGRADE_INTENT_ADMIN.equals(pending.intent())) {
+            log.info("finalizeTransaction: routing orderId='{}' to ADMIN UPGRADE handler", orderId);
             handleAdminUpgrade(pending.userId(), orderId, pending.amount());
         } else {
+            log.info("finalizeTransaction: routing orderId='{}' to DEPOSIT handler", orderId);
             handleDeposit(pending.userId(), orderId, pending.amount());
         }
 
         pendingTransactions.remove(orderId);
-        log.info("finalizeTransaction: orderId='{}' finalized and removed from pending map txId='{}'",
-                orderId, transactionId);
+        log.info("finalizeTransaction: ✔ orderId='{}' finalized and removed from pending map txId='{}' pendingCount={}",
+                orderId, transactionId, pendingTransactions.size());
     }
 
     // ─── Private wallet/user handlers ─────────────────────────────────────────
@@ -311,16 +354,18 @@ public class ExpressPayController {
      *                  → referralService.attributeCommission (admin affiliate wallet)
      */
     private void handleDeposit(UUID userId, String ref, BigDecimal amount) {
-        log.info("handleDeposit: userId='{}' amount={} ref='{}'", userId, amount, ref);
+        log.info("handleDeposit: ▶ userId='{}' amount={} ref='{}'", userId, amount, ref);
         try {
             walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
                     Map.of("provider", "expresspay", "reference", ref));
-            log.info("handleDeposit: GHS {} credited to userId='{}' ref='{}'", amount, userId, ref);
+            log.info("handleDeposit: ✔ GHS {} credited to userId='{}' ref='{}'", amount, userId, ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
-                log.warn("handleDeposit: duplicate ref='{}' already processed — skipping", ref);
+                log.warn("handleDeposit: ⏩ duplicate ref='{}' already processed — skipping", ref);
                 return;
             }
+            log.error("handleDeposit: ✗ credit failed userId='{}' ref='{}' status={}",
+                    userId, ref, ex.getStatus().value());
             throw ex;
         }
 
@@ -329,11 +374,11 @@ public class ExpressPayController {
         // ReferralService. No rate logic lives here — just trigger attribution.
         try {
             referralService.attributeCommission(userId, amount);
-            log.info("handleDeposit: commission attributed for userId='{}' deposit='{}' adminRate={}",
+            log.info("handleDeposit: ✔ commission attributed for userId='{}' deposit='{}' adminRate={}",
                     userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {
             // Never block a deposit because of a commission failure.
-            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate", userId, ex);
+            log.error("handleDeposit: ✗ commission attribution failed for userId='{}' — investigate", userId, ex);
         }
     }
 
@@ -347,10 +392,10 @@ public class ExpressPayController {
      *   4. Creates onboarding chat with Super Admin for commission confirmation
      */
     private void handleAdminUpgrade(UUID userId, String ref, BigDecimal amount) {
-        log.info("handleAdminUpgrade: userId='{}' amount={} ref='{}'", userId, amount, ref);
+        log.info("handleAdminUpgrade: ▶ userId='{}' amount={} ref='{}'", userId, amount, ref);
 
         if (amount.compareTo(BigDecimal.valueOf(ADMIN_UPGRADE_FEE_GHS)) < 0) {
-            log.error("handleAdminUpgrade: amount {} < GHS {} for userId='{}' ref='{}'",
+            log.error("handleAdminUpgrade: ✗ amount {} < GHS {} for userId='{}' ref='{}'",
                     amount, ADMIN_UPGRADE_FEE_GHS, userId, ref);
             throw ApiException.badRequest(
                     "Upgrade payment GHS " + amount + " is less than required GHS " + ADMIN_UPGRADE_FEE_GHS + ".");
@@ -358,24 +403,26 @@ public class ExpressPayController {
 
         try {
             userService.upgradeToAdmin(userId, ref);
-            log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN with {}% commission ref='{}'",
+            log.info("handleAdminUpgrade: ✔ userId='{}' promoted to ADMIN with {}% commission ref='{}'",
                     userId, ADMIN_COMMISSION_RATE.multiply(BigDecimal.valueOf(100)).toPlainString(), ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
-                log.warn("handleAdminUpgrade: duplicate ref='{}' — skipping", ref);
+                log.warn("handleAdminUpgrade: ⏩ duplicate ref='{}' — skipping", ref);
                 return;
             }
+            log.error("handleAdminUpgrade: ✗ upgrade failed userId='{}' ref='{}' status={}",
+                    userId, ref, ex.getStatus().value());
             throw ex;
         }
 
         // Audit record — expressPay collected GHS 200 externally, no wallet debit needed.
         walletService.recordExternalDebit(userId, amount, TxKind.ADMIN_UPGRADE_FEE, ref,
                 Map.of("provider", "expresspay", "reference", ref));
-        log.info("handleAdminUpgrade: audit tx recorded for userId='{}' ref='{}'", userId, ref);
+        log.info("handleAdminUpgrade: ✔ audit tx recorded for userId='{}' ref='{}'", userId, ref);
 
         // Create onboarding chat so Super Admin can confirm/adjust the 70% commission rate.
         adminUpgradeChatService.createUpgradeChat(userId);
-        log.info("handleAdminUpgrade: upgrade chat created for userId='{}'", userId);
+        log.info("handleAdminUpgrade: ✔ upgrade chat created for userId='{}'", userId);
     }
 
     // ─── expressPay API calls ───────────────────────────────────────────────
@@ -383,24 +430,30 @@ public class ExpressPayController {
     /** Step 1: Submit — initiates a transaction and returns a token for checkout. */
     private Map<String, Object> expressPaySubmit(BigDecimal amount, String orderId) {
 
+        var postUrl = backendUrl + "/api/webhooks/expresspay";
+
         var form = new LinkedMultiValueMap<String, String>();
         form.add("merchant-id", merchantId);
         form.add("api-key", apiKey);
         form.add("currency", "GHS");
         form.add("amount", amount.setScale(2, RoundingMode.HALF_UP).toPlainString());
         form.add("order-id", orderId);
-        form.add("post-url", backendUrl + "/api/webhooks/expresspay");
+        form.add("post-url", postUrl);
 
-        log.info("expressPay submit: orderId='{}' amount={}", orderId, amount);
+        log.info("expressPaySubmit: ▶ orderId='{}' amount={} postUrl='{}' merchantId='{}' apiKey='{}'",
+                orderId, amount, postUrl, merchantId, mask(apiKey));
 
+        long startNanos = System.nanoTime();
         var result = expressPayPost("/api/direct/submit.php", form);
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+
         var status = asInt(result.get("status"));
 
-        log.info("expressPay submit: orderId='{}' status={} token-present={}",
-                orderId, status, result.get("token") != null);
+        log.info("expressPaySubmit: ◀ orderId='{}' status={} token-present={} elapsedMs={}",
+                orderId, status, result.get("token") != null, elapsedMs);
 
         if (!Integer.valueOf(1).equals(status)) {
-            log.error("expressPay submit: orderId='{}' failed status={} body={}", orderId, status, result);
+            log.error("expressPaySubmit: ✗ orderId='{}' failed status={} body={}", orderId, status, result);
             throw new RuntimeException("expressPay submit failed for orderId=" + orderId + " (status=" + status + ")");
         }
 
@@ -426,12 +479,15 @@ public class ExpressPayController {
         addIfPresent(form, "card-zipcode", card.cardZipcode());
         addIfPresent(form, "card-country", card.cardCountry());
 
-        log.info("expressPay checkout (card): token='{}' country='{}'", mask(token), card.cardCountry());
+        log.info("expressPayCheckoutCard: ▶ token='{}' cardLast4='{}' country='{}'",
+                mask(token), last4(card.cardNumber()), card.cardCountry());
 
+        long startNanos = System.nanoTime();
         var result = expressPayPost("/api/direct/checkout.php", form);
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
 
-        log.info("expressPay checkout (card): token='{}' result={} text='{}'",
-                mask(token), result.get("result"), result.get("result-text"));
+        log.info("expressPayCheckoutCard: ◀ token='{}' result={} text='{}' elapsedMs={}",
+                mask(token), result.get("result"), result.get("result-text"), elapsedMs);
 
         return result;
     }
@@ -450,13 +506,15 @@ public class ExpressPayController {
         form.add("mobile-network", mobileNetwork);
         addIfPresent(form, "mobile-auth-token", mobileAuthToken);
 
-        log.info("expressPay checkout (momo): token='{}' network='{}' number='{}'",
-                mask(token), mobileNetwork, maskPhone(mobileNumber));
+        log.info("expressPayCheckoutMomo: ▶ token='{}' network='{}' number='{}' authTokenPresent={}",
+                mask(token), mobileNetwork, maskPhone(mobileNumber), mobileAuthToken != null);
 
+        long startNanos = System.nanoTime();
         var result = expressPayPost("/api/direct/checkout.php", form);
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
 
-        log.info("expressPay checkout (momo): token='{}' result={} text='{}'",
-                mask(token), result.get("result"), result.get("result-text"));
+        log.info("expressPayCheckoutMomo: ◀ token='{}' result={} text='{}' elapsedMs={}",
+                mask(token), result.get("result"), result.get("result-text"), elapsedMs);
 
         return result;
     }
@@ -473,12 +531,15 @@ public class ExpressPayController {
         form.add("api-key", apiKey);
         form.add("token", token);
 
-        log.info("expressPay query: token='{}'", mask(token));
+        log.info("expressPayQuery: ▶ token='{}' merchantId='{}'", mask(token), merchantId);
 
+        long startNanos = System.nanoTime();
         var result = expressPayPost("/api/query.php", form);
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
 
-        log.info("expressPay query: token='{}' result={} text='{}' transaction-id='{}'",
-                mask(token), result.get("result"), result.get("result-text"), result.get("transaction-id"));
+        log.info("expressPayQuery: ◀ token='{}' result={} text='{}' transaction-id='{}' elapsedMs={}",
+                mask(token), result.get("result"), result.get("result-text"),
+                result.get("transaction-id"), elapsedMs);
 
         return result;
     }
@@ -504,6 +565,8 @@ public class ExpressPayController {
     @SuppressWarnings("unchecked")
     private Map<String, Object> expressPayPost(String path, MultiValueMap<String, String> form) {
 
+        log.debug("expressPayPost: ▶ POST {}{} formKeys={}", baseUrl, path, form.keySet());
+
         Map<String, Object> result;
         try {
             result = webClientBuilder.build()
@@ -514,8 +577,8 @@ public class ExpressPayController {
                     .exchangeToMono(clientResponse -> {
                         if (clientResponse.statusCode().isError()) {
                             return clientResponse.bodyToMono(String.class).map(body -> {
-                                log.error("expressPay API error: path='{}' status={} body={}",
-                                        path, clientResponse.statusCode(), body);
+                                log.error("expressPayPost: ✗ HTTP error path='{}' status={} body={}",
+                                        path, clientResponse.statusCode(), truncate(body, 500));
                                 throw new RuntimeException(
                                         "expressPay returned " + clientResponse.statusCode() + ": " + body);
                             });
@@ -523,10 +586,14 @@ public class ExpressPayController {
                         // Read as raw text first — ignore the declared Content-Type, since
                         // expressPay sometimes mislabels JSON as text/html.
                         return clientResponse.bodyToMono(String.class).map(raw -> {
+                            log.debug("expressPayPost: ◀ raw response path='{}' contentType='{}' body='{}'",
+                                    path,
+                                    clientResponse.headers().contentType().map(Object::toString).orElse("none"),
+                                    truncate(raw, 500));
                             try {
                                 return (Map<String, Object>) OBJECT_MAPPER.readValue(raw, Map.class);
                             } catch (Exception parseEx) {
-                                log.error("expressPay returned non-JSON body: path='{}' raw='{}'",
+                                log.error("expressPayPost: ✗ non-JSON body path='{}' raw='{}'",
                                         path, truncate(raw, 300));
                                 throw new RuntimeException(
                                         "expressPay returned an unexpected response (not JSON): "
@@ -540,25 +607,30 @@ public class ExpressPayController {
                     // RuntimeException thrown directly above has no wrapped cause, so
                     // genuine 4xx/5xx responses and non-JSON bodies are excluded from retry.
                     .retryWhen(Retry.max(expressPayRetryAttempts)
-                            .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
+                            .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null)
+                            .doBeforeRetry(sig -> log.warn(
+                                    "expressPayPost: ⟳ retry #{} path='{}' cause='{}'",
+                                    sig.totalRetries() + 1, path,
+                                    sig.failure() != null ? sig.failure().getMessage() : "unknown")))
                     .onErrorMap(
                             ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
                             ex -> {
-                                log.error("expressPay API unreachable after {} retries: path='{}'",
+                                log.error("expressPayPost: ✗ unreachable after {} retries path='{}'",
                                         expressPayRetryAttempts, path, ex);
                                 return new RuntimeException("expressPay is currently unavailable. Please try again.");
                             })
                     .block();
         } catch (RuntimeException ex) {
-            log.error("expressPay API call failed: path='{}'", path, ex);
+            log.error("expressPayPost: ✗ call failed path='{}' message='{}'", path, ex.getMessage());
             throw ex;
         }
 
         if (result == null) {
-            log.error("expressPay API call: path='{}' returned empty response", path);
+            log.error("expressPayPost: ✗ path='{}' returned empty response", path);
             throw new RuntimeException("expressPay returned an empty response.");
         }
 
+        log.debug("expressPayPost: ✔ path='{}' parsed keys={}", path, result.keySet());
         return result;
     }
 
@@ -596,6 +668,11 @@ public class ExpressPayController {
     private String maskPhone(String phone) {
         if (phone == null || phone.length() < 4) return "****";
         return "*".repeat(Math.max(0, phone.length() - 4)) + phone.substring(phone.length() - 4);
+    }
+
+    private String last4(String cardNumber) {
+        if (cardNumber == null || cardNumber.length() < 4) return "****";
+        return "****" + cardNumber.substring(cardNumber.length() - 4);
     }
 
     private String truncate(String s, int maxLen) {
