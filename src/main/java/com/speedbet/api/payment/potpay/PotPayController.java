@@ -28,24 +28,37 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * PotPay deposits (Ghana mobile money + Nigeria redirect checkout).
+ * PotPay deposits — Ghana (MoMo via NaloPay) + Nigeria (redirect checkout via Flutterwave).
  *
- * Crediting model — mirrors PaystackController.handleDeposit():
- *   1. Resolve the owning userId (pending map first, then the provider payload).
- *   2. walletService.credit(...) with a NON-NULL idempotency reference.
- *      A 409 from WalletService means "already credited" and is swallowed.
- *   3. referralService.attributeCommission(...) — never allowed to fail the deposit.
- *   4. ONLY THEN drop the pending record.
+ * Aligned with the PotPay merchant API docs:
  *
- * Step 4 ordering is deliberate. The previous version removed the pending record
- * first, so any failure inside credit() permanently orphaned the deposit.
+ *   GH collect:  POST {base}/api/merchant/api/collect/
+ *                → { success, transaction_id, reference, status:"pending", gross_amount, net_amount, commission }
+ *   GH verify:   GET  {base}/api/merchant/api/verify/{transaction_id}/
+ *                → { transaction_id, gross_amount, net_amount, reference, status, description, ... }  (FLAT, no "success" field)
+ *   NG initiate: POST {base}/api/merchant/ng/payments/initiate/
+ *                → { success, tx_ref, transaction_id, checkout_url, amount, currency }
+ *   NG verify:   GET  {base}/api/merchant/ng/payments/verify/?tx_ref=...
+ *                → { tx_ref, transaction_id, status, amount, currency, merchant_reference, payment_type }  (FLAT)
  *
- * NOTE ON DURABILITY: pendingTransactions is still an in-memory map, which means
- * it does not survive a restart and is not shared across instances. This class now
- * recovers the userId from the provider payload (merchant_reference / description)
- * so a lost map no longer means a lost deposit, but the correct long-term fix is a
- * `potpay_pending_tx` table written inside initGhanaDeposit/initNigeriaDeposit and
- * read by the pollers. See the note at the bottom of this file.
+ *   Verify statuses:  pending | success | failed | decline (GH only)
+ *   NG CALLBACK redirect uses a DIFFERENT vocabulary: successful | failed | pending.
+ *   The callback status is never trusted anyway — we always re-verify server-side.
+ *
+ * Crediting model (mirrors PaystackController.handleDeposit):
+ *   1. Resolve owning userId — pending map first, then description/merchant_reference
+ *      echoed back by PotPay (both confirmed present in verify responses).
+ *   2. walletService.credit with a non-null idempotency ref (transaction_id / tx_ref).
+ *      409 = already credited, swallowed.
+ *   3. referralService.attributeCommission — never allowed to fail the deposit.
+ *   4. Remove the pending record ONLY after a confirmed credit.
+ *
+ * Amount policy:
+ *   PotPay's commission (GH 3%, NG 15%) is deducted from the MERCHANT payout, not
+ *   added to what the customer pays. With credit-gross=true (default) the bettor is
+ *   credited exactly what they paid and the platform absorbs the fee — identical to
+ *   the Paystack flow. Set app.potpay.credit-gross=false to pass the fee on instead
+ *   (bettor gets net_amount / amount×0.85).
  */
 @Slf4j
 @RestController
@@ -53,27 +66,39 @@ import java.util.concurrent.ConcurrentHashMap;
 public class PotPayController {
 
     @Value("${app.potpay.merchant-id}")                   private String     merchantId;
-    @Value("${app.potpay.base-url}")                      private String     baseUrl;
-    @Value("${app.platform.min-deposit-amount:1}")        private BigDecimal minGhsDeposit;
-    @Value("${app.platform.min-deposit-amount-ngn:1000}") private BigDecimal minNgnDeposit;
+    @Value("${app.potpay.base-url}")                      private String     rawBaseUrl;
+
+    // Separate keys: app.platform.min-deposit-amount is shared with PaystackController
+    // (default 300 there), which silently overrode the intended GHS 1 minimum.
+    @Value("${app.potpay.min-deposit-ghs:1}")             private BigDecimal minGhsDeposit;
+    @Value("${app.potpay.min-deposit-ngn:1000}")          private BigDecimal minNgnDeposit;
+
     @Value("${app.platform.frontend-url}")                private String     frontendUrl;
 
     /**
-     * false (default, preserves old behaviour):
-     *   GH credits PotPay's net_amount, NG credits amount * (1 - NG commission).
-     * true:
-     *   the user is credited the full amount they paid, exactly like Paystack.
+     * MUST be the public URL of THIS Spring app (e.g. the Railway URL), NOT the
+     * frontend. PotPay redirects the customer's browser here after checkout; the
+     * nigeriaCallback handler below verifies server-side and then 302s the customer
+     * on to the frontend wallet page.
      *
-     * Set app.potpay.credit-gross=true if users are complaining that less money
-     * arrives than they deposited.
+     * Ensure "/app/wallet/potpay/ng/callback" is permitAll() in SecurityConfig —
+     * the redirect carries no bearer token.
      */
-    @Value("${app.potpay.credit-gross:false}")            private boolean    creditGrossAmount;
+    @Value("${app.potpay.backend-public-url}")            private String     backendPublicUrl;
+
+    /**
+     * true  (default): credit the bettor the full amount they paid; platform absorbs
+     *                  PotPay's commission (matches Paystack behaviour).
+     * false: credit net of PotPay's commission (GH net_amount, NG amount × (1-rate)).
+     */
+    @Value("${app.potpay.credit-gross:true}")             private boolean    creditGrossAmount;
 
     @Value("${app.potpay.ng-commission-rate:0.15}")       private BigDecimal ngCommissionRate;
 
-    /** Give up polling a transaction after this long and log it for manual reconciliation. */
     private static final Duration PENDING_TTL = Duration.ofHours(2);
 
+    // Echoed back verbatim by PotPay in verify responses — used to recover the owner
+    // when the in-memory pending map has been lost (restart / other instance).
     private static final String GH_DESCRIPTION_PREFIX = "Deposit for user ";
     private static final String NG_REFERENCE_PREFIX   = "order-";
 
@@ -85,20 +110,29 @@ public class PotPayController {
     private final WebClient.Builder webClientBuilder;
 
     private final Map<String, PendingTx> pendingTransactions = new ConcurrentHashMap<>();
-
-    /** Guards against the scheduled poller and a user-triggered verify settling the same tx at once. */
-    private final Set<String> settlementsInFlight = ConcurrentHashMap.newKeySet();
+    private final Set<String>            settlementsInFlight = ConcurrentHashMap.newKeySet();
 
     private record PendingTx(UUID userId, BigDecimal grossAmount, String currency,
                              String key, Instant createdAt) {}
 
-    /** Thrown when PotPay is unreachable / returned 5xx. Distinct from ApiException (client's fault). */
     private static class PotPayUnavailableException extends RuntimeException {
         PotPayUnavailableException(String message) { super(message); }
     }
 
+    /**
+     * The dashboard shows different "base URLs" per market (the GH page includes
+     * "/api/merchant/" in it). Paths in this class already start with /api/merchant/...
+     * so strip any trailing copy from the configured value — either config value works.
+     */
+    private String baseUrl() {
+        var b = rawBaseUrl == null ? "" : rawBaseUrl.trim();
+        while (b.endsWith("/")) b = b.substring(0, b.length() - 1);
+        if (b.endsWith("/api/merchant")) b = b.substring(0, b.length() - "/api/merchant".length());
+        return b;
+    }
+
     // ════════════════════════════════════════════════════════════════════════
-    // GHANA (GHS · Mobile Money)
+    // GHANA (GHS · MoMo USSD collect)
     // ════════════════════════════════════════════════════════════════════════
 
     @PostMapping("/api/wallet/deposit/potpay/gh/init")
@@ -111,27 +145,25 @@ public class PotPayController {
             throw ApiException.badRequest("Minimum deposit is GHS " + minGhsDeposit);
 
         var phoneNumber = required(req, "phoneNumber");
-        var network     = (String) req.get("network");
+        var network     = (String) req.get("network");   // MTN | VDF | ATL, optional (auto-detected)
 
-        log.info("initGhanaDeposit: userId='{}' amount={} phone='{}'",
-                user.getId(), amount, mask(phoneNumber));
+        log.info("initGhanaDeposit: userId='{}' amount={} phone='{}' network='{}'",
+                user.getId(), amount, mask(phoneNumber), network);
 
-        // description carries the userId so settlement can recover the owner even if
-        // the in-memory pending map was lost (restart / different instance).
         var response = potpayCollect(phoneNumber, amount, network,
                 GH_DESCRIPTION_PREFIX + user.getId());
 
+        // Collect DOES have a "success" flag (verify does not).
         if (!Boolean.TRUE.equals(response.get("success"))) {
-            log.error("initGhanaDeposit: PotPay rejected collect request for userId='{}': {}", user.getId(), response);
+            log.error("initGhanaDeposit: PotPay rejected collect for userId='{}': {}", user.getId(), response);
             throw ApiException.badRequest("PotPay declined the collection request.");
         }
 
-        var flat          = flatten(response);
-        var transactionId = string(flat, "transaction_id");
-        var reference     = string(flat, "reference");
+        var transactionId = string(response, "transaction_id");
+        var reference     = string(response, "reference");
 
         if (transactionId == null || transactionId.isBlank()) {
-            log.error("initGhanaDeposit: PotPay response missing 'transaction_id' for userId='{}'. Response: {}",
+            log.error("initGhanaDeposit: missing 'transaction_id' for userId='{}'. Response: {}",
                     user.getId(), response);
             throw ApiException.badRequest("PotPay accepted the request but did not return a transaction id.");
         }
@@ -146,8 +178,8 @@ public class PotPayController {
         resBody.put("transactionId", transactionId);
         resBody.put("reference",     reference == null ? "" : reference);
         resBody.put("status",        "pending");
-        resBody.put("grossAmount",   flat.getOrDefault("gross_amount", ""));
-        resBody.put("netAmount",     flat.getOrDefault("net_amount", ""));
+        resBody.put("grossAmount",   response.getOrDefault("gross_amount", ""));
+        resBody.put("netAmount",     response.getOrDefault("net_amount", ""));
 
         return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
@@ -161,12 +193,11 @@ public class PotPayController {
         if (pending != null && !pending.userId().equals(user.getId()))
             throw ApiException.badRequest("Transaction does not belong to this user.");
 
-        var result = flatten(potpayVerifyGhana(transactionId));
+        var result = potpayVerifyGhana(transactionId);
         var status = statusOf(result);
+        log.info("verifyGhanaDeposit: txId='{}' status='{}' rawPayload={}", transactionId, status, result);
 
-        if ("success".equals(status)) {
-            // Owner is re-derived inside settle; if the map was empty we fall back to the
-            // payload, and we still refuse to credit anyone other than the true owner.
+        if (isSuccess(status)) {
             settleGhanaDeposit(transactionId, result, user.getId());
         } else if (isTerminalFailure(status)) {
             pendingTransactions.remove(transactionId);
@@ -175,7 +206,6 @@ public class PotPayController {
         var resBody = new HashMap<String, Object>();
         resBody.put("transactionId", transactionId);
         resBody.put("status", status);
-
         return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
@@ -183,60 +213,57 @@ public class PotPayController {
     public void pollPendingGhanaTransactions() {
         pendingTransactions.entrySet().stream()
                 .filter(e -> "gh".equals(e.getValue().key()))
-                .toList()   // snapshot: settle() mutates the map
+                .toList()
                 .forEach(e -> {
                     var txId = e.getKey();
                     try {
                         if (expireIfStale(txId, e.getValue())) return;
 
-                        var result = flatten(potpayVerifyGhana(txId));
+                        var result = potpayVerifyGhana(txId);
                         var status = statusOf(result);
 
-                        if ("success".equals(status)) {
+                        if (isSuccess(status)) {
                             settleGhanaDeposit(txId, result, null);
                         } else if (isTerminalFailure(status)) {
-                            log.info("pollPendingGhanaTransactions: txId='{}' ended with status='{}' — dropping",
-                                    txId, status);
+                            log.info("pollPendingGhanaTransactions: txId='{}' status='{}' — dropping", txId, status);
                             pendingTransactions.remove(txId);
                         }
                     } catch (Exception ex) {
-                        // Pending record is intentionally NOT removed — we retry next tick.
-                        log.error("pollPendingGhanaTransactions: verify/settle failed for txId='{}'", txId, ex);
+                        // Pending record survives — retried next tick.
+                        log.error("pollPendingGhanaTransactions: verify/settle failed txId='{}'", txId, ex);
                     }
                 });
     }
 
-    /**
-     * @param expectedUserId when non-null, the credit is refused if it does not match
-     *                       the resolved owner (guards the authenticated verify endpoint).
-     */
     private void settleGhanaDeposit(String transactionId, Map<String, Object> verifyResult, UUID expectedUserId) {
-        if (!settlementsInFlight.add(transactionId)) {
-            log.debug("settleGhanaDeposit: txId='{}' already being settled — skipping", transactionId);
-            return;
-        }
+        if (!settlementsInFlight.add(transactionId)) return;
         try {
-            var pending = pendingTransactions.get(transactionId);   // NOT remove — see class javadoc
+            var pending = pendingTransactions.get(transactionId);   // read, NOT remove
 
             var userId = pending != null
                     ? pending.userId()
                     : userIdFromGhanaPayload(verifyResult);
 
             if (userId == null) {
-                log.error("settleGhanaDeposit: cannot resolve owner for txId='{}' — MANUAL RECONCILIATION NEEDED. "
-                        + "payload={}", transactionId, verifyResult);
-                return;
-            }
-            if (expectedUserId != null && !expectedUserId.equals(userId)) {
-                throw ApiException.badRequest("Transaction does not belong to this user.");
-            }
-
-            var amount = resolveGhanaCreditAmount(verifyResult, pending);
-            if (amount == null || amount.signum() <= 0) {
-                log.error("settleGhanaDeposit: no usable amount for txId='{}' — skipping credit. payload={}",
+                log.error("settleGhanaDeposit: cannot resolve owner for txId='{}' — MANUAL RECONCILIATION NEEDED. payload={}",
                         transactionId, verifyResult);
                 return;
             }
+            if (expectedUserId != null && !expectedUserId.equals(userId))
+                throw ApiException.badRequest("Transaction does not belong to this user.");
+
+            // Docs: gross_amount = what the customer paid, net_amount = gross − 3% commission.
+            var gross = firstDecimal(verifyResult, "gross_amount");
+            var net   = firstDecimal(verifyResult, "net_amount");
+            var amount = creditGrossAmount
+                    ? (gross != null ? gross : net)
+                    : (net != null ? net : gross);
+            if (amount == null && pending != null) amount = pending.grossAmount();
+            if (amount == null || amount.signum() <= 0) {
+                log.error("settleGhanaDeposit: no usable amount for txId='{}' — payload={}", transactionId, verifyResult);
+                return;
+            }
+            amount = amount.setScale(2, RoundingMode.HALF_UP);
 
             var providerReference = string(verifyResult, "reference");
 
@@ -245,20 +272,20 @@ public class PotPayController {
             metadata.put("market",        "gh");
             metadata.put("transactionId", transactionId);
             metadata.put("reference",     providerReference == null ? "" : providerReference);
+            metadata.put("grossAmount",   gross == null ? "" : gross.toPlainString());
+            metadata.put("netAmount",     net == null ? "" : net.toPlainString());
 
-            // Idempotency key is the PotPay transaction id, never the nullable `reference`.
             creditWallet(userId, amount, transactionId, metadata, "GHS");
 
-            pendingTransactions.remove(transactionId);   // only after a confirmed credit
-            log.info("settleGhanaDeposit: GHS {} settled for userId='{}' txId='{}'",
-                    amount, userId, transactionId);
+            pendingTransactions.remove(transactionId);   // only after confirmed credit
+            log.info("settleGhanaDeposit: GHS {} settled userId='{}' txId='{}'", amount, userId, transactionId);
         } finally {
             settlementsInFlight.remove(transactionId);
         }
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // NIGERIA (NGN · Redirect checkout)
+    // NIGERIA (NGN · redirect checkout)
     // ════════════════════════════════════════════════════════════════════════
 
     @PostMapping("/api/wallet/deposit/potpay/ng/init")
@@ -272,33 +299,37 @@ public class PotPayController {
 
         var customerName = required(req, "customerName");
 
-        // Format is load-bearing: userIdFromMerchantReference() parses the userId back
-        // out of this so settlement survives a lost pending map.
+        // Format is load-bearing: echoed back as merchant_reference in verify,
+        // and parsed by userIdFromMerchantReference() to recover the owner.
         var merchantReference = NG_REFERENCE_PREFIX + user.getId() + "-" + UUID.randomUUID();
 
         log.info("initNigeriaDeposit: userId='{}' amount={} merchantReference='{}'",
                 user.getId(), amount, merchantReference);
 
+        // Callback must hit THIS backend — PotPay's redirect carries the result there,
+        // nigeriaCallback verifies server-side, then forwards the customer to the frontend.
         var response = potpayInitiateNigeria(
                 amount, customerName,
-                frontendUrl + "/app/wallet/potpay/ng/callback",
+                backendPublicUrl + "/app/wallet/potpay/ng/callback",
                 "Deposit for user " + user.getId(),
                 merchantReference
         );
 
         if (!Boolean.TRUE.equals(response.get("success"))) {
-            log.error("initNigeriaDeposit: PotPay rejected initiate request for userId='{}': {}",
-                    user.getId(), response);
+            log.error("initNigeriaDeposit: PotPay rejected initiate for userId='{}': {}", user.getId(), response);
             throw ApiException.badRequest("PotPay declined the payment request.");
         }
 
-        var flat  = flatten(response);
-        var txRef = string(flat, "tx_ref");
+        var txRef       = string(response, "tx_ref");
+        var checkoutUrl = string(response, "checkout_url");
 
         if (txRef == null || txRef.isBlank()) {
-            log.error("initNigeriaDeposit: PotPay response missing 'tx_ref' for userId='{}'. Response: {}",
-                    user.getId(), response);
+            log.error("initNigeriaDeposit: missing 'tx_ref' for userId='{}'. Response: {}", user.getId(), response);
             throw ApiException.badRequest("PotPay accepted the request but did not return a transaction reference.");
+        }
+        if (checkoutUrl == null || checkoutUrl.isBlank()) {
+            log.error("initNigeriaDeposit: missing 'checkout_url' for userId='{}'. Response: {}", user.getId(), response);
+            throw ApiException.badRequest("PotPay did not return a checkout URL.");
         }
 
         pendingTransactions.put(txRef, new PendingTx(user.getId(), amount, "NGN", "ng", Instant.now()));
@@ -306,34 +337,49 @@ public class PotPayController {
 
         var resBody = new HashMap<String, Object>();
         resBody.put("txRef",       txRef);
-        resBody.put("checkoutUrl", flat.get("checkout_url"));
-        resBody.put("amount",      flat.get("amount"));
-        resBody.put("currency",    flat.get("currency"));
-
+        resBody.put("checkoutUrl", checkoutUrl);
+        resBody.put("amount",      response.get("amount"));
+        resBody.put("currency",    response.get("currency"));
         return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
+    /**
+     * Browser redirect target from PotPay. Query params use the CALLBACK vocabulary
+     * (successful|failed|pending) and are never trusted — we always re-verify, which
+     * returns the VERIFY vocabulary (success|failed|pending).
+     * Must be permitAll() — no auth on a provider redirect.
+     */
     @GetMapping("/app/wallet/potpay/ng/callback")
     public ResponseEntity<Void> nigeriaCallback(
             @RequestParam("tx_ref") String txRef,
-            @RequestParam(value = "status", required = false) String unverifiedStatus) {
+            @RequestParam(value = "status", required = false) String unverifiedStatus,
+            @RequestParam(value = "transaction_id", required = false) String flutterwaveTxnId) {
 
-        log.info("nigeriaCallback: txRef='{}' unverifiedStatus='{}'", txRef, unverifiedStatus);
+        log.info("nigeriaCallback: txRef='{}' unverifiedStatus='{}' fwTxnId='{}'",
+                txRef, unverifiedStatus, flutterwaveTxnId);
 
-        String finalStatus;
+        String uiStatus;
         try {
-            var result = flatten(potpayVerifyNigeria(txRef));
-            finalStatus = statusOf(result);
-            if ("success".equals(finalStatus)) {
+            var result = potpayVerifyNigeria(txRef);
+            var status = statusOf(result);
+            log.info("nigeriaCallback: verified txRef='{}' status='{}' rawPayload={}", txRef, status, result);
+
+            if (isSuccess(status)) {
                 settleNigeriaDeposit(txRef, result, null);
+                uiStatus = "success";
+            } else if (isTerminalFailure(status)) {
+                pendingTransactions.remove(txRef);
+                uiStatus = "failed";
+            } else {
+                uiStatus = "pending";   // poller keeps watching it
             }
         } catch (Exception ex) {
-            // Pending record survives — the 15s poller will settle it shortly.
-            log.error("nigeriaCallback: verify failed for txRef='{}' — leaving to poller", txRef, ex);
-            finalStatus = "unknown";
+            log.error("nigeriaCallback: verify failed txRef='{}' — leaving to poller", txRef, ex);
+            uiStatus = "pending";
         }
 
-        var redirectUrl = frontendUrl + "/app/wallet?payment=" + finalStatus + "&tx_ref=" + txRef;
+        var redirectUrl = frontendUrl + "/app/wallet?payment=" + uiStatus
+                + "&tx_ref=" + java.net.URLEncoder.encode(txRef, java.nio.charset.StandardCharsets.UTF_8);
         return ResponseEntity.status(302).header("Location", redirectUrl).build();
     }
 
@@ -346,10 +392,11 @@ public class PotPayController {
         if (pending != null && !pending.userId().equals(user.getId()))
             throw ApiException.badRequest("Transaction does not belong to this user.");
 
-        var result = flatten(potpayVerifyNigeria(txRef));
+        var result = potpayVerifyNigeria(txRef);
         var status = statusOf(result);
+        log.info("verifyNigeriaDeposit: txRef='{}' status='{}' rawPayload={}", txRef, status, result);
 
-        if ("success".equals(status)) {
+        if (isSuccess(status)) {
             settleNigeriaDeposit(txRef, result, user.getId());
         } else if (isTerminalFailure(status)) {
             pendingTransactions.remove(txRef);
@@ -358,7 +405,6 @@ public class PotPayController {
         var resBody = new HashMap<String, Object>();
         resBody.put("txRef",  txRef);
         resBody.put("status", status);
-
         return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
@@ -372,27 +418,23 @@ public class PotPayController {
                     try {
                         if (expireIfStale(txRef, e.getValue())) return;
 
-                        var result = flatten(potpayVerifyNigeria(txRef));
+                        var result = potpayVerifyNigeria(txRef);
                         var status = statusOf(result);
 
-                        if ("success".equals(status)) {
+                        if (isSuccess(status)) {
                             settleNigeriaDeposit(txRef, result, null);
                         } else if (isTerminalFailure(status)) {
-                            log.info("pollPendingNigeriaTransactions: txRef='{}' ended with status='{}' — dropping",
-                                    txRef, status);
+                            log.info("pollPendingNigeriaTransactions: txRef='{}' status='{}' — dropping", txRef, status);
                             pendingTransactions.remove(txRef);
                         }
                     } catch (Exception ex) {
-                        log.error("pollPendingNigeriaTransactions: verify/settle failed for txRef='{}'", txRef, ex);
+                        log.error("pollPendingNigeriaTransactions: verify/settle failed txRef='{}'", txRef, ex);
                     }
                 });
     }
 
     private void settleNigeriaDeposit(String txRef, Map<String, Object> verifyResult, UUID expectedUserId) {
-        if (!settlementsInFlight.add(txRef)) {
-            log.debug("settleNigeriaDeposit: txRef='{}' already being settled — skipping", txRef);
-            return;
-        }
+        if (!settlementsInFlight.add(txRef)) return;
         try {
             var pending = pendingTransactions.get(txRef);
 
@@ -401,33 +443,35 @@ public class PotPayController {
                     : userIdFromMerchantReference(string(verifyResult, "merchant_reference"));
 
             if (userId == null) {
-                log.error("settleNigeriaDeposit: cannot resolve owner for txRef='{}' — MANUAL RECONCILIATION NEEDED. "
-                        + "payload={}", txRef, verifyResult);
-                return;
-            }
-            if (expectedUserId != null && !expectedUserId.equals(userId)) {
-                throw ApiException.badRequest("Transaction does not belong to this user.");
-            }
-
-            var gross = firstDecimal(verifyResult, "amount", "gross_amount");
-            if (gross == null && pending != null) gross = pending.grossAmount();
-            if (gross == null || gross.signum() <= 0) {
-                log.error("settleNigeriaDeposit: no usable amount for txRef='{}' — skipping credit. payload={}",
+                log.error("settleNigeriaDeposit: cannot resolve owner for txRef='{}' — MANUAL RECONCILIATION NEEDED. payload={}",
                         txRef, verifyResult);
                 return;
             }
+            if (expectedUserId != null && !expectedUserId.equals(userId))
+                throw ApiException.badRequest("Transaction does not belong to this user.");
 
-            var netAmount = creditGrossAmount
-                    ? gross
-                    : gross.multiply(BigDecimal.ONE.subtract(ngCommissionRate));
-            netAmount = netAmount.setScale(2, RoundingMode.HALF_UP);
-
-            if (!creditGrossAmount && gross.compareTo(netAmount) != 0) {
-                log.info("settleNigeriaDeposit: txRef='{}' gross={} commissionRate={} credited={}",
-                        txRef, gross, ngCommissionRate, netAmount);
+            // Docs: verify "amount" = what the customer paid (gross). PotPay deducts
+            // its 15% from the merchant payout, not from this figure.
+            var gross = firstDecimal(verifyResult, "amount");
+            if (gross == null && pending != null) gross = pending.grossAmount();
+            if (gross == null || gross.signum() <= 0) {
+                log.error("settleNigeriaDeposit: no usable amount for txRef='{}' — payload={}", txRef, verifyResult);
+                return;
             }
 
-            var paymentType = string(verifyResult, "payment_type");
+            // Docs: verify amount before fulfilling. If it drifted from what we initiated, stop.
+            if (pending != null && gross.compareTo(pending.grossAmount()) != 0) {
+                log.error("settleNigeriaDeposit: AMOUNT MISMATCH txRef='{}' initiated={} verified={} — refusing to credit, MANUAL RECONCILIATION NEEDED",
+                        txRef, pending.grossAmount(), gross);
+                return;   // record stays pending for investigation
+            }
+
+            var creditAmount = creditGrossAmount
+                    ? gross
+                    : gross.multiply(BigDecimal.ONE.subtract(ngCommissionRate));
+            creditAmount = creditAmount.setScale(2, RoundingMode.HALF_UP);
+
+            var paymentType = string(verifyResult, "payment_type");   // card | banktransfer | ussd
 
             var metadata = new HashMap<String, Object>();
             metadata.put("provider",    "potpay");
@@ -436,10 +480,10 @@ public class PotPayController {
             metadata.put("grossAmount", gross.toPlainString());
             metadata.put("paymentType", paymentType == null ? "unknown" : paymentType);
 
-            creditWallet(userId, netAmount, txRef, metadata, "NGN");
+            creditWallet(userId, creditAmount, txRef, metadata, "NGN");
 
             pendingTransactions.remove(txRef);
-            log.info("settleNigeriaDeposit: NGN {} settled for userId='{}' txRef='{}'", netAmount, userId, txRef);
+            log.info("settleNigeriaDeposit: NGN {} settled userId='{}' txRef='{}'", creditAmount, userId, txRef);
         } finally {
             settlementsInFlight.remove(txRef);
         }
@@ -449,81 +493,61 @@ public class PotPayController {
     // Wallet crediting — mirrors PaystackController.handleDeposit()
     // ════════════════════════════════════════════════════════════════════════
 
-    /**
-     * Credits the wallet and then attributes referral commission.
-     *
-     * @param idempotencyRef MUST be non-null and stable per transaction. WalletService
-     *                       throws 409 on a repeat, which is how double-crediting is
-     *                       prevented when the poller and the verify endpoint overlap.
-     */
     private void creditWallet(UUID userId, BigDecimal amount, String idempotencyRef,
                               Map<String, Object> metadata, String currency) {
 
         if (idempotencyRef == null || idempotencyRef.isBlank())
             throw new IllegalStateException("Refusing to credit without an idempotency reference");
 
-        log.info("creditWallet: userId='{}' amount={} {} ref='{}'", userId, amount, currency, idempotencyRef);
-
         try {
             walletService.credit(userId, amount, TxKind.DEPOSIT, idempotencyRef, metadata);
-            log.info("creditWallet: {} {} credited to userId='{}' ref='{}'",
-                    currency, amount, userId, idempotencyRef);
+            log.info("creditWallet: {} {} credited userId='{}' ref='{}'", currency, amount, userId, idempotencyRef);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
-                // Already credited on an earlier pass — commission was attributed then too.
                 log.warn("creditWallet: duplicate ref='{}' already processed — skipping", idempotencyRef);
-                return;
+                return;   // commission was attributed on the first pass
             }
             throw ex;
         }
 
-        // Attribute commission to the referring admin. Never block a deposit on this.
         try {
             referralService.attributeCommission(userId, amount);
-            log.info("creditWallet: commission attributed for userId='{}' deposit={} ref='{}'",
-                    userId, amount, idempotencyRef);
+            log.info("creditWallet: commission attributed userId='{}' deposit={} ref='{}'", userId, amount, idempotencyRef);
         } catch (Exception ex) {
-            log.error("creditWallet: commission attribution failed for userId='{}' ref='{}' — investigate",
+            // Never block a deposit on a commission failure.
+            log.error("creditWallet: commission attribution failed userId='{}' ref='{}' — investigate",
                     userId, idempotencyRef, ex);
         }
     }
 
-    private BigDecimal resolveGhanaCreditAmount(Map<String, Object> verifyResult, PendingTx pending) {
-        BigDecimal amount = creditGrossAmount
-                ? firstDecimal(verifyResult, "gross_amount", "amount", "net_amount")
-                : firstDecimal(verifyResult, "net_amount", "amount", "gross_amount");
+    // ════════════════════════════════════════════════════════════════════════
+    // Status + recovery helpers
+    // ════════════════════════════════════════════════════════════════════════
 
-        if (amount == null && pending != null) amount = pending.grossAmount();
-        if (amount == null) return null;
-
-        if (!creditGrossAmount) {
-            var gross = firstDecimal(verifyResult, "gross_amount", "amount");
-            if (gross != null && gross.compareTo(amount) != 0) {
-                log.info("resolveGhanaCreditAmount: crediting PotPay net_amount={} (gross={})", amount, gross);
-            }
-        }
-        return amount.setScale(2, RoundingMode.HALF_UP);
+    /** Verify vocabulary is success|failed|pending|decline; callback uses successful|failed|pending. */
+    private static boolean isSuccess(String status) {
+        return "success".equals(status) || "successful".equals(status);
     }
 
-    /** Drops a pending record that has outlived PENDING_TTL. Logged loudly for reconciliation. */
+    private static boolean isTerminalFailure(String status) {
+        return "failed".equals(status) || "decline".equals(status) || "declined".equals(status);
+    }
+
+    private static String statusOf(Map<String, Object> payload) {
+        var status = payload == null ? null : payload.get("status");
+        return status == null || status.toString().isBlank()
+                ? "pending" : status.toString().trim().toLowerCase();
+    }
+
     private boolean expireIfStale(String key, PendingTx pending) {
         if (pending.createdAt().plus(PENDING_TTL).isAfter(Instant.now())) return false;
-
         pendingTransactions.remove(key);
-        log.error("expireIfStale: pending {} tx key='{}' userId='{}' amount={} exceeded {} without settling "
-                        + "— VERIFY MANUALLY before writing it off",
+        log.error("expireIfStale: pending {} tx key='{}' userId='{}' amount={} exceeded {} without settling — VERIFY MANUALLY",
                 pending.key(), key, pending.userId(), pending.grossAmount(), PENDING_TTL);
         return true;
     }
 
-    private static boolean isTerminalFailure(String status) {
-        return "failed".equals(status) || "decline".equals(status)
-                || "declined".equals(status) || "cancelled".equals(status) || "canceled".equals(status);
-    }
-
-    // ── Owner recovery (used when the in-memory pending map has been lost) ───────
-
-    /** Parses the userId back out of "order-{userId}-{uuid}". */
+    /** Parses the userId back out of "order-{userId}-{uuid}" (echoed as merchant_reference). */
     private static UUID userIdFromMerchantReference(String merchantReference) {
         if (merchantReference == null || !merchantReference.startsWith(NG_REFERENCE_PREFIX)) return null;
         var rest = merchantReference.substring(NG_REFERENCE_PREFIX.length());
@@ -531,30 +555,26 @@ public class PotPayController {
         try {
             return UUID.fromString(rest.substring(0, 36));
         } catch (IllegalArgumentException ex) {
-            log.warn("userIdFromMerchantReference: unparseable merchant_reference='{}'", merchantReference);
             return null;
         }
     }
 
-    /** Recovers the userId from the description we sent with the collect request. */
+    /** Recovers the userId from the description echoed back in the GH verify response. */
     private static UUID userIdFromGhanaPayload(Map<String, Object> verifyResult) {
-        for (var field : new String[]{"description", "narration", "merchant_reference"}) {
-            var value = string(verifyResult, field);
-            if (value == null) continue;
+        var description = verifyResult == null ? null : verifyResult.get("description");
+        if (description == null) return null;
 
-            var idx = value.indexOf(GH_DESCRIPTION_PREFIX);
-            var candidate = idx >= 0
-                    ? value.substring(idx + GH_DESCRIPTION_PREFIX.length()).trim()
-                    : value.trim();
+        var text = description.toString();
+        var idx  = text.indexOf(GH_DESCRIPTION_PREFIX);
+        if (idx < 0) return null;
 
-            if (candidate.length() >= 36) candidate = candidate.substring(0, 36);
-            try {
-                return UUID.fromString(candidate);
-            } catch (IllegalArgumentException ignored) {
-                // try the next field
-            }
+        var candidate = text.substring(idx + GH_DESCRIPTION_PREFIX.length()).trim();
+        if (candidate.length() > 36) candidate = candidate.substring(0, 36);
+        try {
+            return UUID.fromString(candidate);
+        } catch (IllegalArgumentException ex) {
+            return null;
         }
-        return null;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -572,7 +592,8 @@ public class PotPayController {
     }
 
     private Map<String, Object> potpayVerifyGhana(String transactionId) {
-        return callPotPay("GET", "/api/merchant/api/verify/" + transactionId + "/", null);
+        return callPotPay("GET", "/api/merchant/api/verify/"
+                + java.net.URLEncoder.encode(transactionId, java.nio.charset.StandardCharsets.UTF_8) + "/", null);
     }
 
     private Map<String, Object> potpayInitiateNigeria(BigDecimal amount, String customerName,
@@ -590,30 +611,31 @@ public class PotPayController {
     }
 
     private Map<String, Object> potpayVerifyNigeria(String txRef) {
-        return callPotPay("GET", "/api/merchant/ng/payments/verify/?tx_ref=" + txRef, null);
+        return callPotPay("GET", "/api/merchant/ng/payments/verify/?tx_ref="
+                + java.net.URLEncoder.encode(txRef, java.nio.charset.StandardCharsets.UTF_8), null);
     }
 
     /**
      * Resilience:
      *   - 10s timeout per attempt.
-     *   - Retries ONLY on GET (verify). Retrying a POST collect/initiate after a timeout
-     *     can create a second charge against the customer while we only ever track one
-     *     transaction id — that is a real double-debit, so POSTs fail fast instead.
-     *   - 4xx  -> ApiException (client's fault, never retried, surfaces the gateway message).
-     *   - 5xx / network -> PotPayUnavailableException, so callers can distinguish
-     *     "declined" from "couldn't reach PotPay".
+     *   - Retries ONLY on GET (verify). Retrying POST /collect/ after a timeout can
+     *     send the customer a SECOND USSD prompt while we track only one
+     *     transaction_id — a real double-debit risk, so POSTs fail fast.
+     *   - 4xx → ApiException (surfaces PotPay's validation message, e.g. bad network code).
+     *   - 5xx / network → PotPayUnavailableException.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> callPotPay(String method, String path, Map<String, Object> body) {
         var client = webClientBuilder.build();
         var isGet  = !"POST".equals(method);
+        var url    = baseUrl() + path;
 
         WebClient.RequestHeadersSpec<?> spec;
         if (isGet) {
-            spec = client.get().uri(baseUrl + path)
+            spec = client.get().uri(url)
                     .header("Authorization", "Bearer " + merchantId);
         } else {
-            spec = client.post().uri(baseUrl + path)
+            spec = client.post().uri(url)
                     .header("Authorization", "Bearer " + merchantId)
                     .header("Content-Type", "application/json")
                     .bodyValue(body);
@@ -624,16 +646,15 @@ public class PotPayController {
                 .onStatus(HttpStatusCode::is4xxClientError,
                         clientResponse -> clientResponse.bodyToMono(String.class).defaultIfEmpty("")
                                 .map(respBody -> {
-                                    log.error("PotPay API 4xx: method={} path='{}' status={} body={}",
-                                            method, path, clientResponse.statusCode(), respBody);
-                                    return ApiException.badRequest(
-                                            "Payment gateway rejected the request: " + respBody);
+                                    log.error("PotPay 4xx: {} {} status={} body={}",
+                                            method, url, clientResponse.statusCode(), respBody);
+                                    return ApiException.badRequest("Payment gateway rejected the request: " + respBody);
                                 }))
                 .onStatus(HttpStatusCode::is5xxServerError,
                         clientResponse -> clientResponse.bodyToMono(String.class).defaultIfEmpty("")
                                 .map(respBody -> {
-                                    log.error("PotPay API 5xx: method={} path='{}' status={} body={}",
-                                            method, path, clientResponse.statusCode(), respBody);
+                                    log.error("PotPay 5xx: {} {} status={} body={}",
+                                            method, url, clientResponse.statusCode(), respBody);
                                     return new PotPayUnavailableException(
                                             "PotPay returned " + clientResponse.statusCode());
                                 }))
@@ -653,7 +674,7 @@ public class PotPayController {
         } catch (ApiException | PotPayUnavailableException ex) {
             throw ex;
         } catch (Exception ex) {
-            log.error("PotPay unreachable: method={} path='{}'", method, path, ex);
+            log.error("PotPay unreachable: {} {}", method, url, ex);
             throw new PotPayUnavailableException("PotPay is currently unavailable. Please try again.");
         }
 
@@ -662,46 +683,24 @@ public class PotPayController {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // Payload helpers
+    // Input helpers
     // ════════════════════════════════════════════════════════════════════════
 
-    /**
-     * PotPay sometimes nests the payload under "data". Returns a single flat view with
-     * nested values winning, so callers never have to guess at the shape.
-     */
-    @SuppressWarnings("unchecked")
-    private static Map<String, Object> flatten(Map<String, Object> response) {
-        if (response == null) return new HashMap<>();
-        var flat = new HashMap<String, Object>(response);
-        var data = response.get("data");
-        if (data instanceof Map<?, ?> nested) {
-            flat.remove("data");
-            flat.putAll((Map<String, Object>) nested);
-        }
-        return flat;
-    }
-
-    private static String statusOf(Map<String, Object> payload) {
-        var status = string(payload, "status");
-        return status == null || status.isBlank() ? "pending" : status.toLowerCase();
-    }
-
     private static String string(Map<String, Object> src, String key) {
-        var value = src.get(key);
+        var value = src == null ? null : src.get(key);
         return value == null ? null : value.toString();
     }
 
-    /** Returns the first key that parses as a positive-or-zero decimal, tolerating "1,000.00". */
+    /** Docs return amounts as strings ("100.00", "5000.00"); tolerate "1,000.00" too. */
     private static BigDecimal firstDecimal(Map<String, Object> src, String... keys) {
         for (var key : keys) {
-            var value = src.get(key);
+            var value = src == null ? null : src.get(key);
             if (value == null) continue;
             try {
                 var text = value.toString().replace(",", "").trim();
-                if (text.isEmpty()) continue;
-                return new BigDecimal(text);
+                if (!text.isEmpty()) return new BigDecimal(text);
             } catch (NumberFormatException ignored) {
-                log.warn("firstDecimal: field '{}' is not a number: {}", key, value);
+                log.warn("firstDecimal: field '{}' not numeric: {}", key, value);
             }
         }
         return null;
@@ -731,31 +730,3 @@ public class PotPayController {
         return "*".repeat(phone.length() - 3) + phone.substring(phone.length() - 3);
     }
 }
-
-/*
- * ─── FOLLOW-UP: make pending transactions durable ───────────────────────────────
- *
- * The recovery paths above (merchant_reference / description parsing) stop a lost
- * pending map from losing money, but the pollers still cannot see transactions they
- * never held in memory. If you run more than one instance, or deploy while users are
- * mid-payment, add a table:
- *
- *   CREATE TABLE potpay_pending_tx (
- *     tx_key        VARCHAR(128) PRIMARY KEY,   -- transaction_id (GH) or tx_ref (NG)
- *     user_id       UUID        NOT NULL,
- *     gross_amount  NUMERIC(19,2) NOT NULL,
- *     currency      VARCHAR(3)  NOT NULL,
- *     market        VARCHAR(2)  NOT NULL,       -- 'gh' | 'ng'
- *     status        VARCHAR(16) NOT NULL,       -- 'pending' | 'settled' | 'failed'
- *     created_at    TIMESTAMPTZ NOT NULL,
- *     settled_at    TIMESTAMPTZ
- *   );
- *
- * Swap `pendingTransactions.put/get/remove` for repository calls and have the pollers
- * query `WHERE status = 'pending' AND market = ?`. Everything else in this class works
- * unchanged, because settlement already treats the pending record as a hint rather than
- * a precondition.
- *
- * Also confirm @EnableScheduling is present on a @Configuration class, otherwise neither
- * poller ever runs and every deposit depends on the user returning to the verify page.
- */
