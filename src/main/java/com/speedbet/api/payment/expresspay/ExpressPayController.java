@@ -19,6 +19,7 @@ import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.util.retry.Retry;
@@ -87,14 +88,17 @@ public class ExpressPayController {
     private String backendUrl;
 
     /**
-     * redirect-url — REQUIRED by expressPay's LIVE submit.php (sandbox did not
-     * enforce it; production rejects the submit with status=3 "Check redirect-url"
-     * when it is missing). This is the URL expressPay sends the USER'S BROWSER to
-     * after the hosted checkout finishes or is abandoned — distinct from post-url
-     * (the server-to-server webhook). Point it at a user-facing "payment return"
-     * page. Overridable via app.expresspay.redirect-url per environment.
+     * redirect-url — REQUIRED by expressPay's LIVE submit.php. This is where
+     * expressPay sends the USER'S BROWSER after checkout finishes (distinct from
+     * post-url, the server-to-server webhook that actually credits the wallet).
+     * Points at the wallet page so the user lands back on their balance, which
+     * should refresh on load. Overridable via app.expresspay.redirect-url.
+     *
+     * NOTE: crediting does NOT depend on the user reaching this URL — the webhook
+     * credits independently, so even if the user closes the tab after paying,
+     * the wallet is still credited once the webhook + query confirm succeed.
      */
-    @Value("${app.expresspay.redirect-url:https://futballbackend-production-f14d.up.railway.app/api/payment/expresspay/return}")
+    @Value("${app.expresspay.redirect-url:https://www.omegabett.site/wallet}")
     private String redirectUrl;
 
     /**
@@ -201,9 +205,21 @@ public class ExpressPayController {
      * expressPay's callback carries no signature header, so the payload itself
      * is never trusted for crediting funds — we always re-confirm with a
      * server-to-server Query call first.
+     *
+     * CONTENT TYPE: expressPay posts callbacks as application/x-www-form-urlencoded
+     * (not JSON), like the rest of its API. We therefore bind loosely with
+     * @RequestParam so form fields populate correctly. A JSON fallback is also
+     * accepted so the endpoint is robust to either encoding.
      */
     @PostMapping("/api/webhooks/expresspay")
-    public ResponseEntity<String> webhook(@RequestBody Map<String, Object> body) {
+    public ResponseEntity<String> webhook(
+            @RequestParam(required = false) Map<String, String> form,
+            @RequestBody(required = false) Map<String, Object> json) {
+
+        // Prefer form params (expressPay's actual encoding); fall back to JSON.
+        Map<String, Object> body = new java.util.HashMap<>();
+        if (form != null) form.forEach(body::put);
+        if (json != null) body.putAll(json);
 
         var orderId = body.get("order-id") != null ? body.get("order-id").toString() : null;
         var token   = body.get("token") != null ? body.get("token").toString() : null;
@@ -217,30 +233,55 @@ public class ExpressPayController {
         }
 
         var pending = pendingTransactions.get(orderId);
-        if (pending == null) {
-            log.warn("webhook: ✗ unknown orderId='{}' (not in pending map, size={}) — ignoring",
-                    orderId, pendingTransactions.size());
-            return ResponseEntity.ok("Ignored — unknown order");
-        }
 
+        // Confirm with expressPay FIRST — the payload is never trusted, and the
+        // token in the payload is enough to query even if our in-memory pending
+        // map was wiped (e.g. a Railway restart while the user was on the hosted
+        // checkout page). This decouples "is the payment real?" from "do we still
+        // have the local record?".
+        String resultCode;
+        String transactionId;
         try {
             log.info("webhook: re-confirming orderId='{}' via server-to-server query", orderId);
             var queryResult = expressPayQuery(token);
-            var resultCode   = String.valueOf(queryResult.get("result"));
-
+            resultCode    = String.valueOf(queryResult.get("result"));
+            transactionId = String.valueOf(queryResult.get("transaction-id"));
             log.info("webhook: query confirmed orderId='{}' result='{}' text='{}'",
                     orderId, resultCode, queryResult.get("result-text"));
-
-            if (RESULT_APPROVED.equals(resultCode)) {
-                log.info("webhook: ✔ APPROVED orderId='{}' — finalizing", orderId);
-                finalizeTransaction(orderId, String.valueOf(queryResult.get("transaction-id")));
-            } else {
-                log.warn("webhook: ✗ orderId='{}' not approved (result='{}') — no wallet action taken",
-                        orderId, resultCode);
-            }
         } catch (Exception e) {
-            log.error("webhook: ✗ unexpected error confirming orderId='{}' — expressPay will retry callback",
-                    orderId, e);
+            log.error("webhook: ✗ error confirming orderId='{}' — expressPay will retry callback", orderId, e);
+            return ResponseEntity.status(500).body("Processing error");
+        }
+
+        if (!RESULT_APPROVED.equals(resultCode)) {
+            log.warn("webhook: ✗ orderId='{}' not approved (result='{}') — no wallet action", orderId, resultCode);
+            return ResponseEntity.ok("OK — not approved");
+        }
+
+        if (pending == null) {
+            // Payment is CONFIRMED APPROVED by expressPay, but we have no local
+            // record of who to credit or how much. This is money at risk: the
+            // customer paid and we cannot auto-credit. This happens when the
+            // in-memory pendingTransactions map was lost (restart / redeploy /
+            // multi-instance) between init and the callback.
+            //
+            // ⚠️ THIS IS WHY pendingTransactions MUST BE A DATABASE TABLE. With a
+            // DB, we would look up the order here and credit normally. Until then,
+            // we log CRITICALLY so the payment can be reconciled/credited by hand.
+            log.error("webhook: ‼ CRITICAL orderId='{}' txId='{}' is APPROVED but has NO pending record — "
+                            + "customer PAID but cannot be auto-credited. MANUAL RECONCILIATION REQUIRED. "
+                            + "(root cause: in-memory pending map lost; migrate to a DB table to fix permanently)",
+                    orderId, transactionId);
+            // Return 200 so expressPay stops retrying — retrying won't help, the
+            // record is gone. The CRITICAL log above is the recovery signal.
+            return ResponseEntity.ok("Acknowledged — manual reconciliation required");
+        }
+
+        try {
+            log.info("webhook: ✔ APPROVED orderId='{}' — finalizing", orderId);
+            finalizeTransaction(orderId, transactionId);
+        } catch (Exception e) {
+            log.error("webhook: ✗ finalize failed orderId='{}' — expressPay will retry callback", orderId, e);
             return ResponseEntity.status(500).body("Processing error");
         }
 
