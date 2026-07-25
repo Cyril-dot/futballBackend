@@ -166,6 +166,10 @@ public class SecurityConfig {
                         // NOTE: /api/webhooks/** covers /api/webhooks/moolre automatically.
                         //       Moolre webhook identity is verified internally via the secret
                         //       field in the payload (see MoolreController.verifyWebhookSecret).
+                        //       It ALSO covers /api/webhooks/rushpay — RushPay webhook identity
+                        //       is verified internally via HMAC signature over the raw body
+                        //       (see RushPayController.verifySignature). Signature auth is why
+                        //       this path is permitAll: RushPay's servers have no JWT.
                         .requestMatchers(HttpMethod.GET,  "/api/tip/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
 
@@ -211,6 +215,19 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST,
                                 "/api/user/upgrade-to-admin/moolre/init",
                                 "/api/user/upgrade-to-admin/moolre/ussd/init"
+                        ).authenticated()
+
+                        // ── RushPay — deposit + admin upgrade init (authenticated) ────────
+                        // These mint a checkout + short-lived widget session under the
+                        // logged-in user; the browser then drives MoMo/card/gift-card funding
+                        // with the widget token. The webhook (POST /api/webhooks/rushpay) is
+                        // covered by the /api/webhooks/** permitAll rule above and is
+                        // authenticated by HMAC signature, not JWT.
+                        // POST /api/wallet/deposit/rushpay/init          — creates deposit checkout
+                        // POST /api/user/upgrade-to-admin/rushpay/init   — pays GHS 200 upgrade fee
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/wallet/deposit/rushpay/init",
+                                "/api/user/upgrade-to-admin/rushpay/init"
                         ).authenticated()
 
                         // ── Admin & super-admin ───────────────────────────────────────────
