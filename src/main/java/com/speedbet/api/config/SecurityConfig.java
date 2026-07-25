@@ -115,6 +115,10 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/basketball/matches/results").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/basketball/standings").permitAll()
 
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/wallet/deposit/expresspay/verify"
+                        ).authenticated()
+
                         // ── NFL public unauthenticated ────────────────────────────────────
                         .requestMatchers(HttpMethod.GET, "/api/nfl/matches/live").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/nfl/matches/today").permitAll()

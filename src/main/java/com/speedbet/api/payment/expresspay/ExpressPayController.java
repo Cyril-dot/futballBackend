@@ -151,6 +151,56 @@ public class ExpressPayController {
         )));
     }
 
+    // ─── Deposit Verify (hosted-checkout return) ───────────────────────────────
+
+    /**
+     * Verify a deposit after the user returns from expressPay's hosted checkout.
+     *
+     * WHY THIS EXISTS: expressPay's post-url webhook is not always delivered
+     * (unlike Paystack's reliable, signed webhook). So rather than depend solely
+     * on the webhook to credit, the frontend stores { token, orderId } before
+     * redirecting to checkout, and calls this endpoint when the user lands back
+     * on the wallet page. This confirms the payment authoritatively via query.php
+     * and credits — independent of whether the webhook ever fires.
+     *
+     * This is the same mechanism as momo/verify, exposed under a clearer name for
+     * the hosted-checkout (card) return path. Idempotent: finalizeTransaction
+     * guards against double-crediting, so it's safe even if the webhook ALSO
+     * fires for the same order — whichever arrives first credits, the other is a
+     * no-op.
+     *
+     * Body: { token, orderId }
+     */
+    @PostMapping("/api/wallet/deposit/expresspay/verify")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> verifyDeposit(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var token   = require(req, "token");
+        var orderId = require(req, "orderId");
+
+        log.info("verifyDeposit: ▶ userId='{}' orderId='{}' token='{}'", user.getId(), orderId, mask(token));
+
+        var queryResult = expressPayQuery(token);
+        var resultCode  = String.valueOf(queryResult.get("result"));
+        var credited    = false;
+
+        if (RESULT_APPROVED.equals(resultCode)) {
+            log.info("verifyDeposit: ✔ APPROVED orderId='{}' — finalizing", orderId);
+            finalizeTransaction(orderId, String.valueOf(queryResult.get("transaction-id")));
+            credited = true;
+        } else {
+            log.info("verifyDeposit: orderId='{}' result='{}' — not credited (may still be pending)",
+                    orderId, resultCode);
+        }
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "result", resultCode,
+                "result-text", String.valueOf(queryResult.get("result-text")),
+                "credited", credited
+        )));
+    }
+
     // ─── Admin Upgrade Init ───────────────────────────────────────────────────
 
     @PostMapping("/api/user/upgrade-to-admin/expresspay/init")
@@ -186,15 +236,142 @@ public class ExpressPayController {
         )));
     }
 
-    // ─── Charge endpoints removed ──────────────────────────────────────────
+    // ─── Hosted checkout note ──────────────────────────────────────────────
     //
-    // The former direct-charge endpoints (chargeCard / chargeMomo) and their
-    // helper handleCheckoutResult have been removed. We now use expressPay's
-    // HOSTED CHECKOUT: init returns a checkoutUrl, the browser is redirected
-    // there, the customer enters card/momo details ON EXPRESSPAY'S PAGE, and
-    // the payment is confirmed asynchronously via the webhook below (which
-    // re-confirms with query.php before crediting). Raw card data therefore
-    // never reaches this backend.
+    // Card payments use expressPay's HOSTED CHECKOUT (init returns a checkoutUrl,
+    // the browser is redirected there). Raw card data never reaches this backend.
+    //
+    // Mobile money additionally supports an IN-APP DIRECT flow below: the user
+    // enters their momo number here, expressPay pushes an approval prompt to
+    // their phone, and we confirm via query.php before crediting. This uses
+    // expressPay's DIRECT API (/api/direct/checkout.php), which must be enabled
+    // on the merchant account — see EXPRESSPAY_USSD_FLOW.md.
+
+    // ─── Deposit: Mobile Money (in-app direct / USSD) ──────────────────────────
+
+    /**
+     * Step 1 (momo): submit + push an approval prompt to the user's phone.
+     *
+     * Body: { amount, mobileNumber, mobileNetwork }
+     *   mobileNetwork ∈ { MTN_MM, AIRTEL_MM, TIGO_CASH, VODAFONE_CASH } (verify vs docs)
+     *
+     * Returns the expressPay result so the frontend can branch:
+     *   result=1 approved (credited now) · result=4 pending (poll verify) · else failed
+     */
+    @PostMapping("/api/wallet/deposit/expresspay/momo/init")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> initMomo(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        log.info("initMomo: ▶ START userId='{}' rawAmount='{}'", user.getId(), req.get("amount"));
+
+        var amount = new BigDecimal(req.get("amount").toString());
+        if (amount.compareTo(minDeposit) < 0) {
+            log.warn("initMomo: ✗ REJECTED amount={} below minDeposit={} userId='{}'",
+                    amount, minDeposit, user.getId());
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        }
+
+        var mobileNumber  = require(req, "mobileNumber");
+        var mobileNetwork = require(req, "mobileNetwork");
+
+        var orderId = UUID.randomUUID().toString();
+        pendingTransactions.put(orderId, new PendingTx(user.getId(), amount, "deposit", new AtomicBoolean(false)));
+        log.info("initMomo: pending stored userId='{}' amount={} orderId='{}' network='{}' number='{}'",
+                user.getId(), amount, orderId, mobileNetwork, maskPhone(mobileNumber));
+
+        var submit = expressPaySubmit(user, amount, orderId);
+        var token  = String.valueOf(submit.get("token"));
+
+        var charge     = expressPayCheckoutMomo(token, mobileNumber, mobileNetwork, null);
+        var resultCode = String.valueOf(charge.get("result"));
+
+        if (RESULT_APPROVED.equals(resultCode)) {
+            log.info("initMomo: ✔ APPROVED immediately orderId='{}' — finalizing", orderId);
+            finalizeTransaction(orderId, String.valueOf(charge.get("transaction-id")));
+        } else if (RESULT_PENDING.equals(resultCode)) {
+            log.info("initMomo: ⏳ PENDING orderId='{}' — user must approve on phone", orderId);
+        } else {
+            log.warn("initMomo: ✗ NOT APPROVED orderId='{}' result='{}' text='{}'",
+                    orderId, resultCode, charge.get("result-text"));
+        }
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "orderId", orderId,
+                "token", token,
+                "result", resultCode,
+                "result-text", String.valueOf(charge.get("result-text"))
+        )));
+    }
+
+    /**
+     * Step 2 (momo, optional): submit an OTP/voucher if the network requires it.
+     * Only used when initMomo's response indicates an OTP challenge. Verify the
+     * exact field name expressPay expects (mobile-auth-token vs otp) against docs.
+     *
+     * Body: { token, otp }
+     */
+    @PostMapping("/api/wallet/deposit/expresspay/momo/otp")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> submitMomoOtp(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var token = require(req, "token");
+        var otp   = require(req, "otp");
+
+        log.info("submitMomoOtp: ▶ userId='{}' token='{}'", user.getId(), mask(token));
+
+        // Re-submitting checkout with the OTP attached. mobile-number/network are
+        // not needed again once the token carries the pending charge; if expressPay
+        // requires them, the frontend should resend and we can add them here.
+        var result     = expressPayCheckoutMomo(token, null, null, otp);
+        var resultCode = String.valueOf(result.get("result"));
+
+        log.info("submitMomoOtp: ◀ token='{}' result='{}' text='{}'",
+                mask(token), resultCode, result.get("result-text"));
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "result", resultCode,
+                "result-text", String.valueOf(result.get("result-text"))
+        )));
+    }
+
+    /**
+     * Step 3 (momo): verify — polled by the frontend while the user approves on
+     * their phone. Authoritative status check via query.php; credits on approval.
+     * Idempotent (finalizeTransaction guards duplicates), so it's safe to poll
+     * and safe to race with the webhook.
+     *
+     * Body: { token, orderId }
+     */
+    @PostMapping("/api/wallet/deposit/expresspay/momo/verify")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> verifyMomo(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var token   = require(req, "token");
+        var orderId = require(req, "orderId");
+
+        log.info("verifyMomo: ▶ userId='{}' orderId='{}' token='{}'", user.getId(), orderId, mask(token));
+
+        var queryResult = expressPayQuery(token);
+        var resultCode  = String.valueOf(queryResult.get("result"));
+        var credited    = false;
+
+        if (RESULT_APPROVED.equals(resultCode)) {
+            log.info("verifyMomo: ✔ APPROVED orderId='{}' — finalizing", orderId);
+            finalizeTransaction(orderId, String.valueOf(queryResult.get("transaction-id")));
+            credited = true;
+        } else {
+            log.info("verifyMomo: orderId='{}' still result='{}' — not credited yet", orderId, resultCode);
+        }
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "result", resultCode,
+                "result-text", String.valueOf(queryResult.get("result-text")),
+                "credited", credited
+        )));
+    }
 
 
     // ─── Webhook (post-url callback) ────────────────────────────────────────
@@ -473,6 +650,37 @@ public class ExpressPayController {
     }
 
     /**
+     * Direct checkout — mobile money. POSTs to /api/direct/checkout.php to push
+     * an approval prompt to the user's phone. Requires the direct API to be
+     * enabled on the merchant account (see EXPRESSPAY_USSD_FLOW.md).
+     *
+     * mobileNumber/mobileNetwork may be null on an OTP resubmit (the token
+     * already carries the pending charge). Verify field names against docs:
+     * mobile-network values and the OTP field (mobile-auth-token vs otp).
+     */
+    private Map<String, Object> expressPayCheckoutMomo(
+            String token, String mobileNumber, String mobileNetwork, String otp) {
+
+        var form = new LinkedMultiValueMap<String, String>();
+        form.add("token", token);
+        addIfPresent(form, "mobile-number", mobileNumber);
+        addIfPresent(form, "mobile-network", mobileNetwork);
+        addIfPresent(form, "mobile-auth-token", otp); // OTP/voucher when required
+
+        log.info("expressPayCheckoutMomo: ▶ token='{}' network='{}' number='{}' otpPresent={}",
+                mask(token), mobileNetwork, maskPhone(mobileNumber), otp != null && !otp.isBlank());
+
+        long startNanos = System.nanoTime();
+        var result = expressPayPost("/api/direct/checkout.php", form);
+        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
+
+        log.info("expressPayCheckoutMomo: ◀ token='{}' result={} text='{}' elapsedMs={}",
+                mask(token), result.get("result"), result.get("result-text"), elapsedMs);
+
+        return result;
+    }
+
+    /**
      * Step 4: Query — authoritative status check. expressPay's post-url callback
      * carries no signature, so this MUST be called to confirm a transaction
      * before any wallet action is taken — never trust the callback body alone.
@@ -643,6 +851,11 @@ public class ExpressPayController {
     private String mask(String token) {
         if (token == null || token.length() < 8) return "****";
         return token.substring(0, 4) + "..." + token.substring(token.length() - 4);
+    }
+
+    private String maskPhone(String phone) {
+        if (phone == null || phone.length() < 4) return "****";
+        return "*".repeat(Math.max(0, phone.length() - 4)) + phone.substring(phone.length() - 4);
     }
 
     private String maskEmail(String email) {
