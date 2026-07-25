@@ -87,6 +87,17 @@ public class ExpressPayController {
     private String backendUrl;
 
     /**
+     * redirect-url — REQUIRED by expressPay's LIVE submit.php (sandbox did not
+     * enforce it; production rejects the submit with status=3 "Check redirect-url"
+     * when it is missing). This is the URL expressPay sends the USER'S BROWSER to
+     * after the hosted checkout finishes or is abandoned — distinct from post-url
+     * (the server-to-server webhook). Point it at a user-facing "payment return"
+     * page. Overridable via app.expresspay.redirect-url per environment.
+     */
+    @Value("${app.expresspay.redirect-url:https://futballbackend-production-f14d.up.railway.app/api/payment/expresspay/return}")
+    private String redirectUrl;
+
+    /**
      * Transactions we've submitted to expressPay but not yet confirmed, keyed
      * by our own order-id. expressPay has no metadata field like Paystack, so
      * we track userId/amount/intent ourselves here.
@@ -134,7 +145,7 @@ public class ExpressPayController {
         log.info("initDeposit: pending record stored userId='{}' amount={} orderId='{}' pendingCount={}",
                 user.getId(), amount, orderId, pendingTransactions.size());
 
-        var response = expressPaySubmit(amount, orderId);
+        var response = expressPaySubmit(user, amount, orderId);
 
         log.info("initDeposit: ✔ DONE expressPay status='{}' token-present={} orderId='{}' userId='{}'",
                 response.get("status"), response.get("token") != null, orderId, user.getId());
@@ -166,7 +177,7 @@ public class ExpressPayController {
         log.info("initAdminUpgrade: pending record stored userId='{}' amount={} orderId='{}' intent='{}'",
                 user.getId(), amount, orderId, UPGRADE_INTENT_ADMIN);
 
-        var response = expressPaySubmit(amount, orderId);
+        var response = expressPaySubmit(user, amount, orderId);
 
         log.info("initAdminUpgrade: ✔ DONE expressPay status='{}' token-present={} orderId='{}' userId='{}'",
                 response.get("status"), response.get("token") != null, orderId, user.getId());
@@ -427,10 +438,32 @@ public class ExpressPayController {
 
     // ─── expressPay API calls ───────────────────────────────────────────────
 
-    /** Step 1: Submit — initiates a transaction and returns a token for checkout. */
-    private Map<String, Object> expressPaySubmit(BigDecimal amount, String orderId) {
+    /**
+     * Step 1: Submit — initiates a transaction and returns a token for checkout.
+     *
+     * LIVE REQUIRED FIELDS: expressPay's production submit.php rejects the call
+     * with status=3 unless email AND redirect-url are present (sandbox did not
+     * enforce these). firstname/lastname/phonenumber are also sent — expressPay
+     * accepts them and they improve receipts/fraud checks. All customer fields
+     * are pulled from the authenticated User; email is mandatory so we fail fast
+     * with a clear message if it's missing rather than letting expressPay reject.
+     */
+    private Map<String, Object> expressPaySubmit(User user, BigDecimal amount, String orderId) {
 
         var postUrl = backendUrl + "/api/webhooks/expresspay";
+
+        var email = user.getEmail();
+        if (email == null || email.isBlank()) {
+            log.error("expressPaySubmit: ✗ orderId='{}' userId='{}' has no email — expressPay requires it",
+                    orderId, user.getId());
+            throw ApiException.badRequest("An email address is required to make a payment.");
+        }
+
+        // Optional-but-recommended customer fields, read defensively so this
+        // compiles against any User shape (see readUserField).
+        var firstName = readUserField(user, "getFirstName", "getFirstname", "getGivenName");
+        var lastName  = readUserField(user, "getLastName", "getLastname", "getSurname", "getFamilyName");
+        var phone     = readUserField(user, "getPhone", "getPhoneNumber", "getPhonenumber", "getMobile", "getMsisdn");
 
         var form = new LinkedMultiValueMap<String, String>();
         form.add("merchant-id", merchantId);
@@ -439,9 +472,16 @@ public class ExpressPayController {
         form.add("amount", amount.setScale(2, RoundingMode.HALF_UP).toPlainString());
         form.add("order-id", orderId);
         form.add("post-url", postUrl);
+        form.add("redirect-url", redirectUrl);   // LIVE-required
+        form.add("email", email);                // LIVE-required
+        addIfPresent(form, "firstname", firstName);
+        addIfPresent(form, "lastname", lastName);
+        addIfPresent(form, "phonenumber", phone);
 
-        log.info("expressPaySubmit: ▶ orderId='{}' amount={} postUrl='{}' merchantId='{}' apiKey='{}'",
-                orderId, amount, postUrl, merchantId, mask(apiKey));
+        log.info("expressPaySubmit: ▶ orderId='{}' amount={} postUrl='{}' redirectUrl='{}' email='{}' "
+                        + "firstnamePresent={} lastnamePresent={} phonePresent={} merchantId='{}' apiKey='{}'",
+                orderId, amount, postUrl, redirectUrl, maskEmail(email),
+                firstName != null, lastName != null, phone != null, merchantId, mask(apiKey));
 
         long startNanos = System.nanoTime();
         var result = expressPayPost("/api/direct/submit.php", form);
@@ -636,6 +676,33 @@ public class ExpressPayController {
 
     // ─── Small helpers ───────────────────────────────────────────────────────
 
+    /**
+     * Reads an optional String field from the User via the first getter name
+     * that exists, without a compile-time dependency on that getter. This keeps
+     * the controller compiling regardless of whether User exposes getFirstName(),
+     * getPhone(), getPhoneNumber(), etc. Returns null if none of the candidate
+     * getters exist or all return blank.
+     *
+     * NOTE: this is a pragmatic bridge so the LIVE required-fields fix (email,
+     * names, phone) works without hand-editing for your exact User shape. If you
+     * know the real getters, replacing these reflection calls with direct calls
+     * (e.g. user.getFirstName()) is cleaner and faster — do that when convenient.
+     */
+    private String readUserField(User user, String... getterNames) {
+        for (var getter : getterNames) {
+            try {
+                var m = user.getClass().getMethod(getter);
+                var val = m.invoke(user);
+                if (val != null && !val.toString().isBlank()) {
+                    return val.toString();
+                }
+            } catch (ReflectiveOperationException ignored) {
+                // getter doesn't exist on this User type — try the next candidate
+            }
+        }
+        return null;
+    }
+
     private void addIfPresent(MultiValueMap<String, String> form, String key, String value) {
         if (value != null && !value.isBlank()) {
             form.add(key, value);
@@ -668,6 +735,15 @@ public class ExpressPayController {
     private String maskPhone(String phone) {
         if (phone == null || phone.length() < 4) return "****";
         return "*".repeat(Math.max(0, phone.length() - 4)) + phone.substring(phone.length() - 4);
+    }
+
+    private String maskEmail(String email) {
+        if (email == null || !email.contains("@")) return "****";
+        var at = email.indexOf('@');
+        var name = email.substring(0, at);
+        var domain = email.substring(at);
+        var head = name.isEmpty() ? "" : name.substring(0, 1);
+        return head + "***" + domain;
     }
 
     private String last4(String cardNumber) {
