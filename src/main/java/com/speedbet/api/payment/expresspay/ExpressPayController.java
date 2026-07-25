@@ -111,18 +111,6 @@ public class ExpressPayController {
     private record PendingTx(UUID userId, BigDecimal amount, String intent, AtomicBoolean processed) {
     }
 
-    public record CardDetails(
-            String cardNumber,
-            String cardHolderName,
-            String cardExpiry,
-            String cardCvv,
-            String cardAddress,
-            String cardCity,
-            String cardState,
-            String cardZipcode,
-            String cardCountry) {
-    }
-
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
     @PostMapping("/api/wallet/deposit/expresspay/init")
@@ -146,13 +134,16 @@ public class ExpressPayController {
                 user.getId(), amount, orderId, pendingTransactions.size());
 
         var response = expressPaySubmit(user, amount, orderId);
+        var token = String.valueOf(response.get("token"));
+        var checkoutUrl = baseUrl + "/api/checkout.php?token=" + token;
 
         log.info("initDeposit: ✔ DONE expressPay status='{}' token-present={} orderId='{}' userId='{}'",
                 response.get("status"), response.get("token") != null, orderId, user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "token", response.get("token"),
-                "orderId", orderId
+                "token", token,
+                "orderId", orderId,
+                "checkoutUrl", checkoutUrl
         )));
     }
 
@@ -178,89 +169,29 @@ public class ExpressPayController {
                 user.getId(), amount, orderId, UPGRADE_INTENT_ADMIN);
 
         var response = expressPaySubmit(user, amount, orderId);
+        var token = String.valueOf(response.get("token"));
+        var checkoutUrl = baseUrl + "/api/checkout.php?token=" + token;
 
         log.info("initAdminUpgrade: ✔ DONE expressPay status='{}' token-present={} orderId='{}' userId='{}'",
                 response.get("status"), response.get("token") != null, orderId, user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "token", response.get("token"),
-                "orderId", orderId
+                "token", token,
+                "orderId", orderId,
+                "checkoutUrl", checkoutUrl
         )));
     }
 
-    // ─── Charge: Card (domestic + international) ────────────────────────────
+    // ─── Charge endpoints removed ──────────────────────────────────────────
+    //
+    // The former direct-charge endpoints (chargeCard / chargeMomo) and their
+    // helper handleCheckoutResult have been removed. We now use expressPay's
+    // HOSTED CHECKOUT: init returns a checkoutUrl, the browser is redirected
+    // there, the customer enters card/momo details ON EXPRESSPAY'S PAGE, and
+    // the payment is confirmed asynchronously via the webhook below (which
+    // re-confirms with query.php before crediting). Raw card data therefore
+    // never reaches this backend.
 
-    @PostMapping("/api/wallet/deposit/expresspay/charge/card")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> chargeCard(
-            @AuthenticationPrincipal User user,
-            @RequestBody Map<String, Object> req) {
-
-        log.info("chargeCard: ▶ START userId='{}'", user.getId());
-
-        var token = require(req, "token");
-        var card = new CardDetails(
-                require(req, "cardNumber"),
-                require(req, "cardHolderName"),
-                require(req, "cardExpiry"),
-                require(req, "cardCvv"),
-                (String) req.get("cardAddress"),
-                (String) req.get("cardCity"),
-                (String) req.get("cardState"),
-                (String) req.get("cardZipcode"),
-                (String) req.get("cardCountry")
-        );
-
-        log.info("chargeCard: userId='{}' token='{}' cardLast4='{}' country='{}'",
-                user.getId(), mask(token), last4(card.cardNumber()), card.cardCountry());
-
-        var result = expressPayCheckoutCard(token, card);
-        return handleCheckoutResult(user, result);
-    }
-
-    // ─── Charge: Mobile Money (incl. USSD-initiated payments) ──────────────────
-
-    @PostMapping("/api/wallet/deposit/expresspay/charge/momo")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> chargeMomo(
-            @AuthenticationPrincipal User user,
-            @RequestBody Map<String, Object> req) {
-
-        log.info("chargeMomo: ▶ START userId='{}'", user.getId());
-
-        var token           = require(req, "token");
-        var mobileNumber    = require(req, "mobileNumber");
-        var mobileNetwork   = require(req, "mobileNetwork"); // MTN_MM | AIRTEL_MM | TIGO_CASH | VODAFONE_CASH
-        var mobileAuthToken = (String) req.get("mobileAuthToken");
-
-        log.info("chargeMomo: userId='{}' token='{}' network='{}' number='{}' authTokenPresent={}",
-                user.getId(), mask(token), mobileNetwork, maskPhone(mobileNumber), mobileAuthToken != null);
-
-        var result = expressPayCheckoutMomo(token, mobileNumber, mobileNetwork, mobileAuthToken);
-        return handleCheckoutResult(user, result);
-    }
-
-    private ResponseEntity<ApiResponse<Map<String, Object>>> handleCheckoutResult(
-            User user, Map<String, Object> result) {
-
-        var resultCode = String.valueOf(result.get("result"));
-        var orderId    = String.valueOf(result.get("order-id"));
-
-        log.info("handleCheckoutResult: userId='{}' orderId='{}' resultCode='{}' text='{}'",
-                user.getId(), orderId, resultCode, result.get("result-text"));
-
-        if (RESULT_APPROVED.equals(resultCode)) {
-            log.info("handleCheckoutResult: ✔ APPROVED orderId='{}' userId='{}' — finalizing immediately",
-                    orderId, user.getId());
-            finalizeTransaction(orderId, String.valueOf(result.get("transaction-id")));
-        } else if (RESULT_PENDING.equals(resultCode)) {
-            log.info("handleCheckoutResult: ⏳ PENDING orderId='{}' userId='{}' — awaiting webhook callback",
-                    orderId, user.getId());
-        } else {
-            log.warn("handleCheckoutResult: ✗ NOT APPROVED orderId='{}' userId='{}' result='{}' text='{}'",
-                    orderId, user.getId(), resultCode, result.get("result-text"));
-        }
-
-        return ResponseEntity.ok(ApiResponse.ok(result));
-    }
 
     // ─── Webhook (post-url callback) ────────────────────────────────────────
 
@@ -484,7 +415,7 @@ public class ExpressPayController {
                 firstName != null, lastName != null, phone != null, merchantId, mask(apiKey));
 
         long startNanos = System.nanoTime();
-        var result = expressPayPost("/api/direct/submit.php", form);
+        var result = expressPayPost("/api/submit.php", form);
         long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
 
         var status = asInt(result.get("status"));
@@ -496,65 +427,6 @@ public class ExpressPayController {
             log.error("expressPaySubmit: ✗ orderId='{}' failed status={} body={}", orderId, status, result);
             throw new RuntimeException("expressPay submit failed for orderId=" + orderId + " (status=" + status + ")");
         }
-
-        return result;
-    }
-
-    /**
-     * Step 2a: Checkout — Card. Handles both domestic and international cards
-     * (Visa, Mastercard, Amex, Discover) — expressPay does not distinguish
-     * these at the API level, so no separate "international" call is needed.
-     */
-    private Map<String, Object> expressPayCheckoutCard(String token, CardDetails card) {
-
-        var form = new LinkedMultiValueMap<String, String>();
-        form.add("token", token);
-        form.add("card-number", card.cardNumber());
-        form.add("card-holder-name", card.cardHolderName());
-        form.add("card-expiry", card.cardExpiry());
-        form.add("card-cvv", card.cardCvv());
-        addIfPresent(form, "card-address", card.cardAddress());
-        addIfPresent(form, "card-city", card.cardCity());
-        addIfPresent(form, "card-state", card.cardState());
-        addIfPresent(form, "card-zipcode", card.cardZipcode());
-        addIfPresent(form, "card-country", card.cardCountry());
-
-        log.info("expressPayCheckoutCard: ▶ token='{}' cardLast4='{}' country='{}'",
-                mask(token), last4(card.cardNumber()), card.cardCountry());
-
-        long startNanos = System.nanoTime();
-        var result = expressPayPost("/api/direct/checkout.php", form);
-        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
-
-        log.info("expressPayCheckoutCard: ◀ token='{}' result={} text='{}' elapsedMs={}",
-                mask(token), result.get("result"), result.get("result-text"), elapsedMs);
-
-        return result;
-    }
-
-    /**
-     * Step 2b: Checkout — Mobile Money. The customer may complete authorization
-     * either in-app or by dialing expressPay's *246# USSD code — both surface
-     * here identically, there is no separate USSD endpoint.
-     */
-    private Map<String, Object> expressPayCheckoutMomo(String token, String mobileNumber,
-                                                       String mobileNetwork, String mobileAuthToken) {
-
-        var form = new LinkedMultiValueMap<String, String>();
-        form.add("token", token);
-        form.add("mobile-number", mobileNumber);
-        form.add("mobile-network", mobileNetwork);
-        addIfPresent(form, "mobile-auth-token", mobileAuthToken);
-
-        log.info("expressPayCheckoutMomo: ▶ token='{}' network='{}' number='{}' authTokenPresent={}",
-                mask(token), mobileNetwork, maskPhone(mobileNumber), mobileAuthToken != null);
-
-        long startNanos = System.nanoTime();
-        var result = expressPayPost("/api/direct/checkout.php", form);
-        long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000;
-
-        log.info("expressPayCheckoutMomo: ◀ token='{}' result={} text='{}' elapsedMs={}",
-                mask(token), result.get("result"), result.get("result-text"), elapsedMs);
 
         return result;
     }
@@ -732,11 +604,6 @@ public class ExpressPayController {
         return token.substring(0, 4) + "..." + token.substring(token.length() - 4);
     }
 
-    private String maskPhone(String phone) {
-        if (phone == null || phone.length() < 4) return "****";
-        return "*".repeat(Math.max(0, phone.length() - 4)) + phone.substring(phone.length() - 4);
-    }
-
     private String maskEmail(String email) {
         if (email == null || !email.contains("@")) return "****";
         var at = email.indexOf('@');
@@ -744,11 +611,6 @@ public class ExpressPayController {
         var domain = email.substring(at);
         var head = name.isEmpty() ? "" : name.substring(0, 1);
         return head + "***" + domain;
-    }
-
-    private String last4(String cardNumber) {
-        if (cardNumber == null || cardNumber.length() < 4) return "****";
-        return "****" + cardNumber.substring(cardNumber.length() - 4);
     }
 
     private String truncate(String s, int maxLen) {
