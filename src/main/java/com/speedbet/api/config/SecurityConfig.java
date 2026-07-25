@@ -347,7 +347,8 @@ public class SecurityConfig {
                 "https://africabett-admin.vercel.app",
                 "https://nex-bet-pink.vercel.app",
                 "https://www.bettnova.xyz",
-                "https://betnovasuper-admin.vercel.app"
+                "https://betnovasuper-admin.vercel.app",
+                "https://bet-nova-admin.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
