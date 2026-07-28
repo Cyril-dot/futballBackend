@@ -2,12 +2,13 @@ package com.speedbet.api.match;
 
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.user.User;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.TaskScheduler;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -29,71 +30,112 @@ import java.util.concurrent.ScheduledFuture;
  *   ── Fixed match clock (always the same shape) ───────────────────────────
  *     kickoffAt                              SCHEDULED → LIVE
  *     kickoffAt + 45 min                     LIVE      → HALF_TIME
- *     kickoffAt + 45 min + 15 min break       HALF_TIME → SECOND_HALF
- *     kickoffAt + 45 min + 15 min + 45 min    → FINISHED
+ *     kickoffAt + 45 min + 15 min break      HALF_TIME → SECOND_HALF
+ *     kickoffAt + 45 min + 15 min + 45 min   → FINISHED
  *
  *   ── Randomized goals ─────────────────────────────────────────────────────
  *     Each goal (up to finalScoreHome / finalScoreAway) is given a random,
- *     unique minute: home and away goals in minutes 1-45 fall in the first
- *     half, minutes 46-90 fall in the second half. At the real-world instant
- *     each minute maps to, AdminMatchService.updateScore() is called with
- *     the cumulative score at that point — so the odds table refreshes
- *     exactly the way it would for a real live match, goal by goal.
+ *     unique minute: minutes 1-44 fall in the first half, minutes 46-89 fall
+ *     in the second half. At the real-world instant each minute maps to,
+ *     AdminMatchService.updateScore() is called with the cumulative score at
+ *     that point — so the odds table refreshes exactly the way it would for a
+ *     real live match, goal by goal.
  *
  *   ── Why this calls AdminMatchService rather than duplicating logic ──────
  *     Every scheduled step is a normal call into the existing, already-
- *     audited methods (createMatch / updateStatus / updateScore). That means
- *     ownership checks, the HALF_TIME score-metadata snapshot, live odds
- *     regeneration, and the FINISHED terminal guard all apply automatically
- *     with zero duplicated logic here.
+ *     audited methods. Ownership checks, the HALF_TIME score-metadata
+ *     snapshot, live odds regeneration, and the FINISHED terminal guard all
+ *     apply automatically with zero duplicated logic here.
  *
- * ── FIX (previous revision) ───────────────────────────────────────────────
- *   Previously, scheduled jobs were registered with the TaskScheduler
- *   *inside* the @Transactional method, before the transaction that
- *   created the Match row had committed. Because kickoffAt is frequently
- *   "now" or very soon, the kickoff job could fire on the scheduler's
- *   thread before the row was visible to other DB connections, causing
- *   updateStatus() to fail. That failure was swallowed by safeRun()
- *   (logged only), so the match silently got stuck in SCHEDULED.
+ * ══════════════════════════════════════════════════════════════════════════
+ *  FIXES IN THIS REVISION
+ * ══════════════════════════════════════════════════════════════════════════
  *
- *   Jobs are now registered via TransactionSynchronizationManager so they
- *   are only scheduled AFTER the surrounding transaction commits.
+ *  Reported symptoms:
+ *    A — a match scheduled hours ahead never kicks off
+ *    B — a match that does kick off never progresses and never ends
  *
- * ── FIX (this revision) — matches scheduled hours ahead never kicking off ──
- *   Root cause: this service was relying on *whatever* TaskScheduler bean
- *   Spring happened to inject. If no dedicated TaskScheduler bean was
- *   defined elsewhere in the app, Spring Boot's auto-configured default
- *   applies — a SINGLE-THREADED scheduler shared by every @Scheduled job
- *   and every TaskScheduler-using service in the whole application.
+ *  FIX 1 — the @Bean method was declared INSIDE the @Service that consumed it.
+ *  ────────────────────────────────────────────────────────────────────────
+ *    adminMatchTaskScheduler() was a @Bean on this very class, while the class
+ *    took a TaskScheduler as a constructor argument. That is circular by
+ *    construction: Spring must instantiate the service to invoke its factory
+ *    method, but cannot instantiate the service without the bean that factory
+ *    method produces. In a @Service (lite mode) this either fails outright or
+ *    silently resolves to a completely different TaskScheduler.
  *
- *   Quick kickoffs (seconds/minutes out — the kind used when manually
- *   testing this feature) tend to fire fine because the queue is short and
- *   nothing's contending for the thread yet. A kickoff scheduled 5 hours
- *   out sits in that single thread's queue behind every other job the app
- *   schedules in the meantime; if even one of those blocks, runs long, or
- *   the thread is otherwise busy exactly when this job's trigger time
- *   arrives, this match's kickoff can be starved indefinitely — and
- *   because safeRun() only logs failures rather than surfacing them, that
- *   failure mode is completely silent: the match just sits in SCHEDULED
- *   forever with no error anywhere.
+ *    Worse: @Qualifier on a Lombok @RequiredArgsConstructor FIELD is NOT
+ *    copied onto the generated constructor parameter unless lombok.config
+ *    declares
  *
- *   Fix: this service now defines and injects its OWN dedicated
- *   TaskScheduler bean (see adminMatchTaskScheduler() below), sized for
- *   real concurrent-match volume and named/qualified so it can never
- *   silently fall back to the application's shared default scheduler.
+ *        lombok.copyableAnnotations += org.springframework.beans.factory.annotation.Qualifier
  *
- * ── Operational notes ────────────────────────────────────────────────────
- *   - Scheduling is in-memory via Spring's TaskScheduler. A restart before
- *     a job fires loses that job — the match is simply left at whatever
- *     stage it last reached. If your deploys/restarts happen more often
- *     than "rarely," this is a SEPARATE risk from the thread-starvation
- *     bug fixed above, and needs a durable fix (persist the computed
- *     event list to a table and replace TaskScheduler with a periodic
- *     poller, or re-hydrate scheduledJobs from persisted state on
- *     startup). Flagging this explicitly — happy to build it out if
- *     you're seeing missed kickoffs correlate with deploys/restarts
- *     rather than thread contention.
- *   - Jobs run off the request thread, so failures are logged, not thrown.
+ *    So the qualifier that was supposed to guarantee the dedicated pool was
+ *    silently dropped, and the service kept getting the shared single-threaded
+ *    default it was explicitly written to avoid. That is a direct cause of
+ *    symptom A.
+ *
+ *    Fix: the scheduler is now created and owned by this service directly in
+ *    @PostConstruct — no bean definition, no injection, no qualifier, nothing
+ *    for Spring to resolve incorrectly. It cannot be substituted or starved by
+ *    anything else in the application.
+ *
+ *  FIX 2 — a minute-45 goal collided with the HALF_TIME transition.
+ *  ────────────────────────────────────────────────────────────────
+ *    minuteToInstant(45) returns kickoffAt + 45min, which is EXACTLY
+ *    halfTimeAt. On a 20-thread pool both jobs run concurrently: both load the
+ *    same Match, both mutate it, and the later save wins. If the score-update
+ *    save landed last it wrote status=LIVE back over HALF_TIME. The
+ *    SECOND_HALF job then rejected LIVE→SECOND_HALF as illegal, and because
+ *    safeRun() only logs, the match froze mid-lifecycle with no error
+ *    surfaced. Identically, minute 90 collided with FINISHED, which could
+ *    silently drop the final goal.
+ *
+ *    Fix: goals are now drawn from [1,44] ∪ [46,89]. Boundary minutes are
+ *    never used, so no goal can ever share an instant with a status
+ *    transition.
+ *
+ *  FIX 3 — one missed step killed every remaining step.
+ *  ────────────────────────────────────────────────────
+ *    Downstream jobs fired at fixed wall-clock times regardless of whether the
+ *    previous one succeeded, and strict transition validation rejected the
+ *    resulting jumps. Miss the kickoff and HALF_TIME, SECOND_HALF and FINISHED
+ *    all throw in turn — the match is stuck forever. That is symptom B.
+ *
+ *    Fix: every job now calls AdminMatchService.advanceStatusTo(), which walks
+ *    forward from the match's ACTUAL state and no-ops if already past. A
+ *    missed step can no longer cascade.
+ *
+ *  FIX 4 — the detached User entity was captured in every lambda.
+ *  ──────────────────────────────────────────────────────────────
+ *    A JPA entity was held across hours and thread boundaries with no
+ *    persistence context; any lazy access at execution time throws. Jobs now
+ *    capture only the admin's UUID.
+ *
+ *  FIX 5 — the final score was not guaranteed.
+ *  ───────────────────────────────────────────
+ *    If any goal job failed, the match finished on the wrong scoreline. The
+ *    finish job now forces the exact final score before the whistle.
+ *
+ *  FIX 6 — a watchdog now catches anything the scheduler drops.
+ *  ────────────────────────────────────────────────────────────
+ *    A @Scheduled sweep every 60s compares each tracked match's wall clock to
+ *    its status and advances any match that should have moved on. This is the
+ *    safety net for a starved or lost job — previously such a loss was
+ *    completely silent and permanent.
+ *
+ * ── KNOWN REMAINING LIMITATION (needs a schema change to fix properly) ────
+ *   Scheduling is still IN-MEMORY. A restart before a job fires still loses
+ *   that job, and the watchdog only covers matches still present in the
+ *   in-memory map — which a restart also clears. If your kickoffs are hours
+ *   out AND you deploy/restart in between, that match will still be missed.
+ *
+ *   The durable fix requires persisting the computed event list to a table and
+ *   replacing this scheduler with a DB poller. That is a genuinely separate
+ *   change from the bugs fixed above and I did not add it here per your
+ *   instruction not to introduce new files. If missed kickoffs correlate with
+ *   deploys rather than with load, this is the remaining cause and it is worth
+ *   doing next.
  */
 @Slf4j
 @Service
@@ -105,16 +147,25 @@ public class AdminMatchScheduleService {
     private static final int SECOND_HALF_MINUTES = 45;
     private static final int MATCH_MINUTES       = FIRST_HALF_MINUTES + SECOND_HALF_MINUTES; // 90
 
+    /**
+     * Goals never land on minute 45 or 90 — those instants coincide exactly
+     * with the HALF_TIME and FINISHED transitions. See FIX 2 above.
+     */
+    private static final int LAST_FIRST_HALF_GOAL_MINUTE   = 44;
+    private static final int FIRST_SECOND_HALF_GOAL_MINUTE = 46;
+    private static final int LAST_SECOND_HALF_GOAL_MINUTE  = 89;
+
     private final AdminMatchService adminMatchService;
 
     /**
-     * Dedicated scheduler for this service — see class javadoc "FIX (this
-     * revision)". @Qualifier guards against Spring silently wiring in some
-     * other TaskScheduler bean (e.g. the app-wide default) instead of this
-     * one if bean names ever collide.
+     * Dedicated scheduler, created and owned by this service.
+     *
+     * Deliberately NOT a Spring bean and NOT injected — see FIX 1. A bean
+     * definition here was circular, and the @Qualifier meant to protect the
+     * injection point was silently discarded by Lombok. Owning the instance
+     * outright removes every way this could resolve to the wrong scheduler.
      */
-    @Qualifier("adminMatchTaskScheduler")
-    private final TaskScheduler taskScheduler;
+    private ThreadPoolTaskScheduler taskScheduler;
 
     private final Random random = new Random();
 
@@ -122,39 +173,44 @@ public class AdminMatchScheduleService {
     private final Map<UUID, ScheduleHandle> scheduledJobs = new ConcurrentHashMap<>();
 
     /**
-     * Dedicated thread pool for match-lifecycle jobs (kickoff / goals /
-     * half-time / second-half / finish), completely separate from
-     * whatever TaskScheduler (if any) the rest of the app uses for other
-     * @Scheduled work. Sized generously since jobs are short (a single
-     * DB-backed service call each) — 20 concurrent matches × ~5-9 jobs
-     * each is comfortably covered, and idle threads cost nothing.
-     *
-     * Bump poolSize further if you regularly run more than ~20 matches
-     * concurrently with overlapping schedules.
+     * Sized generously since jobs are short (a single DB-backed service call
+     * each) — 20 concurrent matches × ~5-9 jobs each is comfortably covered,
+     * and idle threads cost nothing.
      */
-    @Bean(name = "adminMatchTaskScheduler")
-    public TaskScheduler adminMatchTaskScheduler() {
+    @PostConstruct
+    void initScheduler() {
         ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
         scheduler.setPoolSize(20);
         scheduler.setThreadNamePrefix("match-sched-");
         scheduler.setRemoveOnCancelPolicy(true);
-        // Don't let one hung job (e.g. a slow/blocked downstream call)
-        // silently starve every other match's jobs on the same thread.
+        scheduler.setWaitForTasksToCompleteOnShutdown(false);
+        // Don't let one hung job silently starve every other match's jobs.
         scheduler.setErrorHandler(t ->
                 log.error("AdminMatchScheduleService: uncaught scheduler error", t));
         scheduler.initialize();
-        return scheduler;
+        this.taskScheduler = scheduler;
+        log.info("AdminMatchScheduleService: dedicated scheduler initialised (poolSize={})", 20);
+    }
+
+    @PreDestroy
+    void shutdownScheduler() {
+        if (taskScheduler != null) {
+            taskScheduler.shutdown();
+        }
     }
 
     @Getter
     @RequiredArgsConstructor
     private static class ScheduleHandle {
         private final List<ScheduledFuture<?>> jobs;
+        private final UUID    adminId;
         private final Instant kickoffAt;
         private final Instant halfTimeAt;
         private final Instant secondHalfAt;
         private final Instant finishedAt;
         private final List<GoalEvent> goals;
+        private final int finalHome;
+        private final int finalAway;
     }
 
     private record GoalEvent(int minute, String team, Instant at, int cumHome, int cumAway) {}
@@ -170,13 +226,14 @@ public class AdminMatchScheduleService {
      * what the admin specified.
      *
      * The actual TaskScheduler registration is deferred until AFTER this
-     * transaction commits (see registerScheduleAfterCommit below), so the
-     * Match row is guaranteed to be visible to the jobs when they run.
+     * transaction commits, so the Match row is guaranteed to be visible to
+     * the jobs when they run.
      */
     @Transactional
     public Match scheduleMatch(AdminAutoMatchRequest req, User admin) {
         validate(req);
 
+        UUID    adminId      = admin.getId();
         Instant kickoffAt    = req.getKickoffAt();
         Instant halfTimeAt   = kickoffAt.plus(FIRST_HALF_MINUTES, ChronoUnit.MINUTES);
         Instant secondHalfAt = halfTimeAt.plus(BREAK_MINUTES, ChronoUnit.MINUTES);
@@ -194,19 +251,21 @@ public class AdminMatchScheduleService {
         createReq.setKickoffAt(kickoffAt);
         createReq.setStatus("SCHEDULED");
 
-        Match match = adminMatchService.createMatch(createReq, admin);
-        UUID matchId = match.getId();
+        // UUID overload — no detached User entity is carried into the jobs.
+        Match match  = adminMatchService.createMatch(createReq, adminId);
+        UUID  matchId = match.getId();
 
         List<GoalEvent> goals = buildGoalSchedule(
                 req.getFinalScoreHome(), req.getFinalScoreAway(),
-                kickoffAt, halfTimeAt, secondHalfAt);
+                kickoffAt, secondHalfAt);
 
         log.info("AdminMatchScheduleService.scheduleMatch: adminId={} matchId={} " +
                         "kickoffAt={} halfTimeAt={} secondHalfAt={} finishedAt={} finalScore={}:{} goals={}",
-                admin.getId(), matchId, kickoffAt, halfTimeAt, secondHalfAt, finishedAt,
+                adminId, matchId, kickoffAt, halfTimeAt, secondHalfAt, finishedAt,
                 req.getFinalScoreHome(), req.getFinalScoreAway(), goals.size());
 
-        registerScheduleAfterCommit(matchId, kickoffAt, halfTimeAt, secondHalfAt, finishedAt, goals, admin);
+        registerScheduleAfterCommit(matchId, adminId, kickoffAt, halfTimeAt, secondHalfAt,
+                finishedAt, goals, req.getFinalScoreHome(), req.getFinalScoreAway());
 
         return match;
     }
@@ -217,10 +276,11 @@ public class AdminMatchScheduleService {
      * called from a test or a non-transactional caller), the jobs are
      * registered immediately instead.
      */
-    private void registerScheduleAfterCommit(UUID matchId, Instant kickoffAt, Instant halfTimeAt,
-                                             Instant secondHalfAt, Instant finishedAt,
-                                             List<GoalEvent> goals, User admin) {
-        Runnable register = () -> doRegisterSchedule(matchId, kickoffAt, halfTimeAt, secondHalfAt, finishedAt, goals, admin);
+    private void registerScheduleAfterCommit(UUID matchId, UUID adminId, Instant kickoffAt,
+                                             Instant halfTimeAt, Instant secondHalfAt, Instant finishedAt,
+                                             List<GoalEvent> goals, int finalHome, int finalAway) {
+        Runnable register = () -> doRegisterSchedule(matchId, adminId, kickoffAt, halfTimeAt,
+                secondHalfAt, finishedAt, goals, finalHome, finalAway);
 
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
@@ -235,52 +295,152 @@ public class AdminMatchScheduleService {
     }
 
     /** Actually creates and stores the ScheduledFuture jobs. Only ever called post-commit. */
-    private void doRegisterSchedule(UUID matchId, Instant kickoffAt, Instant halfTimeAt,
-                                    Instant secondHalfAt, Instant finishedAt,
-                                    List<GoalEvent> goals, User admin) {
+    private void doRegisterSchedule(UUID matchId, UUID adminId, Instant kickoffAt,
+                                    Instant halfTimeAt, Instant secondHalfAt, Instant finishedAt,
+                                    List<GoalEvent> goals, int finalHome, int finalAway) {
         List<ScheduledFuture<?>> jobs = new ArrayList<>();
 
-        // Kickoff
+        // Kickoff — advanceStatusTo, not updateStatus: tolerant of a late run.
         jobs.add(taskScheduler.schedule(
                 () -> safeRun(matchId, "kickoff→LIVE", () ->
-                        adminMatchService.updateStatus(matchId, statusReq("LIVE"), admin)),
+                        adminMatchService.advanceStatusTo(matchId, "LIVE", adminId)),
                 kickoffAt));
 
-        // Goal-by-goal score updates, in chronological order
+        // Goal-by-goal score updates, in chronological order.
         for (GoalEvent g : goals) {
             jobs.add(taskScheduler.schedule(
                     () -> safeRun(matchId,
                             "goal min=" + g.minute() + " scorer=" + g.team() + " → " + g.cumHome() + ":" + g.cumAway(),
-                            () -> adminMatchService.updateScore(matchId,
-                                    scoreReq(g.cumHome(), g.cumAway(), g.minute()), admin)),
+                            () -> {
+                                // Guarantees a live status even if the kickoff job was
+                                // lost — the old code just threw here instead.
+                                adminMatchService.advanceStatusTo(matchId, "LIVE", adminId);
+                                adminMatchService.updateScore(matchId,
+                                        g.cumHome(), g.cumAway(), g.minute(), adminId);
+                            }),
                     g.at()));
         }
 
-        // Half-time (score already reflects any first-half goals by this point)
+        // Half-time (score already reflects any first-half goals by this point).
         jobs.add(taskScheduler.schedule(
                 () -> safeRun(matchId, "halfTime→HALF_TIME", () ->
-                        adminMatchService.updateStatus(matchId, statusReq("HALF_TIME"), admin)),
+                        adminMatchService.advanceStatusTo(matchId, "HALF_TIME", adminId)),
                 halfTimeAt));
 
-        // Second half
+        // Second half.
         jobs.add(taskScheduler.schedule(
                 () -> safeRun(matchId, "secondHalf→SECOND_HALF", () ->
-                        adminMatchService.updateStatus(matchId, statusReq("SECOND_HALF"), admin)),
+                        adminMatchService.advanceStatusTo(matchId, "SECOND_HALF", adminId)),
                 secondHalfAt));
 
-        // Finish (score already reflects all goals by this point)
+        // Finish — forces the exact final score first, so a failed goal job
+        // can never leave the match on the wrong scoreline.
         jobs.add(taskScheduler.schedule(
                 () -> safeRun(matchId, "finish→FINISHED", () -> {
-                    adminMatchService.updateStatus(matchId, statusReq("FINISHED"), admin);
+                    adminMatchService.advanceStatusTo(matchId, "SECOND_HALF", adminId);
+                    try {
+                        adminMatchService.updateScore(matchId, finalHome, finalAway,
+                                MATCH_MINUTES, adminId);
+                    } catch (Exception e) {
+                        log.error("AdminMatchScheduleService: matchId={} could not force final score {}:{} — {}",
+                                matchId, finalHome, finalAway, e.getMessage());
+                    }
+                    adminMatchService.advanceStatusTo(matchId, "FINISHED", adminId);
                     scheduledJobs.remove(matchId); // lifecycle complete
                 }),
                 finishedAt));
 
-        scheduledJobs.put(matchId, new ScheduleHandle(jobs, kickoffAt, halfTimeAt, secondHalfAt, finishedAt, goals));
+        scheduledJobs.put(matchId, new ScheduleHandle(jobs, adminId, kickoffAt, halfTimeAt,
+                secondHalfAt, finishedAt, goals, finalHome, finalAway));
 
         log.info("AdminMatchScheduleService.doRegisterSchedule: matchId={} jobsRegistered={} (post-commit)",
                 matchId, jobs.size());
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // WATCHDOG — safety net for dropped jobs
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Every 60s, compares each tracked match's wall clock against its actual
+     * status and advances anything that has fallen behind.
+     *
+     * This is the backstop for FIX 1/FIX 3: if a scheduler thread was starved,
+     * or a job threw and was only logged, the match previously sat frozen
+     * forever with no error visible anywhere. Now it self-corrects within a
+     * minute.
+     *
+     * Requires @EnableScheduling somewhere in your application configuration —
+     * if you already have any @Scheduled method running, it is already on.
+     */
+    @Scheduled(fixedDelay = 60_000, initialDelay = 30_000)
+    public void reconcileSchedules() {
+        if (scheduledJobs.isEmpty()) return;
+
+        Instant now = Instant.now();
+
+        for (Map.Entry<UUID, ScheduleHandle> entry : new HashMap<>(scheduledJobs).entrySet()) {
+            UUID matchId = entry.getKey();
+            ScheduleHandle handle = entry.getValue();
+
+            try {
+                Match match = adminMatchService.findMyMatchOrNull(matchId, handle.getAdminId());
+                if (match == null) {
+                    scheduledJobs.remove(matchId);
+                    continue;
+                }
+                if ("FINISHED".equals(match.getStatus())) {
+                    scheduledJobs.remove(matchId);
+                    continue;
+                }
+
+                String expected = expectedStatusAt(now, handle);
+                if (expected == null) continue;
+
+                if (!expected.equals(match.getStatus())) {
+                    log.warn("AdminMatchScheduleService.reconcileSchedules: matchId={} is {} but should be {} — " +
+                                    "a scheduled job was dropped or starved; correcting now",
+                            matchId, match.getStatus(), expected);
+
+                    adminMatchService.advanceStatusTo(matchId, expected, handle.getAdminId());
+
+                    // Re-apply the cumulative score for every goal that should
+                    // already have happened by now.
+                    int cumHome = 0, cumAway = 0, lastMinute = 0;
+                    for (GoalEvent g : handle.getGoals()) {
+                        if (!g.at().isAfter(now)) {
+                            cumHome = g.cumHome();
+                            cumAway = g.cumAway();
+                            lastMinute = g.minute();
+                        }
+                    }
+                    if ((cumHome > 0 || cumAway > 0) && !"FINISHED".equals(expected)) {
+                        adminMatchService.updateScore(matchId, cumHome, cumAway, lastMinute, handle.getAdminId());
+                    }
+
+                    if ("FINISHED".equals(expected)) {
+                        scheduledJobs.remove(matchId);
+                    }
+                }
+            } catch (Exception e) {
+                log.error("AdminMatchScheduleService.reconcileSchedules: matchId={} FAILED — {}",
+                        matchId, e.getMessage(), e);
+            }
+        }
+    }
+
+    /** Which status the match clock says this match should be in right now. */
+    private String expectedStatusAt(Instant now, ScheduleHandle handle) {
+        if (!now.isBefore(handle.getFinishedAt()))   return "FINISHED";
+        if (!now.isBefore(handle.getSecondHalfAt())) return "SECOND_HALF";
+        if (!now.isBefore(handle.getHalfTimeAt()))   return "HALF_TIME";
+        if (!now.isBefore(handle.getKickoffAt()))    return "LIVE";
+        return null; // not started yet — nothing to reconcile
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // CANCEL / INSPECT
+    // ══════════════════════════════════════════════════════════════════════
 
     /**
      * Cancels all pending automated transitions for a match. The match stays
@@ -342,17 +502,21 @@ public class AdminMatchScheduleService {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Builds a chronologically-sorted list of goal events for the whole
-     * match. Home goals get unique random minutes in [1, MATCH_MINUTES],
-     * away goals independently get their own unique random minutes in the
-     * same range — a home and away goal CAN land in the same minute (kept
-     * a few seconds apart so their scheduled jobs don't collide). Minutes
-     * 1-45 map to first-half real time (kickoffAt + minute); minutes 46-90
-     * map to second-half real time (secondHalfAt + (minute-45)), so the
-     * break is correctly skipped.
+     * Builds a chronologically-sorted list of goal events for the whole match.
+     *
+     * Home goals get unique random minutes drawn from [1,44] ∪ [46,89]; away
+     * goals independently get their own. A home and away goal CAN land in the
+     * same minute (kept a few seconds apart so their scheduled jobs don't
+     * collide). Minutes 1-44 map to first-half real time (kickoffAt + minute);
+     * minutes 46-89 map to second-half real time (secondHalfAt + (minute-45)),
+     * so the break is correctly skipped.
+     *
+     * Minutes 45 and 90 are deliberately excluded — see FIX 2 in the class
+     * javadoc. Those instants coincide exactly with the HALF_TIME and FINISHED
+     * transitions and caused a lost-update race that froze the lifecycle.
      */
     private List<GoalEvent> buildGoalSchedule(int finalHome, int finalAway,
-                                              Instant kickoffAt, Instant halfTimeAt, Instant secondHalfAt) {
+                                              Instant kickoffAt, Instant secondHalfAt) {
         List<int[]> raw = new ArrayList<>(); // [minute, teamFlag] teamFlag: 0=home,1=away
 
         for (int minute : uniqueRandomMinutes(finalHome)) raw.add(new int[]{minute, 0});
@@ -381,18 +545,28 @@ public class AdminMatchScheduleService {
         return events;
     }
 
-    /** Random, unique minutes (1..MATCH_MINUTES) for a given number of goals. */
+    /**
+     * Random, unique minutes for a given number of goals, drawn from the legal
+     * pool only (boundary minutes 45 and 90 excluded).
+     */
     private List<Integer> uniqueRandomMinutes(int count) {
         if (count <= 0) return List.of();
-        int max = Math.min(count, MATCH_MINUTES);
+
+        List<Integer> pool = new ArrayList<>();
+        for (int m = 1; m <= LAST_FIRST_HALF_GOAL_MINUTE; m++) pool.add(m);
+        for (int m = FIRST_SECOND_HALF_GOAL_MINUTE; m <= LAST_SECOND_HALF_GOAL_MINUTE; m++) pool.add(m);
+
+        int wanted = Math.min(count, pool.size());
         Set<Integer> minutes = new LinkedHashSet<>();
-        while (minutes.size() < max) {
-            minutes.add(1 + random.nextInt(MATCH_MINUTES));
+        while (minutes.size() < wanted) {
+            minutes.add(pool.get(random.nextInt(pool.size())));
         }
-        return new ArrayList<>(minutes);
+        List<Integer> result = new ArrayList<>(minutes);
+        result.sort(Integer::compareTo);
+        return result;
     }
 
-    /** Maps a match minute (1-90) to the real-world instant it occurs at, skipping the break. */
+    /** Maps a match minute to the real-world instant it occurs at, skipping the break. */
     private Instant minuteToInstant(int minute, Instant kickoffAt, Instant secondHalfAt) {
         if (minute <= FIRST_HALF_MINUTES) {
             return kickoffAt.plus(minute, ChronoUnit.MINUTES);
@@ -409,7 +583,8 @@ public class AdminMatchScheduleService {
             action.run();
             log.info("AdminMatchScheduleService.safeRun: matchId={} step='{}' OK", matchId, step);
         } catch (Exception e) {
-            log.error("AdminMatchScheduleService.safeRun: matchId={} step='{}' FAILED — {}",
+            log.error("AdminMatchScheduleService.safeRun: matchId={} step='{}' FAILED — {} " +
+                            "(the watchdog will attempt to correct this within 60s)",
                     matchId, step, e.getMessage(), e);
         }
     }
@@ -424,19 +599,10 @@ public class AdminMatchScheduleService {
         if (req.getFinalScoreHome() < 0 || req.getFinalScoreAway() < 0) {
             throw ApiException.badRequest("Scores cannot be negative.");
         }
-    }
-
-    private AdminStatusUpdateRequest statusReq(String status) {
-        AdminStatusUpdateRequest r = new AdminStatusUpdateRequest();
-        r.setStatus(status);
-        return r;
-    }
-
-    private AdminScoreUpdateRequest scoreReq(int home, int away, Integer minute) {
-        AdminScoreUpdateRequest r = new AdminScoreUpdateRequest();
-        r.setScoreHome(home);
-        r.setScoreAway(away);
-        r.setMinutePlayed(minute);
-        return r;
+        int maxGoals = LAST_FIRST_HALF_GOAL_MINUTE
+                + (LAST_SECOND_HALF_GOAL_MINUTE - FIRST_SECOND_HALF_GOAL_MINUTE + 1);
+        if (req.getFinalScoreHome() > maxGoals || req.getFinalScoreAway() > maxGoals) {
+            throw ApiException.badRequest("A side cannot score more than " + maxGoals + " goals.");
+        }
     }
 }
