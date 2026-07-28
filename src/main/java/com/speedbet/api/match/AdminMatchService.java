@@ -105,6 +105,24 @@ import java.util.UUID;
  *    the match ACTUALLY is, applying every intermediate step in order, and is
  *    a no-op if the match is already at or past the requested state. It never
  *    moves a match backwards and never resurrects a FINISHED match.
+ *
+ *  FIX 4 — tickMinute(): the displayed clock now advances on its own.
+ *  ────────────────────────────────────────────────────────────────────
+ *    Before this fix, {@code minutePlayed} was only ever written in three
+ *    places: once to 0 on entering LIVE, forced to 45/90 on HALF_TIME /
+ *    SECOND_HALF / FINISHED, and as a side-effect of updateScore() — which
+ *    only runs when a goal happens. During any scoreless stretch of a live
+ *    match nothing touched the field at all, so the match was genuinely
+ *    LIVE in the database while the timer on screen sat frozen.
+ *
+ *    tickMinute() is a small, separate write path: it updates ONLY
+ *    minutePlayed, does not touch score, and does not regenerate odds (odds
+ *    already refresh on score changes and status transitions; the clock
+ *    itself doesn't need to move the price). It is intentionally monotonic —
+ *    it never moves the clock backwards — so it is safe to call from a
+ *    once-a-minute scheduled tick AND from the reconciliation watchdog
+ *    without the two ever fighting each other or undoing a more recent
+ *    goal-driven update.
  */
 @Slf4j
 @Service
@@ -302,7 +320,7 @@ public class AdminMatchService {
         if (!allowed.contains(target)) {
             throw ApiException.badRequest(
                     "Cannot transition from " + current + " to " + target +
-                    ". Allowed from " + current + ": " + allowed);
+                            ". Allowed from " + current + ": " + allowed);
         }
 
         log.info("AdminMatchService.updateStatus: adminId={} matchId={} {} → {}",
@@ -465,7 +483,7 @@ public class AdminMatchService {
         if (!LIVE_STATUSES.contains(status)) {
             throw ApiException.badRequest(
                     "Score updates are only allowed during live play. " +
-                    "Current status: " + status + ". Expected one of: " + LIVE_STATUSES);
+                            "Current status: " + status + ". Expected one of: " + LIVE_STATUSES);
         }
         if (scoreHome < 0 || scoreAway < 0) {
             throw ApiException.badRequest("Scores cannot be negative.");
@@ -488,6 +506,56 @@ public class AdminMatchService {
         persistLiveOdds(saved, "updateScore[" + scoreHome + ":" + scoreAway + "]");
 
         return saved;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // CLOCK TICK — keeps minutePlayed moving with no goal required
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Advances ONLY the displayed clock ({@code minutePlayed}). No score
+     * change, no odds regeneration — this exists purely so the timer keeps
+     * moving during a scoreless stretch of live play. See FIX 4 in the class
+     * javadoc for why this was missing.
+     *
+     * Deliberately monotonic and tolerant:
+     *   • silently no-ops if the match isn't in a LIVE_STATUSES state right
+     *     now (e.g. it already reached HALF_TIME/FINISHED, or hasn't kicked
+     *     off yet) — a late-firing tick must never drag the clock backwards
+     *     or fight a status transition
+     *   • silently no-ops if {@code minute} is not strictly ahead of the
+     *     current value — so an out-of-order tick, or one that raced a
+     *     goal-driven updateScore() call, can never undo a more recent value
+     *
+     * Called once a minute by AdminMatchScheduleService for the duration of
+     * each half, and again by the reconciliation watchdog so a dropped tick
+     * self-corrects within 60s exactly like a dropped status transition does.
+     *
+     * @throws ApiException 404 if match not found or owned by a different admin
+     */
+    @Transactional
+    @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
+    public void tickMinute(UUID matchId, int minute, UUID adminId) {
+        Match match = findOrThrow(matchId);
+        assertOwnership(match, adminId);
+
+        String status = match.getStatus();
+        if (!LIVE_STATUSES.contains(status)) {
+            log.debug("AdminMatchService.tickMinute: matchId={} status={} not live — ignoring stale tick(min={})",
+                    matchId, status, minute);
+            return;
+        }
+
+        Integer current = match.getMinutePlayed();
+        if (current != null && current >= minute) {
+            log.debug("AdminMatchService.tickMinute: matchId={} current minute {} already >= {} — ignoring",
+                    matchId, current, minute);
+            return;
+        }
+
+        match.setMinutePlayed(minute);
+        matchRepo.save(match);
+        log.debug("AdminMatchService.tickMinute: matchId={} minutePlayed → {}", matchId, minute);
     }
 
     // ══════════════════════════════════════════════════════════════════════
