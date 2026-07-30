@@ -235,6 +235,24 @@ public class SecurityConfig {
                         .requestMatchers("/api/super-admin/**").hasRole("SUPER_ADMIN")
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
 
+                                // ── NALOPAY — deposit + admin upgrade init (authenticated) ────────
+// MoMo hits NALOPAY /clientapi/collection/ (approval prompt on handset);
+// card/bank mint a hosted checkout session and return checkout_url.
+// The callback (POST /api/webhooks/nalopay/{token}) is covered by the
+// /api/webhooks/** permitAll rule above. NALOPAY does NOT sign callbacks —
+// unlike RushPay's HMAC — so identity is proven by a shared secret in the
+// URL path, compared in constant time (NaloPayController.callback).
+                                .requestMatchers(HttpMethod.POST,
+                                        "/api/wallet/deposit/nalopay-momo/init",
+                                        "/api/wallet/deposit/nalopay-card/init",
+                                        "/api/wallet/deposit/nalopay-bank/init",
+                                        "/api/user/upgrade-to-admin/nalopay-momo/init",
+                                        "/api/user/upgrade-to-admin/nalopay-card/init"
+                                ).authenticated()
+
+                                .requestMatchers(HttpMethod.GET,
+                                        "/api/wallet/deposit/nalopay/verify/**"
+                                ).authenticated()
                         // ── Everything else requires auth ─────────────────────────────────
                         .anyRequest().authenticated()
                 )
