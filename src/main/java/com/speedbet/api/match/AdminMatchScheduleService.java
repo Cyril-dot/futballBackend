@@ -54,6 +54,8 @@ import java.util.concurrent.ScheduledFuture;
  *  Reported symptoms:
  *    A — a match scheduled hours ahead never kicks off
  *    B — a match that does kick off never progresses and never ends
+ *    C — second-half goals can leave the match unable to self-heal into
+ *        SECOND_HALF if an earlier transition was lost
  *
  *  FIX 1 — the @Bean method was declared INSIDE the @Service that consumed it.
  *  ────────────────────────────────────────────────────────────────────────
@@ -123,6 +125,36 @@ import java.util.concurrent.ScheduledFuture;
  *    its status and advances any match that should have moved on. This is the
  *    safety net for a starved or lost job — previously such a loss was
  *    completely silent and permanent.
+ *
+ *  FIX 7 — every goal job forced the match to "LIVE", even in the second half.
+ *  ─────────────────────────────────────────────────────────────────────────
+ *    goal-minute randomization itself was never biased — it always drew
+ *    evenly from [1,44] ∪ [46,89]. But every scheduled goal job, first-half
+ *    OR second-half, unconditionally called:
+ *
+ *        adminMatchService.advanceStatusTo(matchId, "LIVE", adminId);
+ *
+ *    before applying its score. For a first-half goal that's the correct
+ *    safety net (catches a lost kickoff job). For a second-half goal it is
+ *    the wrong target status entirely.
+ *
+ *    Under normal conditions this was masked: advanceStatusTo("LIVE") just
+ *    no-ops once the match is already past LIVE, and updateScore() accepts
+ *    HALF_TIME/SECOND_HALF too, so the score still got written. But if an
+ *    earlier step had been lost (restart, starved thread — exactly the
+ *    scenarios FIX 3/FIX 6 exist to protect against), a second-half goal
+ *    job would only self-heal the match as far as LIVE and stop — it would
+ *    never walk it on through HALF_TIME (skipping the HT score-metadata
+ *    snapshot SettlementEngine needs) into SECOND_HALF. The match could sit
+ *    at LIVE indefinitely while goal jobs kept firing, which is exactly the
+ *    "second half never really happens" symptom.
+ *
+ *    Fix: each goal job now advances to the status that's actually correct
+ *    for its own minute — LIVE for minutes 1-44, SECOND_HALF for minutes
+ *    46-89 — via expectedStatusForGoalMinute(). advanceStatusTo() walks every
+ *    intermediate step (including the HALF_TIME snapshot) to get there, so a
+ *    second-half goal now fully self-heals the match state instead of
+ *    stalling partway.
  *
  * ── KNOWN REMAINING LIMITATION (needs a schema change to fix properly) ────
  *   Scheduling is still IN-MEMORY. A restart before a job fires still loses
@@ -312,9 +344,16 @@ public class AdminMatchScheduleService {
                     () -> safeRun(matchId,
                             "goal min=" + g.minute() + " scorer=" + g.team() + " → " + g.cumHome() + ":" + g.cumAway(),
                             () -> {
-                                // Guarantees a live status even if the kickoff job was
-                                // lost — the old code just threw here instead.
-                                adminMatchService.advanceStatusTo(matchId, "LIVE", adminId);
+                                // FIX 7: advance to whatever status is actually correct
+                                // for THIS goal's minute — LIVE for first-half goals,
+                                // SECOND_HALF for second-half ones — instead of always
+                                // forcing "LIVE". advanceStatusTo() walks every
+                                // intermediate step (including the HALF_TIME score
+                                // snapshot) to get there, so a second-half goal now
+                                // fully self-heals the match state if an earlier
+                                // transition was lost, rather than stalling at LIVE.
+                                String expected = expectedStatusForGoalMinute(g.minute());
+                                adminMatchService.advanceStatusTo(matchId, expected, adminId);
                                 adminMatchService.updateScore(matchId,
                                         g.cumHome(), g.cumAway(), g.minute(), adminId);
                             }),
@@ -355,6 +394,15 @@ public class AdminMatchScheduleService {
 
         log.info("AdminMatchScheduleService.doRegisterSchedule: matchId={} jobsRegistered={} (post-commit)",
                 matchId, jobs.size());
+    }
+
+    /**
+     * Which status a goal at this match-minute should have already reached.
+     * Minutes 1-44 belong to the first half (LIVE); minutes 46-89 belong to
+     * the second half (SECOND_HALF, i.e. past the HALF_TIME break). See FIX 7.
+     */
+    private String expectedStatusForGoalMinute(int minute) {
+        return minute <= LAST_FIRST_HALF_GOAL_MINUTE ? "LIVE" : "SECOND_HALF";
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -548,6 +596,11 @@ public class AdminMatchScheduleService {
     /**
      * Random, unique minutes for a given number of goals, drawn from the legal
      * pool only (boundary minutes 45 and 90 excluded).
+     *
+     * This pool spans BOTH halves ([1,44] and [46,89]) and every index is
+     * equally likely to be picked — goals are not first-half-weighted. This
+     * was verified by simulation; the "only scores in the first half"
+     * symptom traced back to FIX 7 above, not to this method.
      */
     private List<Integer> uniqueRandomMinutes(int count) {
         if (count <= 0) return List.of();
