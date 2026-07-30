@@ -28,53 +28,66 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * PotPay deposits — Ghana (ZaaPay/Flutterwave redirect checkout) + Nigeria (redirect
- * checkout via Flutterwave).
+ * PotPay deposits — Ghana (direct Mobile Money collect) + Nigeria (redirect checkout
+ * via Flutterwave).
  *
  * ── UPDATED (GH) ─────────────────────────────────────────────────────────────
- * PotPay's GH MoMo USSD-push collect API (NaloPay/HSTpay) is paused and no longer
- * used. GH collections now go through ZaaPay (Flutterwave) as a hosted redirect
- * checkout — card + Ghana Mobile Money (MTN, Telecel, AirtelTigo) selected on
- * Flutterwave's page. This makes the GH flow structurally identical to the NG
- * flow: initiate → checkout_url → customer pays → callback (untrusted hint) →
- * verify (source of truth).
+ * GH no longer uses a hosted redirect checkout page (ZaaPay/Flutterwave) or the old
+ * USSD-push collect API — both are retired; the old initiate endpoint now returns
+ * 410 Gone for GHS. GH collections are now a direct Mobile Money "collect" call:
+ * we send the customer's MoMo number + amount, PotPay pushes an approval prompt to
+ * their handset, and we poll verify until it clears. There is no checkout_url, no
+ * callback_url, and no browser redirect for GH anymore — the merchant builds its
+ * own UI and polls.
  *
- * GH also authenticates differently now: an API key with the `Api-Key` scheme,
- * NOT the merchant id / Bearer scheme that NG still uses.
+ * GH auth is unchanged from the last update: an API key with the `Api-Key` scheme
+ * (Bearer/Token also accepted by PotPay, but we keep Api-Key), NOT the merchant id
+ * / Bearer scheme that NG still uses.
  *
  * Aligned with the current PotPay merchant API docs:
  *
- *   GH initiate: POST {base}/api/merchant/gh/payments/initiate/   [Authorization: Api-Key {gh-api-key}]
- *                → { success, status, tx_ref, transaction_id, checkout_url, amount, currency, type }
- *   GH verify:   GET  {base}/api/merchant/gh/payments/verify/?transaction_id=...  (or ?tx_ref=...)
- *                → flat: { tx_ref, transaction_id, status, amount, currency, merchant_reference, payment_type }
+ *   GH collect: POST {base}/api/merchant/api/collect/            [Authorization: Api-Key {gh-api-key}]
+ *               body: { phone_number, amount, description? }
+ *               → { success, transaction_id, reference, status, amount, currency, type, message }
+ *   GH verify:  GET  {base}/api/merchant/api/verify/{transaction_id}/
+ *               → flat: { transaction_id, account, channel, gross_amount, net_amount, status, currency }
+ *
  *   NG initiate: POST {base}/api/merchant/ng/payments/initiate/   [Authorization: Bearer {merchant-id}]  (unchanged)
  *                → { success, tx_ref, transaction_id, checkout_url, amount, currency }
  *   NG verify:   GET  {base}/api/merchant/ng/payments/verify/?tx_ref=...
  *                → flat: { tx_ref, transaction_id, status, amount, currency, merchant_reference, payment_type }
  *
- *   Verify statuses:      pending | success | failed   (GH no longer has "decline" — that
- *                         was a USSD-push-only status; kept in isTerminalFailure() defensively).
- *   CALLBACK redirects (both markets) use a DIFFERENT vocabulary: successful | failed | pending.
- *   The callback status is never trusted anyway — we always re-verify server-side.
+ *   GH verify statuses:  pending | success | failed.
+ *   NG verify statuses:  pending | success | failed  (kept "decline" handling defensively —
+ *                        an artifact of an older, now-unused GH vocabulary).
+ *   NG CALLBACK redirect uses a DIFFERENT vocabulary: successful | failed | pending. The
+ *   callback status is never trusted anyway — we always re-verify server-side. GH has no
+ *   callback at all now.
  *
  * Crediting model (mirrors PaystackController.handleDeposit):
- *   1. Resolve owning userId — pending map first, then merchant_reference
- *      echoed back by PotPay ("order-{userId}-{uuid}", same scheme for GH and NG now).
+ *   1. Resolve owning userId.
+ *      - NG: pending map first, then merchant_reference echoed back by PotPay
+ *        ("order-{userId}-{uuid}").
+ *      - GH: pending map ONLY — the new collect/verify API does not accept or echo
+ *        back a merchant reference, so if the pending record is lost (restart / other
+ *        instance) the owner cannot be recovered automatically. See the log line in
+ *        settleGhanaDeposit() for manual reconciliation in that case.
  *   2. walletService.credit with a non-null idempotency ref (transaction_id / tx_ref).
  *      409 = already credited, swallowed.
  *   3. referralService.attributeCommission — never allowed to fail the deposit.
  *   4. Remove the pending record ONLY after a confirmed credit.
  *
  * Amount policy:
- *   PotPay's commission (GH ~15% now, NG 15%) is deducted from the MERCHANT payout,
- *   not added to what the customer pays. With credit-gross=true (default) the bettor
- *   is credited exactly what they paid and the platform absorbs the fee — identical
- *   to the Paystack flow. Set app.potpay.credit-gross=false to pass the fee on instead.
+ *   NG: PotPay's 15% commission is deducted from the MERCHANT payout, not added to what
+ *   the customer pays, so we compute net = gross × (1 - ngCommissionRate) ourselves.
+ *   GH: PotPay now computes and returns the net figure directly (net_amount in the verify
+ *   response) — no rate math needed on our side any more.
+ *   With credit-gross=true (default) the bettor is credited exactly what they paid
+ *   (gross) and the platform absorbs the fee, identical to the Paystack flow. Set
+ *   app.potpay.credit-gross=false to credit the net amount instead.
  *
  * NG SIDE IS UNCHANGED — same endpoints, same fields, same callback, same auth
- * (Bearer merchantId), same commission config. Only GH's transport, auth, and
- * owner-recovery mechanics were updated to match the new redirect-checkout API.
+ * (Bearer merchantId), same commission config.
  */
 @Slf4j
 @RestController
@@ -82,7 +95,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class PotPayController {
 
     @Value("${app.potpay.merchant-id}")                   private String     merchantId;   // NG auth — unchanged
-    @Value("${app.potpay.gh-api-key}")                     private String     ghApiKey;     // NEW — GH auth
+    @Value("${app.potpay.gh-api-key}")                     private String     ghApiKey;     // GH auth
     @Value("${app.potpay.base-url}")                      private String     rawBaseUrl;
 
     // Separate keys: app.platform.min-deposit-amount is shared with PaystackController
@@ -94,34 +107,31 @@ public class PotPayController {
 
     /**
      * MUST be the public URL of THIS Spring app (e.g. the Railway URL), NOT the
-     * frontend. PotPay redirects the customer's browser here after checkout; the
-     * ghanaCallback / nigeriaCallback handlers below verify server-side and then
-     * 302 the customer on to the frontend wallet page.
+     * frontend. Only used by NG now — PotPay redirects the customer's browser here
+     * after NG checkout; nigeriaCallback verifies server-side and then 302s the
+     * customer on to the frontend wallet page. GH has no redirect/callback any more.
      *
-     * Ensure BOTH "/app/wallet/potpay/gh/callback" and "/app/wallet/potpay/ng/callback"
-     * are permitAll() in SecurityConfig — these redirects carry no bearer token.
+     * Ensure "/app/wallet/potpay/ng/callback" is permitAll() in SecurityConfig — this
+     * redirect carries no bearer token. The old "/app/wallet/potpay/gh/callback" route
+     * can be removed from SecurityConfig; it is no longer registered here.
      */
     @Value("${app.potpay.backend-public-url}")            private String     backendPublicUrl;
 
     /**
      * true  (default): credit the bettor the full amount they paid; platform absorbs
      *                  PotPay's commission (matches Paystack behaviour).
-     * false: credit net of PotPay's commission (GH amount × (1-gh-rate), NG amount × (1-ng-rate)).
+     * false: credit net of PotPay's commission — NG: amount × (1 - ng-rate) computed
+     *        here; GH: net_amount as returned directly by PotPay's verify response.
      */
     @Value("${app.potpay.credit-gross:true}")             private boolean    creditGrossAmount;
 
     @Value("${app.potpay.ng-commission-rate:0.15}")       private BigDecimal ngCommissionRate;
 
-    // GH moved off the flat-fee USSD collect API onto ZaaPay/Flutterwave, whose
-    // commission is ~15% (admin-configurable per merchant per the docs), not the
-    // old collect API's 3%.
-    @Value("${app.potpay.gh-commission-rate:0.15}")       private BigDecimal ghCommissionRate;
-
     private static final Duration PENDING_TTL = Duration.ofHours(2);
 
-    // Echoed back verbatim by PotPay in verify responses — used to recover the owner
-    // when the in-memory pending map has been lost (restart / other instance).
-    // Both markets now use the same merchant_reference scheme.
+    // Echoed back verbatim by PotPay in NG verify responses — used to recover the
+    // owner when the in-memory pending map has been lost (restart / other instance).
+    // NOT available for GH under the new collect/verify API.
     private static final String NG_REFERENCE_PREFIX = "order-";
 
     private final Duration potpayTimeout       = Duration.ofSeconds(10);
@@ -158,7 +168,7 @@ public class PotPayController {
     private String ngAuthHeader() { return "Bearer " + merchantId; }
 
     // ════════════════════════════════════════════════════════════════════════
-    // GHANA (GHS · ZaaPay/Flutterwave redirect checkout)
+    // GHANA (GHS · direct Mobile Money collect — no redirect/checkout)
     // ════════════════════════════════════════════════════════════════════════
 
     @PostMapping("/api/wallet/deposit/potpay/gh/init")
@@ -170,101 +180,46 @@ public class PotPayController {
         if (amount.compareTo(minGhsDeposit) < 0)
             throw ApiException.badRequest("Minimum deposit is GHS " + minGhsDeposit);
 
-        var customerName = required(req, "customerName");
+        var phoneNumber = required(req, "phoneNumber");
 
-        // Format is load-bearing: echoed back as merchant_reference in verify,
-        // and parsed by userIdFromMerchantReference() to recover the owner.
-        var merchantReference = NG_REFERENCE_PREFIX + user.getId() + "-" + UUID.randomUUID();
+        log.info("initGhanaDeposit: userId='{}' amount={} phoneNumber='{}'",
+                user.getId(), amount, phoneNumber);
 
-        log.info("initGhanaDeposit: userId='{}' amount={} merchantReference='{}'",
-                user.getId(), amount, merchantReference);
-
-        // Callback must hit THIS backend — PotPay's redirect carries the result there,
-        // ghanaCallback verifies server-side, then forwards the customer to the frontend.
-        var response = potpayInitiateGhana(
-                amount, customerName,
-                backendPublicUrl + "/app/wallet/potpay/gh/callback",
-                "Deposit for user " + user.getId(),
-                merchantReference
-        );
+        var response = potpayCollectGhana(amount, phoneNumber, "Deposit for user " + user.getId());
 
         if (!Boolean.TRUE.equals(response.get("success"))) {
-            log.error("initGhanaDeposit: PotPay rejected initiate for userId='{}': {}", user.getId(), response);
+            log.error("initGhanaDeposit: PotPay rejected collect for userId='{}': {}", user.getId(), response);
             throw ApiException.badRequest("PotPay declined the payment request.");
         }
 
         var transactionId = string(response, "transaction_id");
-        var txRef         = string(response, "tx_ref");
-        var checkoutUrl   = string(response, "checkout_url");
+        var reference      = string(response, "reference");
 
         if (transactionId == null || transactionId.isBlank()) {
             log.error("initGhanaDeposit: missing 'transaction_id' for userId='{}'. Response: {}",
                     user.getId(), response);
             throw ApiException.badRequest("PotPay accepted the request but did not return a transaction id.");
         }
-        if (checkoutUrl == null || checkoutUrl.isBlank()) {
-            log.error("initGhanaDeposit: missing 'checkout_url' for userId='{}'. Response: {}", user.getId(), response);
-            throw ApiException.badRequest("PotPay did not return a checkout URL.");
-        }
 
-        // Keyed by transaction_id — matches the existing /gh/verify/{transactionId} path param.
+        // Keyed by transaction_id — matches the /gh/verify/{transactionId} path param.
+        // This is the ONLY place the userId is recorded for GH; the collect/verify API
+        // does not accept or echo back a merchant reference, so if this record is lost
+        // (restart / other instance) the owner cannot be auto-recovered.
         pendingTransactions.put(transactionId,
                 new PendingTx(user.getId(), amount, "GHS", "gh", Instant.now()));
 
-        log.info("initGhanaDeposit: pending txId='{}' txRef='{}' userId='{}'",
-                transactionId, txRef, user.getId());
+        log.info("initGhanaDeposit: pending txId='{}' reference='{}' userId='{}' — prompt sent to '{}'",
+                transactionId, reference, user.getId(), phoneNumber);
 
         var resBody = new HashMap<String, Object>();
         resBody.put("transactionId", transactionId);
-        resBody.put("reference",     txRef == null ? "" : txRef);
-        resBody.put("checkoutUrl",   checkoutUrl);
+        resBody.put("reference",     reference == null ? "" : reference);
         resBody.put("status",        "pending");
         resBody.put("amount",        response.getOrDefault("amount", ""));
+        resBody.put("message",       response.getOrDefault("message",
+                "Payment request sent. Approve the prompt on your phone."));
 
         return ResponseEntity.ok(ApiResponse.ok(resBody));
-    }
-
-    /**
-     * Browser redirect target from PotPay (ZaaPay/Flutterwave checkout). Query params
-     * use the CALLBACK vocabulary (successful|failed|pending) and are never trusted —
-     * we always re-verify, which returns the VERIFY vocabulary (success|failed|pending).
-     * Must be permitAll() — no auth on a provider redirect.
-     */
-    @GetMapping("/app/wallet/potpay/gh/callback")
-    public ResponseEntity<Void> ghanaCallback(
-            @RequestParam("tx_ref") String txRef,
-            @RequestParam(value = "status", required = false) String unverifiedStatus,
-            @RequestParam(value = "transaction_id", required = false) String transactionId) {
-
-        log.info("ghanaCallback: txRef='{}' transactionId='{}' unverifiedStatus='{}'",
-                txRef, transactionId, unverifiedStatus);
-
-        // Prefer transaction_id (our pending map key) when present; fall back to tx_ref.
-        var verifyKey = (transactionId != null && !transactionId.isBlank()) ? transactionId : txRef;
-
-        String uiStatus;
-        try {
-            var result = potpayVerifyGhana(verifyKey);
-            var status = statusOf(result);
-            log.info("ghanaCallback: verified key='{}' status='{}' rawPayload={}", verifyKey, status, result);
-
-            if (isSuccess(status)) {
-                settleGhanaDeposit(verifyKey, result, null);
-                uiStatus = "success";
-            } else if (isTerminalFailure(status)) {
-                pendingTransactions.remove(verifyKey);
-                uiStatus = "failed";
-            } else {
-                uiStatus = "pending";   // poller keeps watching it
-            }
-        } catch (Exception ex) {
-            log.error("ghanaCallback: verify failed key='{}' — leaving to poller", verifyKey, ex);
-            uiStatus = "pending";
-        }
-
-        var redirectUrl = frontendUrl + "/app/wallet?payment=" + uiStatus
-                + "&tx_ref=" + java.net.URLEncoder.encode(txRef, java.nio.charset.StandardCharsets.UTF_8);
-        return ResponseEntity.status(302).header("Location", redirectUrl).build();
     }
 
     @GetMapping("/api/wallet/deposit/potpay/gh/verify/{transactionId}")
@@ -292,6 +247,11 @@ public class PotPayController {
         return ResponseEntity.ok(ApiResponse.ok(resBody));
     }
 
+    /**
+     * No callback endpoint for GH any more — there's no redirect/browser leg to catch.
+     * The frontend is expected to poll verifyGhanaDeposit (or wait on this poller)
+     * every 5–10s per the docs until status leaves "pending".
+     */
     @Scheduled(fixedDelay = 30_000)
     public void pollPendingGhanaTransactions() {
         pendingTransactions.entrySet().stream()
@@ -323,24 +283,26 @@ public class PotPayController {
         try {
             var pending = pendingTransactions.get(transactionId);   // read, NOT remove
 
-            var userId = pending != null
-                    ? pending.userId()
-                    : userIdFromMerchantReference(string(verifyResult, "merchant_reference"));
+            // No merchant-reference fallback for GH under the new API — pending map is
+            // the only source of truth for the owner.
+            var userId = pending != null ? pending.userId() : null;
 
             if (userId == null) {
-                log.error("settleGhanaDeposit: cannot resolve owner for txId='{}' — MANUAL RECONCILIATION NEEDED. payload={}",
+                log.error("settleGhanaDeposit: cannot resolve owner for txId='{}' (no pending record — "
+                                + "restart/other-instance loss and GH's collect/verify API has no merchant "
+                                + "reference to recover from) — MANUAL RECONCILIATION NEEDED. payload={}",
                         transactionId, verifyResult);
                 return;
             }
             if (expectedUserId != null && !expectedUserId.equals(userId))
                 throw ApiException.badRequest("Transaction does not belong to this user.");
 
-            // New flat verify shape: single "amount" field (what the customer paid).
-            // ZaaPay's commission is deducted from the merchant payout, not from this figure.
-            var gross = firstDecimal(verifyResult, "amount");
+            // New flat verify shape: gross_amount (what the customer paid) + net_amount
+            // (what we actually receive, fee already deducted by PotPay).
+            var gross = firstDecimal(verifyResult, "gross_amount");
             if (gross == null && pending != null) gross = pending.grossAmount();
             if (gross == null || gross.signum() <= 0) {
-                log.error("settleGhanaDeposit: no usable amount for txId='{}' — payload={}", transactionId, verifyResult);
+                log.error("settleGhanaDeposit: no usable gross_amount for txId='{}' — payload={}", transactionId, verifyResult);
                 return;
             }
 
@@ -352,21 +314,28 @@ public class PotPayController {
                 return;
             }
 
-            var creditAmount = creditGrossAmount
-                    ? gross
-                    : gross.multiply(BigDecimal.ONE.subtract(ghCommissionRate));
-            creditAmount = creditAmount.setScale(2, RoundingMode.HALF_UP);
+            var net = firstDecimal(verifyResult, "net_amount");
+            if (net == null) {
+                // Should not happen per current docs — verify always returns net_amount.
+                // Fall back to crediting gross rather than blocking the deposit outright.
+                log.error("settleGhanaDeposit: verify response missing 'net_amount' for txId='{}' — "
+                        + "falling back to gross for net-credit calc. payload={}", transactionId, verifyResult);
+                net = gross;
+            }
 
-            var providerReference = string(verifyResult, "tx_ref");
-            var paymentType        = string(verifyResult, "payment_type");   // card | mobilemoneyghana
+            var creditAmount = (creditGrossAmount ? gross : net).setScale(2, RoundingMode.HALF_UP);
+
+            var account = string(verifyResult, "account");   // customer MoMo number
+            var channel = string(verifyResult, "channel");   // MTN | Telecel | AirtelTigo
 
             var metadata = new HashMap<String, Object>();
-            metadata.put("provider",    "potpay");
-            metadata.put("market",      "gh");
+            metadata.put("provider",      "potpay");
+            metadata.put("market",        "gh");
             metadata.put("transactionId", transactionId);
-            metadata.put("txRef",       providerReference == null ? "" : providerReference);
-            metadata.put("grossAmount", gross.toPlainString());
-            metadata.put("paymentType", paymentType == null ? "unknown" : paymentType);
+            metadata.put("account",       account == null ? "" : account);
+            metadata.put("channel",       channel == null ? "unknown" : channel);
+            metadata.put("grossAmount",   gross.toPlainString());
+            metadata.put("netAmount",     net.toPlainString());
 
             creditWallet(userId, creditAmount, transactionId, metadata, "GHS");
 
@@ -613,8 +582,8 @@ public class PotPayController {
     // Status + recovery helpers
     // ════════════════════════════════════════════════════════════════════════
 
-    /** Verify vocabulary is success|failed|pending; callback uses successful|failed|pending.
-     *  "decline" kept defensively — was the old GH USSD-push vocabulary and is now unused. */
+    /** Verify vocabulary is success|failed|pending; NG callback uses successful|failed|pending.
+     *  "decline" kept defensively — an artifact of an old, now-unused GH vocabulary. */
     private static boolean isSuccess(String status) {
         return "success".equals(status) || "successful".equals(status);
     }
@@ -637,8 +606,8 @@ public class PotPayController {
         return true;
     }
 
-    /** Parses the userId back out of "order-{userId}-{uuid}" (echoed as merchant_reference).
-     *  Shared by GH and NG now that both markets use the same reference scheme. */
+    /** Parses the userId back out of "order-{userId}-{uuid}" (echoed as merchant_reference
+     *  by NG only — GH's collect/verify API has no equivalent field). */
     private static UUID userIdFromMerchantReference(String merchantReference) {
         if (merchantReference == null || !merchantReference.startsWith(NG_REFERENCE_PREFIX)) return null;
         var rest = merchantReference.substring(NG_REFERENCE_PREFIX.length());
@@ -654,21 +623,17 @@ public class PotPayController {
     // PotPay API helpers
     // ════════════════════════════════════════════════════════════════════════
 
-    private Map<String, Object> potpayInitiateGhana(BigDecimal amount, String customerName,
-                                                    String callbackUrl, String narration,
-                                                    String merchantReference) {
+    private Map<String, Object> potpayCollectGhana(BigDecimal amount, String phoneNumber, String description) {
         var body = new HashMap<String, Object>();
-        body.put("amount",             amount);
-        body.put("customer_name",      customerName);
-        body.put("callback_url",       callbackUrl);
-        body.put("narration",          narration);
-        body.put("merchant_reference", merchantReference);
-        return callPotPay("POST", "/api/merchant/gh/payments/initiate/", body, ghAuthHeader());
+        body.put("phone_number", phoneNumber);
+        body.put("amount",       amount);
+        body.put("description",  description);
+        return callPotPay("POST", "/api/merchant/api/collect/", body, ghAuthHeader());
     }
 
     private Map<String, Object> potpayVerifyGhana(String transactionId) {
-        return callPotPay("GET", "/api/merchant/gh/payments/verify/?transaction_id="
-                        + java.net.URLEncoder.encode(transactionId, java.nio.charset.StandardCharsets.UTF_8),
+        return callPotPay("GET", "/api/merchant/api/verify/"
+                        + java.net.URLEncoder.encode(transactionId, java.nio.charset.StandardCharsets.UTF_8) + "/",
                 null, ghAuthHeader());
     }
 
@@ -695,13 +660,13 @@ public class PotPayController {
     /**
      * Resilience:
      *   - 10s timeout per attempt.
-     *   - Retries ONLY on GET (verify). Retrying POST /initiate/ after a timeout can
-     *     create a SECOND checkout session while we track only one tx ref — a real
-     *     double-charge risk, so POSTs fail fast.
+     *   - Retries ONLY on GET (verify). Retrying POST after a timeout can trigger a
+     *     SECOND MoMo prompt / checkout session while we track only one tx ref — a
+     *     real double-charge risk, so POSTs (collect / initiate) fail fast.
      *   - 4xx → ApiException (surfaces PotPay's validation message).
      *   - 5xx / network → PotPayUnavailableException.
      *
-     * authHeader is now passed in per-call since GH and NG use different schemes
+     * authHeader is passed in per-call since GH and NG use different schemes
      * (GH: "Api-Key {key}", NG: "Bearer {merchantId}").
      */
     @SuppressWarnings("unchecked")
@@ -771,7 +736,7 @@ public class PotPayController {
         return value == null ? null : value.toString();
     }
 
-    /** Docs return amounts as strings ("100.00", "5000.00"); tolerate "1,000.00" too. */
+    /** Docs return amounts as strings ("50.00", "48.50"); tolerate "1,000.00" too. */
     private static BigDecimal firstDecimal(Map<String, Object> src, String... keys) {
         for (var key : keys) {
             var value = src == null ? null : src.get(key);
