@@ -37,7 +37,7 @@ public class WithdrawalService {
     private final WithdrawalEmailService      withdrawalEmailService;
     private final WithdrawalSmsService        withdrawalSmsService;
 
-    @Value("${app.withdrawal.min-amount:2000}")
+    @Value("${app.withdrawal.min-amount:5}")
     private BigDecimal minWithdrawalAmount;
 
     // ─────────────────────────────────────────────────────────────────────────
