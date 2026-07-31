@@ -23,6 +23,21 @@ public class SuperAdminDtos {
             String currency
     ) {}
 
+    public record AdminCommissionPeriodDto(
+            String periodLabel,
+            UUID adminId,
+            String adminEmail,
+            BigDecimal amount,
+            String currency
+    ) {}
+
+    public record PlatformPeriodTotalDto(
+            String periodLabel,
+            BigDecimal amount,
+            long count,
+            String currency
+    ) {}
+
     // Inside SuperAdminDtos class
 
     public record UserStatusUpdateDto(

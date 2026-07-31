@@ -140,4 +140,9 @@ public interface TransactionRepository
         Instant getBucketDate();
         BigDecimal getTotal();
     }
+
+    @Query("SELECT t FROM Transaction t " +
+            "WHERE t.kind = :kind AND t.createdAt >= :since ORDER BY t.createdAt ASC")
+    List<Transaction> findAllByKindSince(@Param("kind") TxKind kind, @Param("since") Instant since);
+
 }
