@@ -53,6 +53,9 @@ public class WithdrawalService {
                     + "Please wait for it to be processed before submitting a new one.");
         }
 
+        if (req.getAmount() == null) {
+            throw ApiException.badRequest("Amount is required");
+        }
         if (req.getAmount().compareTo(minWithdrawalAmount) < 0) {
             throw ApiException.badRequest("Minimum withdrawal amount is " + minWithdrawalAmount);
         }
@@ -81,18 +84,18 @@ public class WithdrawalService {
                 .network(req.getNetwork())
                 .build();
 
-        request = withdrawalRepo.save(request);
+        final WithdrawalRequest savedRequest = withdrawalRepo.save(request);
 
-        Transaction holdTx = txRepo.save(Transaction.builder()
+        txRepo.save(Transaction.builder()
                 .walletId(wallet.getId())
                 .kind(TxKind.WITHDRAW_HOLD)
                 .amount(req.getAmount().negate())
                 .balanceAfter(newBalance)
-                .providerRef(request.getId().toString())
-                .metadata(Map.of("withdrawalRequestId", request.getId().toString()))
+                .providerRef(savedRequest.getId().toString())
+                .metadata(Map.of("withdrawalRequestId", savedRequest.getId().toString()))
                 .build());
 
-        auditService.log(user.getId(), "WITHDRAWAL_REQUESTED", "WithdrawalRequest", request.getId(),
+        auditService.log(user.getId(), "WITHDRAWAL_REQUESTED", "WithdrawalRequest", savedRequest.getId(),
                 null, Map.of(
                         "amount",   req.getAmount().toString(),
                         "method",   req.getMethod() != null ? req.getMethod() : "mobile_money",
@@ -100,22 +103,23 @@ public class WithdrawalService {
                 null);
 
         log.info("Withdrawal request {} created for user {} — amount {} {}",
-                request.getId(), userId, req.getAmount(),
-                req.getCurrency() != null ? req.getCurrency() : "GHS");
+                savedRequest.getId(), userId, req.getAmount(), savedRequest.getCurrency());
 
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        String smsTarget = resolvePhoneForSms(request.getAccountNumber(), user.getPhone());
-        withdrawalSmsService.                                                                                                                                                                                                                                                                    notifyWithdrawalPending(
-                smsTarget,
-                user.getFirstName(),
-                request.getAccountName(),        // MoMo account name entered by user
-                request.getAmount(),
-                newBalance,
-                null,                            // reference — not included in SMS
-                LocalDateTime.now()
-        );
+        // The greeting name is the account name entered on the withdrawal form,
+        // falling back to the profile first name only when it is blank.
+        notifySafely("withdrawal-pending", savedRequest.getId(), () ->
+                withdrawalSmsService.notifyWithdrawalPending(
+                        resolvePhoneForSms(savedRequest.getAccountNumber(), user.getPhone()),
+                        resolveDisplayName(savedRequest.getAccountName(), user.getFirstName()),
+                        savedRequest.getAccountName(),
+                        savedRequest.getAmount(),
+                        newBalance,
+                        null,                            // reference — not included in SMS
+                        LocalDateTime.now()
+                ));
 
-        return WithdrawalDto.from(request);
+        return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -143,21 +147,23 @@ public class WithdrawalService {
                         "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        final var u   = savedRequest.getUser();
+        final var u = savedRequest.getUser();
         final LocalDateTime now = LocalDateTime.now();
 
         // ── Email → all ADMIN and SUPER_ADMIN users ──────────────────────────
-        var admins = userRepo.findByRoleIn(List.of(UserRole.ADMIN, UserRole.SUPER_ADMIN));
-        admins.forEach(a -> withdrawalEmailService.notifyConfirmed(
-                a.getEmail(),
-                a.getFirstName(),
-                a.getLastName(),
-                a.getPhone(),
-                a.getCountry(),
-                savedRequest.getAmount(),
-                savedRequest.getCurrency(),
-                now
-        ));
+        notifySafely("approve-admin-email", requestId, () -> {
+            var admins = userRepo.findByRoleIn(List.of(UserRole.ADMIN, UserRole.SUPER_ADMIN));
+            admins.forEach(a -> withdrawalEmailService.notifyConfirmed(
+                    a.getEmail(),
+                    a.getFirstName(),
+                    a.getLastName(),
+                    a.getPhone(),
+                    a.getCountry(),
+                    savedRequest.getAmount(),
+                    savedRequest.getCurrency(),
+                    now
+            ));
+        });
 
         // ── Resolve wallet balance after the hold deduction ───────────────────
         BigDecimal walletBalance = walletRepo.findByUserId(u.getId())
@@ -168,18 +174,18 @@ public class WithdrawalService {
         BigDecimal fee = BigDecimal.ZERO;
 
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
-        withdrawalSmsService.notifyWithdrawalApproved(
-                smsTarget,
-                u.getFirstName(),
-                savedRequest.getAccountName(),   // MoMo account name entered by user
-                savedRequest.getAmount(),
-                fee,
-                walletBalance,
-                null,   // transactionId — not included in SMS
-                null,   // reference — not included in SMS
-                now
-        );
+        notifySafely("withdrawal-approved", requestId, () ->
+                withdrawalSmsService.notifyWithdrawalApproved(
+                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
+                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
+                        savedRequest.getAccountName(),
+                        savedRequest.getAmount(),
+                        fee,
+                        walletBalance,
+                        null,   // transactionId — not included in SMS
+                        null,   // reference — not included in SMS
+                        now
+                ));
 
         return WithdrawalDto.from(savedRequest);
     }
@@ -229,36 +235,38 @@ public class WithdrawalService {
                         "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        final var u   = savedRequest.getUser();
+        final var u = savedRequest.getUser();
         final LocalDateTime now = LocalDateTime.now();
 
         // ── Email → all ADMIN and SUPER_ADMIN users ──────────────────────────
-        var admins = userRepo.findByRoleIn(List.of(UserRole.ADMIN, UserRole.SUPER_ADMIN));
-        admins.forEach(a -> withdrawalEmailService.notifyRejected(
-                a.getEmail(),
-                a.getFirstName(),
-                a.getLastName(),
-                a.getPhone(),
-                a.getCountry(),
-                savedRequest.getAmount(),
-                savedRequest.getCurrency(),
-                note,
-                now
-        ));
+        notifySafely("reject-admin-email", requestId, () -> {
+            var admins = userRepo.findByRoleIn(List.of(UserRole.ADMIN, UserRole.SUPER_ADMIN));
+            admins.forEach(a -> withdrawalEmailService.notifyRejected(
+                    a.getEmail(),
+                    a.getFirstName(),
+                    a.getLastName(),
+                    a.getPhone(),
+                    a.getCountry(),
+                    savedRequest.getAmount(),
+                    savedRequest.getCurrency(),
+                    note,
+                    now
+            ));
+        });
 
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
-        withdrawalSmsService.notifyWithdrawalRejected(
-                smsTarget,
-                u.getFirstName(),
-                savedRequest.getAccountName(),   // MoMo account name entered by user
-                savedRequest.getAmount(),
-                note,
-                restoredBalance,
-                null,   // transactionId — not included in SMS
-                null,   // reference — not included in SMS
-                now
-        );
+        notifySafely("withdrawal-rejected", requestId, () ->
+                withdrawalSmsService.notifyWithdrawalRejected(
+                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
+                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
+                        savedRequest.getAccountName(),
+                        savedRequest.getAmount(),
+                        note,
+                        restoredBalance,
+                        null,   // transactionId — not included in SMS
+                        null,   // reference — not included in SMS
+                        now
+                ));
 
         return WithdrawalDto.from(savedRequest);
     }
@@ -293,7 +301,7 @@ public class WithdrawalService {
                         "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        final var u   = savedRequest.getUser();
+        final var u = savedRequest.getUser();
         final LocalDateTime now = LocalDateTime.now();
 
         // ── Balance is unchanged at settle time (the hold already deducted it) ─
@@ -305,18 +313,18 @@ public class WithdrawalService {
         BigDecimal fee = BigDecimal.ZERO;
 
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
-        withdrawalSmsService.notifyWithdrawalSettled(
-                smsTarget,
-                u.getFirstName(),
-                savedRequest.getAccountName(),   // MoMo account name entered by user
-                savedRequest.getAmount(),
-                fee,
-                walletBalance,
-                null,   // transactionId — not included in SMS
-                null,   // reference — not included in SMS
-                now
-        );
+        notifySafely("withdrawal-settled", requestId, () ->
+                withdrawalSmsService.notifyWithdrawalSettled(
+                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
+                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
+                        savedRequest.getAccountName(),
+                        savedRequest.getAmount(),
+                        fee,
+                        walletBalance,
+                        null,   // transactionId — not included in SMS
+                        null,   // reference — not included in SMS
+                        now
+                ));
 
         return WithdrawalDto.from(savedRequest);
     }
@@ -368,17 +376,17 @@ public class WithdrawalService {
         final var u = savedRequest.getUser();
 
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
-        withdrawalSmsService.notifyWithdrawalFailed(
-                smsTarget,
-                u.getFirstName(),
-                savedRequest.getAccountName(),   // MoMo account name entered by user
-                savedRequest.getAmount(),
-                note,
-                restoredBalance,
-                null,   // reference — not included in SMS
-                LocalDateTime.now()
-        );
+        notifySafely("withdrawal-failed", requestId, () ->
+                withdrawalSmsService.notifyWithdrawalFailed(
+                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
+                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
+                        savedRequest.getAccountName(),
+                        savedRequest.getAmount(),
+                        note,
+                        restoredBalance,
+                        null,   // reference — not included in SMS
+                        LocalDateTime.now()
+                ));
 
         return WithdrawalDto.from(savedRequest);
     }
@@ -461,5 +469,39 @@ public class WithdrawalService {
             return accountNumber;
         }
         return profilePhone;
+    }
+
+    /**
+     * The name shown in withdrawal notifications is the account name the user
+     * typed on the withdrawal form — that's the name the money is actually
+     * going to, and the one they expect to see confirmed back to them. The
+     * profile first name is only a fallback for older requests that were saved
+     * without an account name.
+     */
+    private String resolveDisplayName(String accountName, String profileFirstName) {
+        if (accountName != null && !accountName.isBlank()) {
+            return accountName.trim();
+        }
+        return profileFirstName;
+    }
+
+    /**
+     * Sends a notification without letting a messaging failure take the
+     * surrounding transaction down with it.
+     *
+     * Previously an SMS or email exception propagated out of these
+     * @Transactional methods, which rolled back the withdrawal row, the balance
+     * change and the ledger entry — the user got a 500 and nothing was saved
+     * even though the money movement itself had succeeded. A notification is
+     * not worth reversing a financial operation over; if it fails we log it and
+     * carry on.
+     */
+    private void notifySafely(String label, UUID requestId, Runnable action) {
+        try {
+            action.run();
+        } catch (Exception e) {
+            log.error("Notification '{}' failed for withdrawal {} — the withdrawal itself was not affected",
+                    label, requestId, e);
+        }
     }
 }
