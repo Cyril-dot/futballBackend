@@ -1,4 +1,3 @@
-
 package com.speedbet.api.superadmin;
 
 import com.speedbet.api.common.ApiResponse;
@@ -10,7 +9,10 @@ import org.springframework.web.bind.annotation.*;
 import java.util.List;
 
 @RestController
-@RequestMapping("/api/superadmin/deposits")
+@RequestMapping({
+        "/api/super-admin/deposits",
+        "/api/superadmin/deposits"
+})
 @PreAuthorize("hasRole('SUPER_ADMIN')")
 @RequiredArgsConstructor
 public class SuperAdminDepositController {

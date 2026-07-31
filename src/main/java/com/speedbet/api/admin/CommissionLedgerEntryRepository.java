@@ -24,8 +24,9 @@ public interface CommissionLedgerEntryRepository extends JpaRepository<Commissio
             @Param("adminId") UUID adminId,
             @Param("since") Instant since);
 
-    @Query("SELECT c FROM CommissionLedgerEntry c " +
-            "WHERE c.createdAt >= :since ORDER BY c.createdAt ASC")
+    @Query("select c from CommissionLedgerEntry c " +
+            "where c.createdAt >= :since " +
+            "order by c.createdAt asc")
     List<CommissionLedgerEntry> findAllSince(@Param("since") Instant since);
 }
 

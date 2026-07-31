@@ -8,8 +8,20 @@ import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
 
+/**
+ * Mapped under BOTH "/api/super-admin/**" (hyphenated — what the frontend and
+ * every other super-admin controller uses) and the legacy "/api/superadmin/**"
+ * so any existing callers don't break.
+ *
+ * The missing hyphen here was the original cause of the 500s: no handler
+ * matched, and the catch-all @ExceptionHandler(Exception.class) converted the
+ * resulting NoResourceFoundException into a 500 instead of a 404.
+ */
 @RestController
-@RequestMapping("/api/superadmin/commission")
+@RequestMapping({
+        "/api/super-admin/commission",
+        "/api/superadmin/commission"
+})
 @PreAuthorize("hasRole('SUPER_ADMIN')")
 @RequiredArgsConstructor
 public class SuperAdminCommissionController {
