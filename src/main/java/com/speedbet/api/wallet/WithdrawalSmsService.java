@@ -6,8 +6,24 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 
+/**
+ * Sends the user-facing SMS for every stage of the withdrawal lifecycle.
+ *
+ * Lifecycle → SMS mapping:
+ *
+ *   PENDING   (user submits)          → notifyWithdrawalPending(...)
+ *   APPROVED  (admin approves)        → notifyWithdrawalApproved(...)   "on its way"
+ *   SETTLED   (super admin settles)   → notifyWithdrawalSettled(...)    "has been sent to you"
+ *   REJECTED  (admin rejects)         → notifyWithdrawalRejected(...)
+ *   FAILED    (super admin marks failed) → notifyWithdrawalFailed(...)
+ *
+ * No method sends more than one SMS. The old "probe" message that was fired
+ * before every confirmation/rejection has been removed — it was telling
+ * rejected users that their money was on its way.
+ */
 @Service
 @RequiredArgsConstructor
 @Slf4j
@@ -15,7 +31,7 @@ public class WithdrawalSmsService {
 
     private final ArkeselSmsService arkeselSmsService;
 
-    @Value("${app.site.name:OddsKingBet}")
+    @Value("${app.site.name:HootBet}")
     private String siteName;
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -23,17 +39,240 @@ public class WithdrawalSmsService {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Formats a BigDecimal amount for display, stripping unnecessary trailing
-     * zeros (e.g. 2000.0000 → "2000", 150.50 → "150.5").
+     * Formats a BigDecimal for display as money with exactly two decimals
+     * (e.g. 50000 → "50000.00", 150.5 → "150.50", 2000.0000 → "2000.00").
      */
     private String formatAmount(BigDecimal amount) {
-        return amount.stripTrailingZeros().toPlainString();
+        return amount.setScale(2, RoundingMode.HALF_UP).toPlainString();
+    }
+
+    /**
+     * Prefers the MoMo account name the user typed in; falls back to their
+     * profile first name, then to a neutral greeting.
+     */
+    private String resolveDisplayName(String accountName, String firstName) {
+        if (accountName != null && !accountName.isBlank()) {
+            return accountName;
+        }
+        if (firstName != null && !firstName.isBlank()) {
+            return firstName;
+        }
+        return "Customer";
+    }
+
+    /**
+     * Returns true when the message can be sent. Logs and returns false when
+     * required data is missing.
+     */
+    private boolean canSend(String stage, String phoneNumber, String firstName, BigDecimal amount) {
+        if (phoneNumber == null || phoneNumber.isBlank()) {
+            log.warn("{}: SKIPPED — phoneNumber is null or blank (firstName='{}' amount={})",
+                    stage, firstName, amount);
+            return false;
+        }
+        if (amount == null) {
+            log.warn("{}: SKIPPED — amount is null (phone='{}' firstName='{}')",
+                    stage, phoneNumber, firstName);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Single dispatch point — never lets an SMS failure bubble up and break the
+     * caller's transaction.
+     */
+    private void dispatch(String stage, String phoneNumber, String message) {
+        log.info("{}: sending SMS — phone='{}' messageLength={}", stage, phoneNumber, message.length());
+        log.debug("{}: message body → {}", stage, message);
+        try {
+            arkeselSmsService.sendSms(phoneNumber, message);
+            log.info("{}: SMS dispatched — phone='{}'", stage, phoneNumber);
+        } catch (Exception e) {
+            log.error("{}: FAILED to send SMS — phone='{}' error='{}'",
+                    stage, phoneNumber, e.getMessage(), e);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Confirmed
+    // 1. PENDING — request submitted, awaiting review
     // ─────────────────────────────────────────────────────────────────────────
 
+    public void notifyWithdrawalPending(
+            String phoneNumber,
+            String firstName,
+            String accountName,
+            BigDecimal amount,
+            BigDecimal newBalance,
+            String reference,
+            LocalDateTime requestedAt) {
+
+        final String stage = "notifyWithdrawalPending";
+
+        log.info("{}: called — phone='{}' firstName='{}' accountName='{}' amount={} balance={} " +
+                        "reference='{}' requestedAt={}",
+                stage, phoneNumber, firstName, accountName, amount, newBalance, reference, requestedAt);
+
+        if (!canSend(stage, phoneNumber, firstName, amount)) {
+            return;
+        }
+
+        String message = String.format(
+                "Hi %s, we have received your withdrawal request of GHS %s. It is currently pending " +
+                        "review and you will be notified as soon as it is processed. " +
+                        "Thank you for using %s.",
+                resolveDisplayName(accountName, firstName),
+                formatAmount(amount),
+                siteName
+        );
+
+        dispatch(stage, phoneNumber, message);
+    }
+
+    /** Backward-compatible overload (minimal args). */
+    public void notifyWithdrawalPending(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            LocalDateTime requestedAt) {
+
+        notifyWithdrawalPending(phoneNumber, firstName, null, amount, null, null, requestedAt);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. APPROVED — payout on its way
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public void notifyWithdrawalApproved(
+            String phoneNumber,
+            String firstName,
+            String accountName,
+            BigDecimal amount,
+            BigDecimal fee,
+            BigDecimal newBalance,
+            String transactionId,
+            String reference,
+            LocalDateTime approvedAt) {
+
+        final String stage = "notifyWithdrawalApproved";
+
+        log.info("{}: called — phone='{}' firstName='{}' accountName='{}' amount={} fee={} balance={} " +
+                        "transactionId='{}' reference='{}' approvedAt={}",
+                stage, phoneNumber, firstName, accountName, amount, fee, newBalance,
+                transactionId, reference, approvedAt);
+
+        if (!canSend(stage, phoneNumber, firstName, amount)) {
+            return;
+        }
+
+        String message = String.format(
+                "Hi %s, we have sent your withdrawal of GHS %s and it is currently on its way " +
+                        "to your account. You will receive a confirmation once it is completed. " +
+                        "Thank you for using %s.",
+                resolveDisplayName(accountName, firstName),
+                formatAmount(amount),
+                siteName
+        );
+
+        dispatch(stage, phoneNumber, message);
+    }
+
+    /** Backward-compatible overload (no accountName). */
+    public void notifyWithdrawalApproved(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            BigDecimal fee,
+            BigDecimal newBalance,
+            String transactionId,
+            String reference,
+            LocalDateTime approvedAt) {
+
+        notifyWithdrawalApproved(phoneNumber, firstName, null, amount,
+                fee, newBalance, transactionId, reference, approvedAt);
+    }
+
+    /** Backward-compatible overload (minimal args). */
+    public void notifyWithdrawalApproved(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            LocalDateTime approvedAt) {
+
+        notifyWithdrawalApproved(phoneNumber, firstName, null, amount,
+                null, null, null, null, approvedAt);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. SETTLED — money actually paid out
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public void notifyWithdrawalSettled(
+            String phoneNumber,
+            String firstName,
+            String accountName,
+            BigDecimal amount,
+            BigDecimal fee,
+            BigDecimal newBalance,
+            String transactionId,
+            String reference,
+            LocalDateTime settledAt) {
+
+        final String stage = "notifyWithdrawalSettled";
+
+        log.info("{}: called — phone='{}' firstName='{}' accountName='{}' amount={} fee={} balance={} " +
+                        "transactionId='{}' reference='{}' settledAt={}",
+                stage, phoneNumber, firstName, accountName, amount, fee, newBalance,
+                transactionId, reference, settledAt);
+
+        if (!canSend(stage, phoneNumber, firstName, amount)) {
+            return;
+        }
+
+        String formattedAmount = formatAmount(amount);
+
+        String message = String.format(
+                "GHS %s has been sent to you!%nHi %s, %s has just paid out GHS %s to your wallet.",
+                formattedAmount,
+                resolveDisplayName(accountName, firstName),
+                siteName,
+                formattedAmount
+        );
+
+        dispatch(stage, phoneNumber, message);
+    }
+
+    /** Backward-compatible overload (no accountName). */
+    public void notifyWithdrawalSettled(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            BigDecimal fee,
+            BigDecimal newBalance,
+            String transactionId,
+            String reference,
+            LocalDateTime settledAt) {
+
+        notifyWithdrawalSettled(phoneNumber, firstName, null, amount,
+                fee, newBalance, transactionId, reference, settledAt);
+    }
+
+    /** Backward-compatible overload (minimal args). */
+    public void notifyWithdrawalSettled(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            LocalDateTime settledAt) {
+
+        notifyWithdrawalSettled(phoneNumber, firstName, null, amount,
+                null, null, null, null, settledAt);
+    }
+
+    /**
+     * @deprecated the old name for the settled message. Kept so existing call
+     * sites keep compiling; use {@link #notifyWithdrawalSettled} instead.
+     */
+    @Deprecated
     public void notifyWithdrawalConfirmed(
             String phoneNumber,
             String firstName,
@@ -45,102 +284,12 @@ public class WithdrawalSmsService {
             String reference,
             LocalDateTime processedAt) {
 
-        log.info("notifyWithdrawalConfirmed: called — phone='{}' firstName='{}' accountName='{}' amount={} fee={} " +
-                        "balance={} transactionId='{}' reference='{}' processedAt={}",
-                phoneNumber, firstName, accountName, amount, fee, newBalance, transactionId, reference, processedAt);
-
-        if (phoneNumber == null || phoneNumber.isBlank()) {
-            log.warn("notifyWithdrawalConfirmed: SKIPPED — phoneNumber is null or blank " +
-                    "(firstName='{}' amount={})", firstName, amount);
-            return;
-        }
-
-        if (amount == null) {
-            log.warn("notifyWithdrawalConfirmed: SKIPPED — amount is null (phone='{}' firstName='{}')",
-                    phoneNumber, firstName);
-            return;
-        }
-
-        // Prefer the account name the user entered; fall back to profile first name
-        String displayName = (accountName != null && !accountName.isBlank())
-                ? accountName
-                : (firstName != null ? firstName : "Customer");
-
-        String formattedAmount = formatAmount(amount);
-
-        // ── Step 1: send processing probe SMS ────────────────────────────────
-        String probeMessage = String.format(
-                "Hi %s, we have sent your withdrawal of GHS %s and it is currently on its way " +
-                        "to your account. You will receive a confirmation once it is completed. " +
-                        "Thank you for using %s.",
-                displayName,
-                formattedAmount,
-                siteName
-        );
-
-        log.info("notifyWithdrawalConfirmed: sending probe SMS — phone='{}'", phoneNumber);
-        try {
-            arkeselSmsService.sendSms(phoneNumber, probeMessage);
-            log.info("notifyWithdrawalConfirmed: probe SMS dispatched — phone='{}'", phoneNumber);
-        } catch (Exception e) {
-            log.error("notifyWithdrawalConfirmed: probe SMS FAILED — phone='{}' error='{}'",
-                    phoneNumber, e.getMessage(), e);
-        }
-
-        // ── Step 2: send actual withdrawal confirmation SMS ───────────────────
-        String message = String.format(
-                "GHS %s has just been sent to you! Hi %s, %s has just paid out GHS %s to your wallet.",
-                formattedAmount,
-                displayName,
-                siteName,
-                formattedAmount
-        );
-
-        log.info("notifyWithdrawalConfirmed: sending confirmation SMS — phone='{}' messageLength={}",
-                phoneNumber, message.length());
-        log.debug("notifyWithdrawalConfirmed: message body → {}", message);
-
-        try {
-            arkeselSmsService.sendSms(phoneNumber, message);
-            log.info("notifyWithdrawalConfirmed: confirmation SMS dispatched — phone='{}'", phoneNumber);
-        } catch (Exception e) {
-            log.error("notifyWithdrawalConfirmed: FAILED to send confirmation SMS — phone='{}' error='{}'",
-                    phoneNumber, e.getMessage(), e);
-        }
-    }
-
-    /**
-     * Backward-compatible overload (no accountName).
-     */
-    public void notifyWithdrawalConfirmed(
-            String phoneNumber,
-            String firstName,
-            BigDecimal amount,
-            BigDecimal fee,
-            BigDecimal newBalance,
-            String transactionId,
-            String reference,
-            LocalDateTime processedAt) {
-
-        notifyWithdrawalConfirmed(phoneNumber, firstName, null, amount,
+        notifyWithdrawalSettled(phoneNumber, firstName, accountName, amount,
                 fee, newBalance, transactionId, reference, processedAt);
     }
 
-    /**
-     * Backward-compatible overload (minimal args).
-     */
-    public void notifyWithdrawalConfirmed(
-            String phoneNumber,
-            String firstName,
-            BigDecimal amount,
-            LocalDateTime processedAt) {
-
-        notifyWithdrawalConfirmed(phoneNumber, firstName, null, amount,
-                null, null, null, null, processedAt);
-    }
-
     // ─────────────────────────────────────────────────────────────────────────
-    // Rejected
+    // 4. REJECTED — declined by admin, funds returned
     // ─────────────────────────────────────────────────────────────────────────
 
     public void notifyWithdrawalRejected(
@@ -154,74 +303,29 @@ public class WithdrawalSmsService {
             String reference,
             LocalDateTime rejectedAt) {
 
-        log.info("notifyWithdrawalRejected: called — phone='{}' firstName='{}' accountName='{}' amount={} reason='{}' " +
+        final String stage = "notifyWithdrawalRejected";
+
+        log.info("{}: called — phone='{}' firstName='{}' accountName='{}' amount={} reason='{}' " +
                         "restoredBalance={} transactionId='{}' reference='{}' rejectedAt={}",
-                phoneNumber, firstName, accountName, amount, reason, restoredBalance,
+                stage, phoneNumber, firstName, accountName, amount, reason, restoredBalance,
                 transactionId, reference, rejectedAt);
 
-        if (phoneNumber == null || phoneNumber.isBlank()) {
-            log.warn("notifyWithdrawalRejected: SKIPPED — phoneNumber is null or blank " +
-                    "(firstName='{}' amount={})", firstName, amount);
+        if (!canSend(stage, phoneNumber, firstName, amount)) {
             return;
         }
 
-        if (amount == null) {
-            log.warn("notifyWithdrawalRejected: SKIPPED — amount is null (phone='{}' firstName='{}')",
-                    phoneNumber, firstName);
-            return;
-        }
-
-        // Prefer the account name the user entered; fall back to profile first name
-        String displayName = (accountName != null && !accountName.isBlank())
-                ? accountName
-                : (firstName != null ? firstName : "Customer");
-
-        String formattedAmount = formatAmount(amount);
-
-        // ── Step 1: send processing probe SMS ────────────────────────────────
-        String probeMessage = String.format(
-                "Hi %s, we have sent your withdrawal of GHS %s and it is currently on its way " +
-                        "to your account. You will receive a confirmation once it is completed. " +
-                        "Thank you for using %s.",
-                displayName,
-                formattedAmount,
-                siteName
-        );
-
-        log.info("notifyWithdrawalRejected: sending probe SMS — phone='{}'", phoneNumber);
-        try {
-            arkeselSmsService.sendSms(phoneNumber, probeMessage);
-            log.info("notifyWithdrawalRejected: probe SMS dispatched — phone='{}'", phoneNumber);
-        } catch (Exception e) {
-            log.error("notifyWithdrawalRejected: probe SMS FAILED — phone='{}' error='{}'",
-                    phoneNumber, e.getMessage(), e);
-        }
-
-        // ── Step 2: send actual withdrawal rejection SMS ──────────────────────
         String message = String.format(
-                "Hi %s, your withdrawal of GHS %s could not be completed at this time. " +
-                        "Please contact support for assistance. Thank you for using %s.",
-                displayName,
-                formattedAmount,
+                "Hi %s, your withdrawal of GHS %s could not be completed and the amount has been " +
+                        "returned to your %s wallet. Please contact support if you need assistance.",
+                resolveDisplayName(accountName, firstName),
+                formatAmount(amount),
                 siteName
         );
 
-        log.info("notifyWithdrawalRejected: sending rejection SMS — phone='{}' messageLength={}",
-                phoneNumber, message.length());
-        log.debug("notifyWithdrawalRejected: message body → {}", message);
-
-        try {
-            arkeselSmsService.sendSms(phoneNumber, message);
-            log.info("notifyWithdrawalRejected: rejection SMS dispatched — phone='{}'", phoneNumber);
-        } catch (Exception e) {
-            log.error("notifyWithdrawalRejected: FAILED to send rejection SMS — phone='{}' error='{}'",
-                    phoneNumber, e.getMessage(), e);
-        }
+        dispatch(stage, phoneNumber, message);
     }
 
-    /**
-     * Backward-compatible overload (no accountName).
-     */
+    /** Backward-compatible overload (no accountName). */
     public void notifyWithdrawalRejected(
             String phoneNumber,
             String firstName,
@@ -236,9 +340,7 @@ public class WithdrawalSmsService {
                 reason, restoredBalance, transactionId, reference, rejectedAt);
     }
 
-    /**
-     * Backward-compatible overload (minimal args).
-     */
+    /** Backward-compatible overload (minimal args). */
     public void notifyWithdrawalRejected(
             String phoneNumber,
             String firstName,
@@ -248,5 +350,56 @@ public class WithdrawalSmsService {
 
         notifyWithdrawalRejected(phoneNumber, firstName, null, amount,
                 reason, null, null, null, rejectedAt);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5. FAILED — approved but payout did not go through, funds returned
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public void notifyWithdrawalFailed(
+            String phoneNumber,
+            String firstName,
+            String accountName,
+            BigDecimal amount,
+            String reason,
+            BigDecimal restoredBalance,
+            String reference,
+            LocalDateTime failedAt) {
+
+        final String stage = "notifyWithdrawalFailed";
+
+        log.info("{}: called — phone='{}' firstName='{}' accountName='{}' amount={} reason='{}' " +
+                        "restoredBalance={} reference='{}' failedAt={}",
+                stage, phoneNumber, firstName, accountName, amount, reason, restoredBalance,
+                reference, failedAt);
+
+        if (!canSend(stage, phoneNumber, firstName, amount)) {
+            return;
+        }
+
+        String formattedAmount = formatAmount(amount);
+
+        String message = String.format(
+                "Hi %s, your withdrawal of GHS %s could not be completed. GHS %s has been returned " +
+                        "to your %s wallet. Please contact support if you need assistance.",
+                resolveDisplayName(accountName, firstName),
+                formattedAmount,
+                formattedAmount,
+                siteName
+        );
+
+        dispatch(stage, phoneNumber, message);
+    }
+
+    /** Backward-compatible overload (minimal args). */
+    public void notifyWithdrawalFailed(
+            String phoneNumber,
+            String firstName,
+            BigDecimal amount,
+            String reason,
+            LocalDateTime failedAt) {
+
+        notifyWithdrawalFailed(phoneNumber, firstName, null, amount,
+                reason, null, null, failedAt);
     }
 }

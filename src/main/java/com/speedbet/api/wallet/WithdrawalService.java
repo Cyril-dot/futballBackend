@@ -41,7 +41,7 @@ public class WithdrawalService {
     private BigDecimal minWithdrawalAmount;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Submit
+    // Submit  ← user gets "request received / pending" SMS
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto submitRequest(UUID userId, WithdrawalRequestDto req) {
@@ -103,11 +103,23 @@ public class WithdrawalService {
                 request.getId(), userId, req.getAmount(),
                 req.getCurrency() != null ? req.getCurrency() : "GHS");
 
+        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
+        String smsTarget = resolvePhoneForSms(request.getAccountNumber(), user.getPhone());
+        withdrawalSmsService.                                                                                                                                                                                                                                                                    notifyWithdrawalPending(
+                smsTarget,
+                user.getFirstName(),
+                request.getAccountName(),        // MoMo account name entered by user
+                request.getAmount(),
+                newBalance,
+                null,                            // reference — not included in SMS
+                LocalDateTime.now()
+        );
+
         return WithdrawalDto.from(request);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Approve  ← admins get email, user gets SMS
+    // Approve  ← admins get email, user gets "on its way" SMS
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalDto approve(UUID requestId, UUID adminId, String note) {
@@ -157,7 +169,7 @@ public class WithdrawalService {
 
         // ── SMS → user's MoMo number (falls back to profile phone) ───────────
         String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
-        withdrawalSmsService.notifyWithdrawalConfirmed(
+        withdrawalSmsService.notifyWithdrawalApproved(
                 smsTarget,
                 u.getFirstName(),
                 savedRequest.getAccountName(),   // MoMo account name entered by user
@@ -173,7 +185,7 @@ public class WithdrawalService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Reject  ← admins get email, user gets SMS
+    // Reject  ← admins get email, user gets rejection SMS
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto reject(UUID requestId, UUID adminId, String note) {
@@ -252,7 +264,7 @@ public class WithdrawalService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Settle
+    // Settle  ← user gets the "money has been sent to you" SMS
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalDto settle(UUID requestId, UUID superAdminId, String note) {
@@ -268,9 +280,9 @@ public class WithdrawalService {
         request.setSuperAdmin(superAdmin);
         request.setSuperAdminNote(note);
         request.setSettledAt(Instant.now());
-        request = withdrawalRepo.save(request);
+        final WithdrawalRequest savedRequest = withdrawalRepo.save(request);
 
-        txRepo.findByProviderRef(request.getId().toString()).ifPresent(holdTx -> {
+        txRepo.findByProviderRef(savedRequest.getId().toString()).ifPresent(holdTx -> {
             holdTx.setKind(TxKind.WITHDRAW);
             txRepo.save(holdTx);
         });
@@ -278,14 +290,39 @@ public class WithdrawalService {
         auditService.log(superAdminId, "WITHDRAWAL_SETTLED", "WithdrawalRequest", requestId,
                 null, Map.of(
                         "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()),
+                        "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        return WithdrawalDto.from(request);
+        final var u   = savedRequest.getUser();
+        final LocalDateTime now = LocalDateTime.now();
+
+        // ── Balance is unchanged at settle time (the hold already deducted it) ─
+        BigDecimal walletBalance = walletRepo.findByUserId(u.getId())
+                .map(Wallet::getBalance)
+                .orElse(null);
+
+        // ── Fee is GHS 0.00 for MoMo withdrawals (no platform fee deducted) ──
+        BigDecimal fee = BigDecimal.ZERO;
+
+        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
+        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
+        withdrawalSmsService.notifyWithdrawalSettled(
+                smsTarget,
+                u.getFirstName(),
+                savedRequest.getAccountName(),   // MoMo account name entered by user
+                savedRequest.getAmount(),
+                fee,
+                walletBalance,
+                null,   // transactionId — not included in SMS
+                null,   // reference — not included in SMS
+                now
+        );
+
+        return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Mark failed
+    // Mark failed  ← user gets "could not be completed, funds returned" SMS
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto markFailed(UUID requestId, UUID superAdminId, String note) {
@@ -301,34 +338,49 @@ public class WithdrawalService {
         request.setSuperAdmin(superAdmin);
         request.setSuperAdminNote(note);
         request.setSettledAt(Instant.now());
-        request = withdrawalRepo.save(request);
+        final WithdrawalRequest savedRequest = withdrawalRepo.save(request);
 
         var wallet = em.find(Wallet.class,
-                walletRepo.findByUserId(request.getUser().getId()).orElseThrow().getId(),
+                walletRepo.findByUserId(savedRequest.getUser().getId()).orElseThrow().getId(),
                 LockModeType.PESSIMISTIC_WRITE);
 
-        BigDecimal restoredBalance = wallet.getBalance().add(request.getAmount(), MathContext.DECIMAL64);
+        BigDecimal restoredBalance = wallet.getBalance().add(savedRequest.getAmount(), MathContext.DECIMAL64);
         wallet.setBalance(restoredBalance);
         walletRepo.save(wallet);
 
         txRepo.save(Transaction.builder()
                 .walletId(wallet.getId())
                 .kind(TxKind.WITHDRAW_RELEASE)
-                .amount(request.getAmount())
+                .amount(savedRequest.getAmount())
                 .balanceAfter(restoredBalance)
-                .providerRef(request.getId().toString())
+                .providerRef(savedRequest.getId().toString())
                 .metadata(Map.of(
-                        "withdrawalRequestId", request.getId().toString(),
+                        "withdrawalRequestId", savedRequest.getId().toString(),
                         "reason", "failed"))
                 .build());
 
         auditService.log(superAdminId, "WITHDRAWAL_FAILED", "WithdrawalRequest", requestId,
                 null, Map.of(
                         "note",   note != null ? note : "",
-                        "userId", request.getUser().getId().toString()),
+                        "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        return WithdrawalDto.from(request);
+        final var u = savedRequest.getUser();
+
+        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
+        String smsTarget = resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone());
+        withdrawalSmsService.notifyWithdrawalFailed(
+                smsTarget,
+                u.getFirstName(),
+                savedRequest.getAccountName(),   // MoMo account name entered by user
+                savedRequest.getAmount(),
+                note,
+                restoredBalance,
+                null,   // reference — not included in SMS
+                LocalDateTime.now()
+        );
+
+        return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
