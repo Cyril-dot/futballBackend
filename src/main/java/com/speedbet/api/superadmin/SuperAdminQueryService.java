@@ -21,8 +21,8 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -37,6 +37,13 @@ public class SuperAdminQueryService {
 
     // ─── Revenue / Deposit Overview ───────────────────────────────────────────
 
+    /**
+     * NOTE: this sums every deposit into one figure and labels it GHS. If
+     * Nigerian deposits are recorded in naira, that total mixes currencies.
+     * The country-split endpoints under /commission/country-report are the
+     * correct source for per-currency figures; this overview is kept for the
+     * legacy dashboard tiles.
+     */
     public SuperAdminDtos.RevenueOverviewDto getRevenueOverview() {
         log.info("getRevenueOverview: computing platform-wide stats");
 
@@ -54,15 +61,9 @@ public class SuperAdminQueryService {
         long withdrawalCount          = txRepo.countByKind(TxKind.WITHDRAW);
 
         return new SuperAdminDtos.RevenueOverviewDto(
-                depositsAllTime,
-                depositsThisMonth,
-                depositsToday,
-                withdrawalsAllTime,
-                withdrawalsMonth,
-                depositCount,
-                withdrawalCount,
-                "GHS"
-        );
+                depositsAllTime, depositsThisMonth, depositsToday,
+                withdrawalsAllTime, withdrawalsMonth,
+                depositCount, withdrawalCount, "GHS");
     }
 
     // ─── All Users (paginated + search) ──────────────────────────────────────
@@ -91,11 +92,8 @@ public class SuperAdminQueryService {
             ));
         }
 
-        // Always sort by createdAt desc — callers don't supply a sort, and
-        // letting Pageable default to "unsorted" can break on some DBs.
         Pageable p = PageRequest.of(
-                pageable.getPageNumber(),
-                pageable.getPageSize(),
+                pageable.getPageNumber(), pageable.getPageSize(),
                 Sort.by(Sort.Direction.DESC, "createdAt"));
 
         return userRepo.findAll(spec, p).map(this::toUserSummary);
@@ -114,39 +112,26 @@ public class SuperAdminQueryService {
         BigDecimal walletDeposits    = txRepo.sumByKindSince(wallet.getId(), TxKind.DEPOSIT,  Instant.EPOCH);
         BigDecimal walletWithdrawals = txRepo.sumByKindSince(wallet.getId(), TxKind.WITHDRAW, Instant.EPOCH);
 
-        SuperAdminDtos.WalletSummaryDto walletDto = new SuperAdminDtos.WalletSummaryDto(
-                wallet.getId(),
-                wallet.getBalance(),
-                wallet.getCurrency(),
-                txCount,
-                walletDeposits,
-                walletWithdrawals
-        );
+        var walletDto = new SuperAdminDtos.WalletSummaryDto(
+                wallet.getId(), wallet.getBalance(), wallet.getCurrency(),
+                txCount, walletDeposits, walletWithdrawals);
 
         Instant createdAt = user.getCreatedAt() != null
                 ? user.getCreatedAt().toInstant(java.time.ZoneOffset.UTC) : null;
 
         return new SuperAdminDtos.UserDetailDto(
-                user.getId(),
-                user.getEmail(),
-                user.getFirstName(),
-                user.getLastName(),
-                user.getPhone(),
-                user.getCountry(),
-                user.getRole().name(),
-                user.getStatus().name(),
-                user.isEmailVerified(),
-                createdAt,
-                walletDto
-        );
+                user.getId(), user.getEmail(), user.getFirstName(), user.getLastName(),
+                user.getPhone(), user.getCountry(),
+                user.getRole().name(), user.getStatus().name(),
+                user.isEmailVerified(), createdAt, walletDto);
     }
 
     // ─── User Deposit History ─────────────────────────────────────────────────
 
     /**
-     * Returns a paginated list of all DEPOSIT transactions for a given user,
-     * newest first. Each row includes user identity so the frontend doesn't
-     * need a separate user-lookup call.
+     * Paginated DEPOSIT transactions for one user, newest first. Each row
+     * carries the user's country and the wallet currency so the client can
+     * render ₵ or ₦ without a second lookup.
      */
     public Page<SuperAdminDtos.UserDepositDto> listUserDeposits(UUID userId, Pageable pageable) {
         log.info("listUserDeposits: userId='{}'", userId);
@@ -157,26 +142,23 @@ public class SuperAdminQueryService {
         Wallet wallet = walletRepo.findByUserId(userId)
                 .orElseThrow(() -> ApiException.notFound("Wallet not found"));
 
+        String country = CountryUtils.normalize(user.getCountry());
+        String currency = (wallet.getCurrency() != null && !wallet.getCurrency().isBlank())
+                ? wallet.getCurrency() : CountryUtils.currencyOf(country);
+
         Pageable p = PageRequest.of(
-                pageable.getPageNumber(),
-                pageable.getPageSize(),
+                pageable.getPageNumber(), pageable.getPageSize(),
                 Sort.by(Sort.Direction.DESC, "createdAt"));
 
         return txRepo
                 .findByWalletIdAndKindOrderByCreatedAtDesc(wallet.getId(), TxKind.DEPOSIT, p)
                 .map(tx -> new SuperAdminDtos.UserDepositDto(
-                        tx.getId(),
-                        tx.getWalletId(),
-                        user.getId(),
-                        user.getEmail(),
-                        user.getFirstName(),
-                        user.getLastName(),
-                        tx.getAmount(),
-                        tx.getBalanceAfter(),
-                        tx.getProviderRef(),
-                        tx.getStatus(),
-                        tx.getCreatedAt()
-                ));
+                        tx.getId(), tx.getWalletId(),
+                        user.getId(), user.getEmail(),
+                        user.getFirstName(), user.getLastName(),
+                        country, currency,
+                        tx.getAmount(), tx.getBalanceAfter(),
+                        tx.getProviderRef(), tx.getStatus(), tx.getCreatedAt()));
     }
 
     // ─── Single Admin Detail ──────────────────────────────────────────────────
@@ -198,44 +180,35 @@ public class SuperAdminQueryService {
         BigDecimal deposited = txRepo.sumByKindSince(wallet.getId(), TxKind.DEPOSIT,  Instant.EPOCH);
         BigDecimal withdrawn = txRepo.sumByKindSince(wallet.getId(), TxKind.WITHDRAW, Instant.EPOCH);
 
-        SuperAdminDtos.WalletSummaryDto walletDto = new SuperAdminDtos.WalletSummaryDto(
+        var walletDto = new SuperAdminDtos.WalletSummaryDto(
                 wallet.getId(), wallet.getBalance(), wallet.getCurrency(),
-                txCount, deposited, withdrawn
-        );
+                txCount, deposited, withdrawn);
 
         List<ReferralLink> links = referralLinkRepo.findByAdminId(adminId);
-        SuperAdminDtos.ReferralSummaryDto referralDto = links.stream()
+        var referralDto = links.stream()
                 .filter(ReferralLink::isActive)
                 .findFirst()
                 .or(() -> links.stream().findFirst())
                 .map(link -> new SuperAdminDtos.ReferralSummaryDto(
-                        link.getId(),
-                        link.getCode(),
-                        link.getCommissionPercent(),
-                        null,
-                        null
-                ))
+                        link.getId(), link.getCode(), link.getCommissionPercent(), null, null))
                 .orElse(null);
 
         Instant adminCreatedAt = admin.getCreatedAt() != null
                 ? admin.getCreatedAt().toInstant(java.time.ZoneOffset.UTC) : null;
 
         return new SuperAdminDtos.AdminDetailDto(
-                admin.getId(),
-                admin.getEmail(),
-                admin.getFirstName(),
-                admin.getLastName(),
-                admin.getPhone(),
-                admin.getCountry(),
-                admin.isEmailVerified(),
-                adminCreatedAt,
-                walletDto,
-                referralDto
-        );
+                admin.getId(), admin.getEmail(), admin.getFirstName(), admin.getLastName(),
+                admin.getPhone(), admin.getCountry(), admin.isEmailVerified(),
+                adminCreatedAt, walletDto, referralDto);
     }
 
     // ─── Platform-wide Transactions (paginated + filtered) ───────────────────
 
+    /**
+     * Wallet and user lookups are batched per page rather than performed inside
+     * the map. The previous version issued two extra queries per row, which at
+     * size=500 during CSV export meant roughly a thousand round-trips per page.
+     */
     public Page<SuperAdminDtos.TransactionDto> listTransactions(
             TxKind kind, String status, UUID walletId,
             Instant from, Instant to, Pageable pageable) {
@@ -243,20 +216,36 @@ public class SuperAdminQueryService {
 
         Pageable p = pageable.getSort().isSorted()
                 ? pageable
-                : PageRequest.of(
-                pageable.getPageNumber(),
-                pageable.getPageSize(),
-                Sort.by(Sort.Direction.DESC, "createdAt"));
+                : PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(),
+                        Sort.by(Sort.Direction.DESC, "createdAt"));
 
-        return txRepo.findAll(TransactionSpecs.filtered(kind, status, walletId, from, to), p)
-                .map(tx -> {
-                    UUID userId = walletRepo.findById(tx.getWalletId())
-                            .map(Wallet::getUserId).orElse(null);
-                    String email = userId != null
-                            ? userRepo.findById(userId).map(User::getEmail).orElse(null)
-                            : null;
-                    return toTransactionDto(tx, userId, email);
-                });
+        Page<Transaction> page =
+                txRepo.findAll(TransactionSpecs.filtered(kind, status, walletId, from, to), p);
+
+        List<Transaction> rows = page.getContent();
+        if (rows.isEmpty()) return page.map(tx -> toTransactionDto(tx, null, null, null));
+
+        Set<UUID> walletIds = rows.stream()
+                .map(Transaction::getWalletId).filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        Map<UUID, UUID> walletToUser = walletRepo.findAllById(walletIds).stream()
+                .filter(w -> w != null && w.getId() != null && w.getUserId() != null)
+                .collect(Collectors.toMap(Wallet::getId, Wallet::getUserId, (a, b) -> a));
+
+        Set<UUID> userIds = new HashSet<>(walletToUser.values());
+        Map<UUID, User> usersById = userIds.isEmpty() ? Map.of()
+                : userRepo.findAllById(userIds).stream()
+                    .filter(u -> u != null && u.getId() != null)
+                    .collect(Collectors.toMap(User::getId, u -> u, (a, b) -> a));
+
+        return page.map(tx -> {
+            UUID userId = walletToUser.get(tx.getWalletId());
+            User u = userId != null ? usersById.get(userId) : null;
+            return toTransactionDto(tx, userId,
+                    u != null ? u.getEmail() : null,
+                    u != null ? CountryUtils.normalize(u.getCountry()) : CountryUtils.UNKNOWN);
+        });
     }
 
     // ─── Affiliate Withdrawal History (all statuses) ──────────────────────────
@@ -266,8 +255,7 @@ public class SuperAdminQueryService {
         log.info("listWithdrawals: status={}", status);
 
         Pageable p = PageRequest.of(
-                pageable.getPageNumber(),
-                pageable.getPageSize(),
+                pageable.getPageNumber(), pageable.getPageSize(),
                 Sort.by(Sort.Direction.DESC, "requestedAt"));
 
         if (status != null) {
@@ -281,20 +269,17 @@ public class SuperAdminQueryService {
     private SuperAdminDtos.UserSummaryDto toUserSummary(User u) {
         return new SuperAdminDtos.UserSummaryDto(
                 u.getId(), u.getEmail(), u.getFirstName(), u.getLastName(),
-                u.getPhone(), u.getCountry(), u.getRole().name(),
-                u.getStatus().name(),
+                u.getPhone(), u.getCountry(), u.getRole().name(), u.getStatus().name(),
                 u.isEmailVerified(),
-                u.getCreatedAt() != null ? u.getCreatedAt().toInstant(java.time.ZoneOffset.UTC) : null
-        );
+                u.getCreatedAt() != null ? u.getCreatedAt().toInstant(java.time.ZoneOffset.UTC) : null);
     }
 
     private SuperAdminDtos.TransactionDto toTransactionDto(
-            Transaction tx, UUID userId, String email) {
+            Transaction tx, UUID userId, String email, String country) {
         return new SuperAdminDtos.TransactionDto(
-                tx.getId(), tx.getWalletId(), userId, email,
+                tx.getId(), tx.getWalletId(), userId, email, country,
                 tx.getKind(), tx.getAmount(), tx.getBalanceAfter(),
                 tx.getProviderRef(), tx.getStatus(), tx.getMetadata(),
-                tx.getCreatedAt()
-        );
+                tx.getCreatedAt());
     }
 }

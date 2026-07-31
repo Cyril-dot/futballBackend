@@ -5,6 +5,7 @@ import com.speedbet.api.wallet.TxKind;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -38,7 +39,58 @@ public class SuperAdminDtos {
             String currency
     ) {}
 
-    // Inside SuperAdminDtos class
+    // ─── Country-split analytics ──────────────────────────────────────────────
+    // Ghanaian users deposit in cedis (MoMo / normal funding); Nigerian users
+    // deposit predominantly by bank transfer in naira. Amounts in different
+    // currencies must never be summed, so every aggregate below is keyed by
+    // country and carries its own currency.
+
+    /** One period × country bucket, for deposits or commission. */
+    public record CountryPeriodTotalDto(
+            String periodLabel,
+            String country,      // GH | NG | OTHER | UNKNOWN
+            String countryName,
+            BigDecimal amount,
+            long count,
+            String currency
+    ) {}
+
+    /** One period × admin × country bucket, for commission attribution. */
+    public record AdminCommissionCountryDto(
+            String periodLabel,
+            UUID adminId,
+            String adminEmail,
+            String country,
+            String countryName,
+            BigDecimal amount,
+            long count,
+            String currency
+    ) {}
+
+    /** Roll-up per country across the whole selected range. */
+    public record CountrySummaryDto(
+            String country,
+            String countryName,
+            String currency,
+            BigDecimal depositTotal,
+            long depositCount,
+            BigDecimal commissionTotal,
+            long commissionCount,
+            BigDecimal averageDeposit,
+            BigDecimal effectiveCommissionRate  // commission ÷ deposits, as a percentage
+    ) {}
+
+    /** Everything the analytics page needs, in one response. */
+    public record CountrySplitReportDto(
+            String period,                              // "daily" | "weekly"
+            String rangeLabel,
+            List<CountrySummaryDto> summaries,
+            List<CountryPeriodTotalDto> depositsByPeriod,
+            List<CountryPeriodTotalDto> commissionByPeriod,
+            List<AdminCommissionCountryDto> commissionByAdmin
+    ) {}
+
+    // ─── User status update ───────────────────────────────────────────────────
 
     public record UserStatusUpdateDto(
             UUID userId,
@@ -120,6 +172,7 @@ public class SuperAdminDtos {
             UUID walletId,
             UUID userId,
             String userEmail,
+            String userCountry,   // normalised bucket, so the UI can pick ₵ vs ₦
             TxKind kind,
             BigDecimal amount,
             BigDecimal balanceAfter,
@@ -138,6 +191,8 @@ public class SuperAdminDtos {
             String userEmail,
             String firstName,
             String lastName,
+            String userCountry,
+            String currency,
             BigDecimal amount,
             BigDecimal balanceAfter,
             String providerRef,
@@ -149,5 +204,4 @@ public class SuperAdminDtos {
 
     // Uses existing AffiliateWithdrawalRequest entity directly —
     // no extra DTO needed; the entity is already serialisable.
-    // If you need a projection, add one here.
 }

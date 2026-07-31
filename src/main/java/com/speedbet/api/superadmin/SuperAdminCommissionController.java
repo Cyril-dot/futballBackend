@@ -9,13 +9,8 @@ import org.springframework.web.bind.annotation.*;
 import java.util.List;
 
 /**
- * Mapped under BOTH "/api/super-admin/**" (hyphenated — what the frontend and
- * every other super-admin controller uses) and the legacy "/api/superadmin/**"
- * so any existing callers don't break.
- *
- * The missing hyphen here was the original cause of the 500s: no handler
- * matched, and the catch-all @ExceptionHandler(Exception.class) converted the
- * resulting NoResourceFoundException into a 500 instead of a 404.
+ * Mapped under both the hyphenated path the frontend uses and the legacy
+ * unhyphenated one, so existing callers keep working.
  */
 @RestController
 @RequestMapping({
@@ -27,6 +22,9 @@ import java.util.List;
 public class SuperAdminCommissionController {
 
     private final SuperAdminCommissionService commissionService;
+    private final SuperAdminCountryReportService countryReportService;
+
+    // ─── Per-admin (legacy shape) ───────────────────────────────────────────
 
     @GetMapping("/by-admin/daily")
     public ResponseEntity<ApiResponse<List<SuperAdminDtos.AdminCommissionPeriodDto>>> dailyByAdmin(
@@ -40,6 +38,8 @@ public class SuperAdminCommissionController {
         return ResponseEntity.ok(ApiResponse.ok(commissionService.getWeeklyCommissionByAdmin(weeks)));
     }
 
+    // ─── Platform totals (legacy shape) ─────────────────────────────────────
+
     @GetMapping("/totals/daily")
     public ResponseEntity<ApiResponse<List<SuperAdminDtos.PlatformPeriodTotalDto>>> dailyTotals(
             @RequestParam(defaultValue = "30") int days) {
@@ -50,5 +50,45 @@ public class SuperAdminCommissionController {
     public ResponseEntity<ApiResponse<List<SuperAdminDtos.PlatformPeriodTotalDto>>> weeklyTotals(
             @RequestParam(defaultValue = "12") int weeks) {
         return ResponseEntity.ok(ApiResponse.ok(commissionService.getWeeklyCommissionTotals(weeks)));
+    }
+
+    // ─── Split by the referred user's country ───────────────────────────────
+
+    @GetMapping("/by-country/daily")
+    public ResponseEntity<ApiResponse<List<SuperAdminDtos.CountryPeriodTotalDto>>> dailyByCountry(
+            @RequestParam(defaultValue = "30") int days) {
+        return ResponseEntity.ok(ApiResponse.ok(commissionService.getDailyByCountry(days)));
+    }
+
+    @GetMapping("/by-country/weekly")
+    public ResponseEntity<ApiResponse<List<SuperAdminDtos.CountryPeriodTotalDto>>> weeklyByCountry(
+            @RequestParam(defaultValue = "12") int weeks) {
+        return ResponseEntity.ok(ApiResponse.ok(commissionService.getWeeklyByCountry(weeks)));
+    }
+
+    @GetMapping("/by-admin-country/daily")
+    public ResponseEntity<ApiResponse<List<SuperAdminDtos.AdminCommissionCountryDto>>> dailyByAdminCountry(
+            @RequestParam(defaultValue = "30") int days) {
+        return ResponseEntity.ok(ApiResponse.ok(commissionService.getDailyByAdminAndCountry(days)));
+    }
+
+    @GetMapping("/by-admin-country/weekly")
+    public ResponseEntity<ApiResponse<List<SuperAdminDtos.AdminCommissionCountryDto>>> weeklyByAdminCountry(
+            @RequestParam(defaultValue = "12") int weeks) {
+        return ResponseEntity.ok(ApiResponse.ok(commissionService.getWeeklyByAdminAndCountry(weeks)));
+    }
+
+    // ─── Combined report — one call, everything the analytics page needs ─────
+
+    @GetMapping("/country-report/daily")
+    public ResponseEntity<ApiResponse<SuperAdminDtos.CountrySplitReportDto>> dailyReport(
+            @RequestParam(defaultValue = "30") int days) {
+        return ResponseEntity.ok(ApiResponse.ok(countryReportService.buildDaily(days)));
+    }
+
+    @GetMapping("/country-report/weekly")
+    public ResponseEntity<ApiResponse<SuperAdminDtos.CountrySplitReportDto>> weeklyReport(
+            @RequestParam(defaultValue = "12") int weeks) {
+        return ResponseEntity.ok(ApiResponse.ok(countryReportService.buildWeekly(weeks)));
     }
 }
