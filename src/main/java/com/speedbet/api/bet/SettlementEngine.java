@@ -12,6 +12,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,6 +28,17 @@ public class SettlementEngine {
     private static final BigDecimal TWO  = new BigDecimal("2");
     private static final BigDecimal HALF = new BigDecimal("0.5");
 
+    /**
+     * Asian handicap convention. FALSE (default) = the line is written for the side
+     * named in the selection, so "AWAY +0.5" means the away team starts half a goal
+     * up. TRUE = the line is always quoted from the home team's perspective, so
+     * "AWAY -1.5" means home -1.5, i.e. away +1.5, and the sign must be flipped.
+     *
+     * Set this to match what HandicapOddsService actually emits. Getting it wrong
+     * inverts every away-side handicap settlement.
+     */
+    private static final boolean AH_LINE_IS_HOME_PERSPECTIVE = false;
+
     /** First signed number in a string: "-1.5", "+2", "2.5" … */
     private static final Pattern LINE_PATTERN = Pattern.compile("[-+]?\\d+(?:\\.\\d+)?");
 
@@ -34,10 +46,10 @@ public class SettlementEngine {
     private final BetService   betService;
 
     /**
-     * Self-reference used so that @Transactional actually applies. Calling
-     * settleMatch(...) directly from run() goes through `this`, bypassing the
-     * Spring proxy, which means the method was NOT running in a transaction.
-     * ObjectProvider is resolved lazily, so this does not create a cycle.
+     * Self-reference so @Transactional actually applies. Calling settleMatch(...)
+     * directly from run() goes through `this` and bypasses the Spring proxy, which
+     * means it was NOT running in a transaction. ObjectProvider resolves lazily,
+     * so this does not create a dependency cycle.
      */
     private final ObjectProvider<SettlementEngine> selfProvider;
 
@@ -84,7 +96,9 @@ public class SettlementEngine {
         }
     }
 
-    // ── Scheduled runner ──────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // SCHEDULED RUNNER
+    // ══════════════════════════════════════════════════════════════════════
 
     @Scheduled(fixedDelay = 60_000)
     public void run() {
@@ -96,9 +110,9 @@ public class SettlementEngine {
 
         for (Match match : finishedMatches) {
 
-            // Not settleable → leave it alone. Do NOT mark it settled: the old
-            // code returned early from settleMatch() but still called
-            // markSettled(), stranding every bet on that match forever.
+            // Not settleable → leave it alone. Do NOT mark it settled: the old code
+            // returned early from settleMatch() but still called markSettled(),
+            // stranding every bet on that match forever.
             if (!isSettleable(match)) {
                 matchesSkipped++;
                 log.warn("Settlement run: SKIP match {} ({} vs {}) — score(s) missing (home={}, away={}); "
@@ -120,8 +134,7 @@ public class SettlementEngine {
                 log.info("Settlement run: match {} marked settled — {}", match.getId(), matchTally);
 
                 // Second pass: catch slips placed between the first pass and
-                // markSettled(). Same call — it is a cheap no-op when there is
-                // nothing pending.
+                // markSettled(). Same call — a cheap no-op when nothing is pending.
                 Tally lateTally = self().settleMatch(match);
                 if (lateTally.finalised() > 0 || lateTally.deferred > 0) {
                     log.warn("Settlement run: {} late bet(s) picked up after settling match {} — {}",
@@ -140,12 +153,13 @@ public class SettlementEngine {
                 matchesSettled, matchesSkipped, matchesFailed, total);
     }
 
-    // ── Orphan recovery ───────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // ORPHAN RECOVERY
+    // ══════════════════════════════════════════════════════════════════════
 
     /**
      * Picks up slips left PENDING on matches that were already marked settled —
-     * e.g. legs that were deferred while waiting on another fixture, or bets
-     * that failed mid-pass.
+     * legs deferred while waiting on another fixture, or bets that failed mid-pass.
      */
     @Scheduled(fixedDelay = 120_000)
     public void runOrphanedBetRecovery() {
@@ -197,7 +211,7 @@ public class SettlementEngine {
                 Outcome outcome = settleOneBet(bet, match, cache);
                 tally.record(outcome);
                 if (outcome == Outcome.DEFERRED || outcome == Outcome.SKIPPED) {
-                    // Legitimately still waiting on another fixture — debug, not warn,
+                    // Legitimately waiting on another fixture — debug, not warn,
                     // otherwise this logs every two minutes until the other leg lands.
                     log.debug("Orphan recovery: bet {} → {}", bet.getId(), outcome);
                 } else {
@@ -213,7 +227,9 @@ public class SettlementEngine {
         return tally;
     }
 
-    // ── Match-level settlement ────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // MATCH-LEVEL SETTLEMENT
+    // ══════════════════════════════════════════════════════════════════════
 
     @Transactional
     public Tally settleMatch(Match match) {
@@ -247,10 +263,10 @@ public class SettlementEngine {
                 tally.record(outcome);
                 log.debug("settleMatch: bet {} → {}", bet.getId(), outcome);
             } catch (Exception e) {
-                // NOTE: if the failure came from the persistence layer the
-                // surrounding transaction may already be rollback-only, in which
-                // case the whole match retries on the next pass — which is safe,
-                // because settleOneBet only touches PENDING selections.
+                // NOTE: if the failure came from the persistence layer the surrounding
+                // transaction may already be rollback-only, in which case the whole
+                // match retries next pass — safe, because settleOneBet only ever
+                // touches PENDING selections.
                 tally.failed++;
                 log.error("settleMatch: FAILED bet {} on match {} — {}",
                         bet.getId(), match.getId(), e.getMessage(), e);
@@ -261,12 +277,13 @@ public class SettlementEngine {
         return tally;
     }
 
-    // ── Bet-level settlement ──────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // BET-LEVEL SETTLEMENT
+    // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Settles a single slip if — and only if — every one of its legs can be
-     * resolved right now. Anything else is saved and deferred; nothing is ever
-     * paid out while a leg is still unresolved.
+     * Settles a single slip if — and only if — every leg can be resolved right now.
+     * Anything else is saved and deferred; nothing is paid while a leg is unresolved.
      */
     private Outcome settleOneBet(Bet bet, Match triggerMatch, Map<UUID, Match> matchCache) {
 
@@ -281,17 +298,17 @@ public class SettlementEngine {
         boolean anyLegUnsettleable = false;
 
         // ── Step 1: evaluate every PENDING leg whose match can be settled now.
-        // The old code only looked at legs belonging to the trigger match, so a
-        // leg on a match that had already been settled stayed "PENDING" forever
-        // and was then silently priced at full odds in step 3.
+        // The old code only looked at legs on the trigger match, so a leg on a match
+        // settled in an earlier pass stayed "PENDING" forever and was then silently
+        // priced at full odds in the payout step.
         for (BetSelection sel : bet.getSelections()) {
-            if (!"PENDING".equals(sel.getResult())) continue;
+            if (!isPending(sel.getResult())) continue;
 
             Match legMatch = resolveSettleableMatch(sel.getMatchId(), triggerMatch, matchCache);
             if (legMatch == null) {
                 anyLegUnsettleable = true;
                 log.debug("settleOneBet: bet {} sel {} waiting on match {} — not settleable yet",
-                        bet.getId(), sel.getId(), sel.getMatchId());
+                        bet.getId(), selId(sel), sel.getMatchId());
                 continue;
             }
 
@@ -299,14 +316,12 @@ public class SettlementEngine {
             sel.setResult(result);
 
             log.info("settleOneBet: bet {} sel {} match={} market={} selection='{}' oddsLocked={} → {}",
-                    bet.getId(), sel.getId(), sel.getMatchId(), sel.getMarket(),
+                    bet.getId(), selId(sel), sel.getMatchId(), sel.getMarket(),
                     sel.getSelection(), sel.getOddsLocked(), result);
         }
 
-        // ── Step 2: a losing leg kills the slip immediately, even if other legs
-        // are still outstanding. Covers legs lost on an earlier pass too.
-        boolean hasLoss = bet.getSelections().stream().anyMatch(s -> "LOST".equals(s.getResult()));
-        if (hasLoss) {
+        // ── Step 2: a losing leg kills the slip immediately, even with legs outstanding.
+        if (bet.getSelections().stream().anyMatch(s -> "LOST".equals(normaliseResult(s.getResult())))) {
             log.info("settleOneBet: bet {} LOST (losing leg present)", bet.getId());
             betService.settleBet(bet, BetStatus.LOST, null);
             return Outcome.LOST;
@@ -321,28 +336,71 @@ public class SettlementEngine {
         }
 
         // ── Step 4: every leg resolved — price the slip.
-        if (bet.getStake() == null || bet.getTotalOdds() == null) {
-            log.error("settleOneBet: bet {} has null stake ({}) or totalOdds ({}) — cannot price, leaving PENDING",
-                    bet.getId(), bet.getStake(), bet.getTotalOdds());
+        List<String>     results = new ArrayList<>(bet.getSelections().size());
+        List<BigDecimal> odds    = new ArrayList<>(bet.getSelections().size());
+        for (BetSelection sel : bet.getSelections()) {
+            results.add(sel.getResult());
+            odds.add(sel.getOddsLocked());
+        }
+
+        Pricing pricing = price(bet.getStake(), bet.getTotalOdds(), results, odds);
+
+        if (!pricing.priceable()) {
+            log.error("settleOneBet: bet {} cannot be priced ({}) — leaving PENDING", bet.getId(), pricing.detail());
             betService.saveSelectionsOnly(bet);
             return Outcome.SKIPPED;
         }
 
-        BigDecimal oddsAdjustment = BigDecimal.ONE;
+        log.info("settleOneBet: bet {} → {} payout={} ({})",
+                bet.getId(), pricing.status(), pricing.payout(), pricing.detail());
+        betService.settleBet(bet, pricing.status(), pricing.payout());
+
+        return switch (pricing.status()) {
+            case WON  -> Outcome.WON;
+            case LOST -> Outcome.LOST;
+            default   -> Outcome.VOID;
+        };
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // PRICING (pure — no entities, no I/O)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Outcome of pricing a slip. `priceable=false` means: do not touch money. */
+    private record Pricing(boolean priceable, BetStatus status, BigDecimal payout, String detail) {
+        static Pricing unpriceable(String detail) { return new Pricing(false, null, null, detail); }
+    }
+
+    /**
+     * Turns a set of leg results + locked odds into a final status and payout.
+     * Legs that void or push are divided back out of the accumulator; half-won and
+     * half-lost legs are re-priced at (odds+1)/2 and 0.5 respectively.
+     */
+    private Pricing price(BigDecimal stake, BigDecimal totalOdds,
+                          List<String> results, List<BigDecimal> oddsLocked) {
+
+        if (results == null || results.isEmpty())      return Pricing.unpriceable("no selections");
+        if (stake == null || totalOdds == null)        return Pricing.unpriceable("null stake or totalOdds");
+        if (results.size() != oddsLocked.size())       return Pricing.unpriceable("results/odds size mismatch");
+
+        for (String r : results) {
+            if ("LOST".equals(normaliseResult(r))) return new Pricing(true, BetStatus.LOST, null, "losing leg");
+        }
+
+        BigDecimal adjustment = BigDecimal.ONE;
         boolean anyWin = false;
         boolean allNeutral = true;   // every leg VOID/PUSH → stake refund
 
-        for (BetSelection sel : bet.getSelections()) {
-            String result = sel.getResult();
-            BigDecimal odds = sel.getOddsLocked();
+        for (int i = 0; i < results.size(); i++) {
+            String result   = normaliseResult(results.get(i));
+            BigDecimal odds = oddsLocked.get(i);
 
-            // Every branch except a clean WON has to divide the leg back out, so
-            // bad odds make the slip unpriceable rather than silently wrong.
+            if (!isResolved(result)) return Pricing.unpriceable("unresolved leg result '" + result + "'");
+
+            // Every branch except a clean WON divides the leg back out, so bad odds
+            // make the slip unpriceable rather than silently wrong.
             if (!"WON".equals(result) && (odds == null || odds.compareTo(BigDecimal.ZERO) <= 0)) {
-                log.error("settleOneBet: bet {} sel {} has invalid oddsLocked={} for result {} — "
-                                + "cannot price, leaving PENDING", bet.getId(), sel.getId(), odds, result);
-                betService.saveSelectionsOnly(bet);
-                return Outcome.SKIPPED;
+                return Pricing.unpriceable("invalid oddsLocked " + odds + " for result " + result);
             }
 
             switch (result) {
@@ -350,87 +408,81 @@ public class SettlementEngine {
                     anyWin = true;
                     allNeutral = false;
                 }
-                case "VOID", "PUSH" -> oddsAdjustment = oddsAdjustment
-                        .divide(odds, MathContext.DECIMAL64);
+                case "VOID", "PUSH" -> adjustment = adjustment.divide(odds, MathContext.DECIMAL64);
                 case "HALF_WON" -> {
                     anyWin = true;
                     allNeutral = false;
-                    BigDecimal halfWinMultiplier = odds.add(BigDecimal.ONE)
-                            .divide(TWO, MathContext.DECIMAL64);
-                    oddsAdjustment = oddsAdjustment
-                            .divide(odds, MathContext.DECIMAL64)
+                    BigDecimal halfWinMultiplier = odds.add(BigDecimal.ONE).divide(TWO, MathContext.DECIMAL64);
+                    adjustment = adjustment.divide(odds, MathContext.DECIMAL64)
                             .multiply(halfWinMultiplier, MathContext.DECIMAL64);
                 }
                 case "HALF_LOST" -> {
                     allNeutral = false;
-                    oddsAdjustment = oddsAdjustment
-                            .divide(odds, MathContext.DECIMAL64)
+                    adjustment = adjustment.divide(odds, MathContext.DECIMAL64)
                             .multiply(HALF, MathContext.DECIMAL64);
                 }
                 default -> {
-                    // Unreachable: isResolved() gated this above. Defensive only.
-                    log.error("settleOneBet: bet {} sel {} unrecognised result '{}' — leaving PENDING",
-                            bet.getId(), sel.getId(), result);
-                    betService.saveSelectionsOnly(bet);
-                    return Outcome.SKIPPED;
+                    return Pricing.unpriceable("unhandled leg result '" + result + "'");
                 }
             }
         }
 
-        BetStatus finalStatus;
-        BigDecimal payout;
-
         if (allNeutral) {
-            // Whole slip voided/pushed — refund the stake exactly, rather than
-            // relying on the odds cancelling back to 1.0 through DECIMAL64.
-            finalStatus = BetStatus.VOID;
-            payout = bet.getStake().setScale(2, RoundingMode.HALF_UP);
-            log.info("settleOneBet: bet {} VOID (all legs void/push) — refunding stake {}", bet.getId(), payout);
-        } else {
-            BigDecimal effectiveOdds = bet.getTotalOdds().multiply(oddsAdjustment, MathContext.DECIMAL64);
-
-            // The old code clamped effectiveOdds up to 1.0. That is wrong for a
-            // HALF_LOST leg, where a payout below stake is the correct result —
-            // it turned half-losses into full stake refunds. Only guard against
-            // a genuinely nonsensical negative.
-            if (effectiveOdds.compareTo(BigDecimal.ZERO) < 0) {
-                log.error("settleOneBet: bet {} negative effectiveOdds {} — clamping to 0",
-                        bet.getId(), effectiveOdds);
-                effectiveOdds = BigDecimal.ZERO;
-            }
-
-            payout = bet.getStake().multiply(effectiveOdds, MathContext.DECIMAL64)
-                    .setScale(2, RoundingMode.HALF_UP);
-            finalStatus = BetStatus.WON;
-
-            log.debug("settleOneBet: bet {} totalOdds={} × oddsAdjustment={} = effectiveOdds={}",
-                    bet.getId(), bet.getTotalOdds(), oddsAdjustment, effectiveOdds);
-
-            if (!anyWin) {
-                // Only reachable via HALF_LOST legs: pays out, but less than stake.
-                log.warn("settleOneBet: bet {} has no winning leg but is not all-void "
-                        + "(half-lost legs) — payout {} vs stake {}", bet.getId(), payout, bet.getStake());
-            }
+            // Whole slip voided/pushed — refund the stake exactly, rather than relying
+            // on the odds cancelling back to 1.0 through DECIMAL64 division.
+            return new Pricing(true, BetStatus.VOID,
+                    stake.setScale(2, RoundingMode.HALF_UP), "all legs void/push — stake refund");
         }
 
-        log.info("settleOneBet: bet {} → {} payout={}", bet.getId(), finalStatus, payout);
-        betService.settleBet(bet, finalStatus, payout);
-        return finalStatus == BetStatus.WON ? Outcome.WON : Outcome.VOID;
+        BigDecimal effectiveOdds = totalOdds.multiply(adjustment, MathContext.DECIMAL64);
+
+        // The old code clamped effectiveOdds up to 1.0. That is wrong for a HALF_LOST
+        // leg, where a payout below stake is correct — it turned half-losses into full
+        // stake refunds. Only guard against a genuinely nonsensical negative.
+        String detail = "effectiveOdds=" + effectiveOdds;
+        if (effectiveOdds.compareTo(BigDecimal.ZERO) < 0) {
+            effectiveOdds = BigDecimal.ZERO;
+            detail = "negative effectiveOdds clamped to 0";
+        } else if (!anyWin) {
+            // Only reachable via HALF_LOST legs: pays out, but less than stake.
+            detail = "no winning leg, half-lost only — " + detail;
+        }
+
+        BigDecimal payout = stake.multiply(effectiveOdds, MathContext.DECIMAL64)
+                .setScale(2, RoundingMode.HALF_UP);
+
+        return new Pricing(true, BetStatus.WON, payout, detail);
     }
 
-    // ── Settleability helpers ─────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // SETTLEABILITY HELPERS
+    // ══════════════════════════════════════════════════════════════════════
 
     /** A match can be settled once we actually have both scores. */
     private boolean isSettleable(Match match) {
         return match != null && match.getScoreHome() != null && match.getScoreAway() != null;
     }
 
+    /** Null or blank counts as PENDING: a selection may not have been persisted yet. */
+    private boolean isPending(String result) {
+        return "PENDING".equals(normaliseResult(result));
+    }
+
+    /** Null/blank/mixed-case tolerant. Null becomes PENDING, never a silent pass. */
+    private String normaliseResult(String result) {
+        if (result == null || result.isBlank()) return "PENDING";
+        return result.trim().toUpperCase();
+    }
+
     private boolean isResolved(String result) {
-        if (result == null) return false;
-        return switch (result) {
+        return switch (normaliseResult(result)) {
             case "WON", "LOST", "VOID", "PUSH", "HALF_WON", "HALF_LOST" -> true;
             default -> false;
         };
+    }
+
+    private String selId(BetSelection sel) {
+        return sel.getId() == null ? "<unsaved>" : sel.getId().toString();
     }
 
     private Map<UUID, Match> newCache(Match match) {
@@ -442,8 +494,8 @@ public class SettlementEngine {
     /**
      * Returns the match for a leg if it can be settled right now, otherwise null.
      * For legs outside the trigger match we additionally require settledAt, so a
-     * fixture that merely has a provisional score does not settle other slips.
-     * Results (including misses) are cached per pass to keep lookups down.
+     * fixture with a merely provisional score does not settle other slips. Results
+     * (including misses) are cached per pass to keep lookups down.
      */
     private Match resolveSettleableMatch(UUID matchId, Match triggerMatch, Map<UUID, Match> cache) {
         if (matchId == null) {
@@ -470,56 +522,67 @@ public class SettlementEngine {
         return usable;
     }
 
-    // ── Market router ─────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    // MARKET ROUTER
+    // ══════════════════════════════════════════════════════════════════════
 
     private String evaluateSelection(BetSelection sel, Match match) {
-        int h = match.getScoreHome();
-        int a = match.getScoreAway();
+        int[] ht = resolveHalfTimeScore(match);
+        return evaluateMarket(
+                sel.getMarket(), sel.getSelection(),
+                match.getScoreHome(), match.getScoreAway(),
+                ht == null ? null : ht[0],
+                ht == null ? null : ht[1],
+                selId(sel));
+    }
 
-        if (sel.getMarket() == null) {
-            log.warn("evaluateSelection: sel {} has null market — voiding", sel.getId());
+    /**
+     * The whole settlement decision, expressed over plain values. Everything that
+     * decides whether a leg won or lost lives below this line and touches no
+     * entities, no database and no clock — which is what makes selfCheck() possible.
+     */
+    private String evaluateMarket(String rawMarket, String selection,
+                                  int h, int a, Integer htHome, Integer htAway, String selId) {
+
+        if (rawMarket == null) {
+            log.warn("evaluateMarket: sel {} has null market — voiding", selId);
             return "VOID";
         }
 
-        // Normalise: trim, spaces/hyphens → underscores, uppercase.
-        // Handles DB values like "correct_score", "1x2", "Correct Score", "over-under".
-        String market = sel.getMarket()
-                .trim()
-                .replace(' ', '_')
-                .replace('-', '_')
-                .toUpperCase();
+        // Normalise: trim, spaces/hyphens → underscores, uppercase. Handles DB values
+        // like "correct_score", "1x2", "Correct Score", "over-under".
+        String market = rawMarket.trim().replace(' ', '_').replace('-', '_').toUpperCase();
 
-        log.debug("evaluateSelection: sel {} market={} selection='{}' score={}-{}",
-                sel.getId(), market, sel.getSelection(), h, a);
+        log.debug("evaluateMarket: sel {} market={} selection='{}' score={}-{}", selId, market, selection, h, a);
 
         return switch (market) {
             case "1X2", "ONE_X_TWO", "MATCH_RESULT", "FT_RESULT", "FULL_TIME_RESULT" ->
-                    evaluate1X2(sel.getSelection(), h, a, sel.getId().toString());
+                    evaluate1X2(selection, h, a, selId);
 
             case "HOME_WIN"  -> h > a ? "WON" : "LOST";
             case "AWAY_WIN"  -> a > h ? "WON" : "LOST";
 
             case "BTTS", "BOTH_TEAMS_TO_SCORE", "GG_NG", "BOTH_TO_SCORE" ->
-                    evaluateBtts(sel, h, a);
+                    evaluateBtts(selection, h, a, selId);
 
             case "OVER_UNDER", "TOTAL_GOALS", "GOALS_OU", "O/U", "O_U" ->
-                    evaluateOverUnder(sel, h + a);
+                    evaluateOverUnder(selection, h + a, selId);
 
             case "CORRECT_SCORE", "EXACT_SCORE", "CS", "SCORE" ->
-                    evaluateCorrectScore(sel.getSelection(), h, a, sel.getId().toString());
+                    evaluateCorrectScore(selection, h, a, selId);
 
             case "DOUBLE_CHANCE", "DC" ->
-                    evaluateDoubleChance(sel.getSelection(), h, a, sel.getId().toString());
+                    evaluateDoubleChance(selection, h, a, selId);
 
             case "HALF_TIME", "HT_RESULT", "FIRST_HALF", "HT", "HALFTIME" ->
-                    evaluateHalfTime(sel, match);
+                    evaluateHalfTime(selection, htHome, htAway, selId);
 
             case "ASIAN_HANDICAP", "AH", "HANDICAP", "ASIAN_HAND" ->
-                    evaluateAsianHandicap(sel, h, a);
+                    evaluateAsianHandicap(selection, h, a, selId);
 
             default -> {
-                log.warn("evaluateSelection: unknown market '{}' (normalised='{}') for sel {} — voiding",
-                        sel.getMarket(), market, sel.getId());
+                log.warn("evaluateMarket: unknown market '{}' (normalised='{}') for sel {} — voiding",
+                        rawMarket, market, selId);
                 yield "VOID";
             }
         };
@@ -529,8 +592,6 @@ public class SettlementEngine {
 
     private String evaluate1X2(String selection, int h, int a, String selId) {
         String s = selection == null ? "" : selection.trim().toUpperCase();
-        log.debug("evaluate1X2: sel {} normalised='{}' score={}-{}", selId, s, h, a);
-
         return switch (s) {
             case "HOME", "HOME WIN", "1", "H", "TEAM1", "HOMETEAM" -> h > a ? "WON" : "LOST";
             case "DRAW", "X", "DRAW/X", "TIE", "LEVEL"             -> h == a ? "WON" : "LOST";
@@ -552,23 +613,19 @@ public class SettlementEngine {
         // Normalise separator — accept "2-2", "2:2", "2 2", "2_2"
         String normalised = selection.trim().replaceAll("[:\\s_]", "-");
         String expected   = h + "-" + a;
-        String r = expected.equals(normalised) ? "WON" : "LOST";
-        log.debug("evaluateCorrectScore: sel {} expected='{}' got='{}' normalised='{}' → {}",
-                selId, expected, selection, normalised, r);
-        return r;
+        return expected.equals(normalised) ? "WON" : "LOST";
     }
 
     // ── BTTS ──────────────────────────────────────────────────────────────
 
-    private String evaluateBtts(BetSelection sel, int h, int a) {
-        String s = sel.getSelection() == null ? "" : sel.getSelection().trim().toLowerCase();
+    private String evaluateBtts(String selection, int h, int a, String selId) {
+        String s = selection == null ? "" : selection.trim().toLowerCase();
         boolean bothScored = h > 0 && a > 0;
         Boolean wantsBoth = switch (s) {
             case "yes", "y", "true", "1", "both", "gg" -> true;
             case "no",  "n", "false", "0", "ng"        -> false;
             default -> {
-                log.warn("evaluateBtts: sel {} unrecognised selection '{}' — VOID",
-                        sel.getId(), sel.getSelection());
+                log.warn("evaluateBtts: sel {} unrecognised selection '{}' — VOID", selId, selection);
                 yield null;
             }
         };
@@ -578,8 +635,8 @@ public class SettlementEngine {
 
     // ── Over / Under ──────────────────────────────────────────────────────
 
-    private String evaluateOverUnder(BetSelection sel, int totalGoals) {
-        String raw = sel.getSelection() == null ? "" : sel.getSelection().trim().toLowerCase();
+    private String evaluateOverUnder(String selection, int totalGoals, String selId) {
+        String raw = selection == null ? "" : selection.trim().toLowerCase();
 
         boolean isOver;
         if (raw.startsWith("over") || raw.startsWith("+") || raw.startsWith("o")) {
@@ -587,8 +644,7 @@ public class SettlementEngine {
         } else if (raw.startsWith("under") || raw.startsWith("u")) {
             isOver = false;
         } else {
-            log.warn("evaluateOverUnder: sel {} cannot determine over/under from '{}' — VOID",
-                    sel.getId(), sel.getSelection());
+            log.warn("evaluateOverUnder: sel {} cannot determine over/under from '{}' — VOID", selId, selection);
             return "VOID";
         }
 
@@ -596,16 +652,15 @@ public class SettlementEngine {
         // "over 2.5", "Over 2,5 goals" and "+2.5" all parse.
         Double parsed = parseLine(raw);
         if (parsed == null) {
-            log.warn("evaluateOverUnder: sel {} cannot parse line from '{}' — VOID",
-                    sel.getId(), sel.getSelection());
+            log.warn("evaluateOverUnder: sel {} cannot parse line from '{}' — VOID", selId, selection);
             return "VOID";
         }
         double line = Math.abs(parsed);
-
         double frac = Math.abs(line % 1);
+
         if (frac > 0.01 && Math.abs(frac - 0.5) > 0.01) {
             // Quarter goal lines (2.25 / 2.75) would need split-stake handling.
-            log.warn("evaluateOverUnder: sel {} unsupported quarter line {} — VOID", sel.getId(), line);
+            log.warn("evaluateOverUnder: sel {} unsupported quarter line {} — VOID", selId, line);
             return "VOID";
         }
 
@@ -619,7 +674,7 @@ public class SettlementEngine {
         String s = selection == null ? "" : selection.trim().toUpperCase()
                 .replace("/", "")
                 .replace(" ", "");
-        String r = switch (s) {
+        return switch (s) {
             case "1X", "HX", "HOMEORDRAW", "HOMEORLEVEL" -> h >= a ? "WON" : "LOST";
             case "X2", "XA", "DRAWORAWAY", "LEVELORAWAY" -> a >= h ? "WON" : "LOST";
             case "12", "HA", "HOMEORAWAY"                -> h != a ? "WON" : "LOST";
@@ -628,37 +683,26 @@ public class SettlementEngine {
                 yield "VOID";
             }
         };
-        log.debug("evaluateDoubleChance: sel {} selection='{}' score={}-{} → {}", selId, s, h, a, r);
-        return r;
     }
 
     // ── Half-Time ─────────────────────────────────────────────────────────
 
-    private String evaluateHalfTime(BetSelection sel, Match match) {
-        int[] ht = resolveHalfTimeScore(match);
-        if (ht == null) {
-            log.warn("evaluateHalfTime: missing ht metadata for match {} sel {} — VOID",
-                    match.getId(), sel.getId());
+    private String evaluateHalfTime(String selection, Integer htHome, Integer htAway, String selId) {
+        if (htHome == null || htAway == null) {
+            log.warn("evaluateHalfTime: sel {} missing half-time metadata — VOID", selId);
             return "VOID";
         }
-        int htHome = ht[0];
-        int htAway = ht[1];
 
-        String s = sel.getSelection() == null ? "" : sel.getSelection().trim().toUpperCase();
-        String r = switch (s) {
-            case "HOME", "HOME WIN", "1", "H" -> htHome > htAway  ? "WON" : "LOST";
-            case "DRAW", "X", "TIE"           -> htHome == htAway ? "WON" : "LOST";
-            case "AWAY", "AWAY WIN", "2", "A" -> htAway > htHome  ? "WON" : "LOST";
+        String s = selection == null ? "" : selection.trim().toUpperCase();
+        return switch (s) {
+            case "HOME", "HOME WIN", "1", "H" -> htHome > htAway         ? "WON" : "LOST";
+            case "DRAW", "X", "TIE"           -> htHome.equals(htAway)   ? "WON" : "LOST";
+            case "AWAY", "AWAY WIN", "2", "A" -> htAway > htHome         ? "WON" : "LOST";
             default -> {
-                log.warn("evaluateHalfTime: sel {} unrecognised selection '{}' — VOID",
-                        sel.getId(), sel.getSelection());
+                log.warn("evaluateHalfTime: sel {} unrecognised selection '{}' — VOID", selId, selection);
                 yield "VOID";
             }
         };
-
-        log.debug("evaluateHalfTime: sel {} ht={}-{} selection='{}' → {}",
-                sel.getId(), htHome, htAway, s, r);
-        return r;
     }
 
     /** Half-time score as {home, away}, or null if no key variant is present. */
@@ -693,8 +737,8 @@ public class SettlementEngine {
 
     // ── Asian Handicap ────────────────────────────────────────────────────
 
-    private String evaluateAsianHandicap(BetSelection sel, int h, int a) {
-        String raw = sel.getSelection() == null ? "" : sel.getSelection().trim();
+    private String evaluateAsianHandicap(String selection, int h, int a, String selId) {
+        String raw = selection == null ? "" : selection.trim();
         String upper = raw.toUpperCase();
 
         boolean bettingHome;
@@ -713,7 +757,7 @@ public class SettlementEngine {
             bettingHome = false;
             rest = raw.substring(1);
         } else {
-            log.warn("evaluateAsianHandicap: sel {} cannot parse side from '{}' — VOID", sel.getId(), raw);
+            log.warn("evaluateAsianHandicap: sel {} cannot parse side from '{}' — VOID", selId, raw);
             return "VOID";
         }
 
@@ -721,48 +765,38 @@ public class SettlementEngine {
         Double parsed = parseLine(rest);
         if (parsed == null) {
             log.warn("evaluateAsianHandicap: sel {} cannot parse line from '{}' rest='{}' — VOID",
-                    sel.getId(), raw, rest);
+                    selId, raw, rest);
             return "VOID";
         }
         double line = parsed;
 
+        // gd is already from the backed side's point of view, so a side-specific
+        // line is applied as written. The old code negated it unconditionally for
+        // away bets, which paid out losing bets: "AWAY -1.5" on a 0-1 away win
+        // became gd(1) + 1.5 = 2.5 -> WON, when the away side did not cover.
         int    gd            = bettingHome ? (h - a) : (a - h);
-        double effectiveLine = bettingHome ? line : -line;
+        double effectiveLine = (bettingHome || !AH_LINE_IS_HOME_PERSPECTIVE) ? line : -line;
         double frac          = Math.abs(effectiveLine % 1);
 
         log.debug("evaluateAsianHandicap: sel {} side={} line={} score={}-{} gd={} effectiveLine={}",
-                sel.getId(), bettingHome ? "HOME" : "AWAY", line, h, a, gd, effectiveLine);
+                selId, bettingHome ? "HOME" : "AWAY", line, h, a, gd, effectiveLine);
 
-        String result;
-        if (frac < 0.01) {
-            result = evaluateWholeHandicap(gd + effectiveLine, sel.getId().toString());
-        } else if (Math.abs(frac - 0.5) < 0.01) {
-            result = evaluateHalfHandicap(gd + effectiveLine, sel.getId().toString());
-        } else if (Math.abs(frac - 0.25) < 0.01 || Math.abs(frac - 0.75) < 0.01) {
-            result = evaluateQuarterHandicap(effectiveLine, gd, sel.getId().toString());
-        } else {
-            log.warn("evaluateAsianHandicap: sel {} unrecognised frac={} for line={} — VOID",
-                    sel.getId(), frac, line);
-            result = "VOID";
-        }
+        if (frac < 0.01)                        return evaluateWholeHandicap(gd + effectiveLine, selId);
+        if (Math.abs(frac - 0.5) < 0.01)        return evaluateHalfHandicap(gd + effectiveLine, selId);
+        if (Math.abs(frac - 0.25) < 0.01
+                || Math.abs(frac - 0.75) < 0.01) return evaluateQuarterHandicap(effectiveLine, gd, selId);
 
-        log.debug("evaluateAsianHandicap: sel {} → {}", sel.getId(), result);
-        return result;
+        log.warn("evaluateAsianHandicap: sel {} unrecognised frac={} for line={} — VOID", selId, frac, line);
+        return "VOID";
     }
 
     private String evaluateHalfHandicap(double adjustedGD, String selId) {
-        String r = adjustedGD > 0 ? "WON" : "LOST";
-        log.debug("evaluateHalfHandicap: sel {} adjustedGD={} → {}", selId, adjustedGD, r);
-        return r;
+        return adjustedGD > 0 ? "WON" : "LOST";
     }
 
     private String evaluateWholeHandicap(double adjustedGD, String selId) {
-        String r;
-        if      (Math.abs(adjustedGD) < 0.01) r = "PUSH";
-        else if (adjustedGD > 0)              r = "WON";
-        else                                  r = "LOST";
-        log.debug("evaluateWholeHandicap: sel {} adjustedGD={} → {}", selId, adjustedGD, r);
-        return r;
+        if (Math.abs(adjustedGD) < 0.01) return "PUSH";
+        return adjustedGD > 0 ? "WON" : "LOST";
     }
 
     private String evaluateQuarterHandicap(double effectiveLine, int gd, String selId) {
@@ -782,8 +816,8 @@ public class SettlementEngine {
         double adjGD = gd + subLine;
         double frac  = Math.abs(subLine % 1);
 
-        if (frac < 0.01)                 return evaluateWholeHandicap(adjGD, selId + "-whole");
-        if (Math.abs(frac - 0.5) < 0.01) return evaluateHalfHandicap(adjGD,  selId + "-half");
+        if (frac < 0.01)                 return evaluateWholeHandicap(adjGD, selId);
+        if (Math.abs(frac - 0.5) < 0.01) return evaluateHalfHandicap(adjGD,  selId);
 
         log.warn("settleSingleLine: sel {} unexpected frac={} for subLine={} — VOID", selId, frac, subLine);
         return "VOID";
@@ -816,5 +850,152 @@ public class SettlementEngine {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SELF-CHECK
+    // ══════════════════════════════════════════════════════════════════════
+    //
+    // Runs the settlement logic against known-answer fixtures. Touches no database,
+    // no wallet and no entities — it calls evaluateMarket() and price() directly, so
+    // it is safe to run at any time (startup, admin endpoint, after a deploy).
+    //
+    //   int failures = settlementEngine.selfCheck();
+    //
+    // Returns the number of failing fixtures; 0 means the engine agrees with every
+    // expectation below. Add a row whenever a settlement bug is found in the wild.
+
+    /** market | selection | homeScore | awayScore | htHome | htAway | expected result */
+    private static final String[][] MARKET_FIXTURES = {
+            // 1X2 and its aliases
+            {"1X2",            "HOME",        "2", "0", "", "", "WON"},
+            {"match_result",   "away",        "2", "0", "", "", "LOST"},
+            {"FT_RESULT",      "X",           "1", "1", "", "", "WON"},
+            {"1X2",            "nonsense",    "1", "1", "", "", "VOID"},
+            // Double chance
+            {"DOUBLE_CHANCE",  "1X",          "0", "0", "", "", "WON"},
+            {"DC",             "X2",          "1", "0", "", "", "LOST"},
+            {"DOUBLE_CHANCE",  "12",          "1", "1", "", "", "LOST"},
+            // Both teams to score
+            {"BTTS",           "yes",         "1", "1", "", "", "WON"},
+            {"both_to_score",  "NG",          "1", "0", "", "", "WON"},
+            // Correct score, separator variants
+            {"CORRECT_SCORE",  "2-1",         "2", "1", "", "", "WON"},
+            {"Correct Score",  "2:1",         "2", "1", "", "", "WON"},
+            {"CS",             "2 1",         "1", "2", "", "", "LOST"},
+            // Over/under, including formats the old parser rejected
+            {"OVER_UNDER",     "o2.5",        "1", "1", "", "", "LOST"},
+            {"OVER_UNDER",     "Over 1,5",    "1", "1", "", "", "WON"},
+            {"total_goals",    "under 2.5",   "1", "1", "", "", "WON"},
+            {"OVER_UNDER",     "U2",          "1", "1", "", "", "PUSH"},
+            {"OVER_UNDER",     "+2.5",        "1", "1", "", "", "LOST"},
+            {"OVER_UNDER",     "over 2.25",   "1", "1", "", "", "VOID"},
+            // Half time, present and missing
+            {"HALF_TIME",      "AWAY",        "2", "2", "0",  "1", "WON"},
+            {"Half Time",      "HOME",        "2", "2", "0",  "1", "LOST"},
+            {"HT_RESULT",      "HOME",        "2", "2", "",   "",  "VOID"},
+            // Asian handicap: whole, half, quarter
+            {"ASIAN_HANDICAP", "HOME -1",     "2", "1", "", "", "PUSH"},
+            {"ASIAN_HANDICAP", "HOME -1.5",   "2", "0", "", "", "WON"},
+            {"AH",             "AWAY +0.5",   "1", "1", "", "", "WON"},
+            {"ASIAN_HANDICAP", "HOME -0.25",  "0", "0", "", "", "HALF_LOST"},
+            {"ASIAN_HANDICAP", "HOME +0.25",  "0", "0", "", "", "HALF_WON"},
+            {"ASIAN_HANDICAP", "HOME +0.25",  "1", "0", "", "", "WON"},
+            {"ASIAN_HANDICAP", "HOME: -1,5",  "3", "0", "", "", "WON"},
+            {"AH",             "AWAY -1.5",   "0", "1", "", "", "LOST"},
+            {"AH",             "AWAY -1.5",   "0", "3", "", "", "WON"},
+            {"AH",             "AWAY +0.25",  "0", "0", "", "", "HALF_WON"},
+            {"AH",             "AWAY -1",     "0", "1", "", "", "PUSH"},
+            {"ASIAN_HANDICAP", "-1.5",        "3", "0", "", "", "VOID"},
+            // Unknown market must void, never guess
+            {"MYSTERY_MARKET", "HOME",        "1", "0", "", "", "VOID"},
+    };
+
+    /** stake | totalOdds | leg results as RESULT:ODDS,… | expected status | expected payout */
+    private static final String[][] PRICING_FIXTURES = {
+            {"100", "4.00", "WON:2.00,WON:2.00",       "WON",  "400.00"},
+            {"100", "4.00", "WON:2.00,LOST:2.00",      "LOST", ""},
+            {"50",  "3.00", "VOID:3.00",               "VOID", "50.00"},
+            {"50",  "6.00", "VOID:3.00,PUSH:2.00",     "VOID", "50.00"},
+            {"10",  "6.00", "WON:2.00,VOID:3.00",      "WON",  "20.00"},
+            {"100", "2.00", "HALF_LOST:2.00",          "WON",  "50.00"},
+            {"100", "2.00", "HALF_WON:2.00",           "WON",  "150.00"},
+            {"100", "4.00", "WON:2.00,HALF_WON:2.00",  "WON",  "300.00"},
+            // Must refuse to price rather than guess
+            {"100", "4.00", "WON:2.00,PENDING:2.00",   "",     ""},
+            {"100", "4.00", "WON:2.00,VOID:0",         "",     ""},
+            // A won leg never divides its own odds back out, so a corrupt oddsLocked
+            // on a winning leg is harmless — the payout comes from totalOdds.
+            {"100", "4.00", "WON:2.00,WON:0",          "WON",  "400.00"},
+    };
+
+    /**
+     * Verifies the settlement logic against the fixtures above.
+     * @return number of failing fixtures (0 = everything agrees)
+     */
+    public int selfCheck() {
+        int passed = 0, failed = 0;
+
+        for (String[] f : MARKET_FIXTURES) {
+            String market = f[0], selection = f[1], expected = f[6];
+            int h = Integer.parseInt(f[2]), a = Integer.parseInt(f[3]);
+            Integer htHome = f[4].isEmpty() ? null : Integer.valueOf(f[4]);
+            Integer htAway = f[5].isEmpty() ? null : Integer.valueOf(f[5]);
+
+            String actual;
+            try {
+                actual = evaluateMarket(market, selection, h, a, htHome, htAway, "self-check");
+            } catch (Exception e) {
+                actual = "EXCEPTION: " + e;
+            }
+
+            if (expected.equals(actual)) {
+                passed++;
+            } else {
+                failed++;
+                log.error("SELF-CHECK FAIL [market] {} '{}' at {}-{} → {} (expected {})",
+                        market, selection, h, a, actual, expected);
+            }
+        }
+
+        for (String[] f : PRICING_FIXTURES) {
+            String expectedStatus = f[3], expectedPayout = f[4];
+
+            List<String>     results = new ArrayList<>();
+            List<BigDecimal> odds    = new ArrayList<>();
+            for (String leg : f[2].split(",")) {
+                String[] parts = leg.split(":");
+                results.add(parts[0]);
+                odds.add(new BigDecimal(parts[1]));
+            }
+
+            Pricing p;
+            try {
+                p = price(new BigDecimal(f[0]), new BigDecimal(f[1]), results, odds);
+            } catch (Exception e) {
+                failed++;
+                log.error("SELF-CHECK FAIL [pricing] {} → EXCEPTION {}", f[2], e.toString());
+                continue;
+            }
+
+            String actualStatus = p.priceable() ? p.status().name() : "";
+            String actualPayout = p.payout() == null ? "" : p.payout().toPlainString();
+
+            if (expectedStatus.equals(actualStatus) && expectedPayout.equals(actualPayout)) {
+                passed++;
+            } else {
+                failed++;
+                log.error("SELF-CHECK FAIL [pricing] stake={} odds={} legs={} → {}/{} (expected {}/{}) — {}",
+                        f[0], f[1], f[2], actualStatus, actualPayout,
+                        expectedStatus, expectedPayout, p.detail());
+            }
+        }
+
+        if (failed == 0) {
+            log.info("SELF-CHECK COMPLETE — {} fixture(s) passed, 0 failed", passed);
+        } else {
+            log.error("SELF-CHECK COMPLETE — {} passed, {} FAILED (see errors above)", passed, failed);
+        }
+        return failed;
     }
 }
