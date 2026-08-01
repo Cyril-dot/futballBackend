@@ -119,6 +119,14 @@ public class SuperAdminDtos {
 
     // ─── Single User Detail ───────────────────────────────────────────────────
 
+    public record WalletCreditDto(
+            UUID userId,
+            BigDecimal amount,
+            BigDecimal newBalance,
+            String message,
+            UUID transactionId
+    ) {}
+
     public record UserDetailDto(
             UUID id,
             String email,
