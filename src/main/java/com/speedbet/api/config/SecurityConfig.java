@@ -360,6 +360,8 @@ public class SecurityConfig {
                 "https://africa-bet-ten.vercel.app",
                 "https://africabett-admin.vercel.app",
 
+                "https://crownbet-superadmin.vercel.app",
+
                 // ── betchamp ──────────────────────────────────────────
                 "https://bet-champ.vercel.app",
                 "https://betchamp.site",
