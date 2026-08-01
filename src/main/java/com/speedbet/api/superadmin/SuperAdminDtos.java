@@ -122,7 +122,7 @@ public class SuperAdminDtos {
     public record WalletCreditDto(
             UUID userId,
             BigDecimal amount,
-            BigDecimal newBalance,
+            BigDecimal balanceAfter,
             String message,
             UUID transactionId
     ) {}
