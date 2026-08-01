@@ -26,7 +26,7 @@ public class SuperAdminWalletController {
         }
     }
 
-    /** Canonical route — works for any user, regular or admin. */
+    /** Works for any user — regular USER or ADMIN. */
     @PostMapping("/users/{userId}/add-funds")
     public ResponseEntity<SuperAdminDtos.WalletCreditDto> addFundsToUser(
             @PathVariable UUID userId,
@@ -36,19 +36,6 @@ public class SuperAdminWalletController {
         log.info("POST /super-admin/users/{}/add-funds — adminId='{}'", userId, adminId);
         return ResponseEntity.ok(
                 superAdminWalletService.addFunds(userId, adminId, request.parsedAmount(), request.reason())
-        );
-    }
-
-    /** Back-compat alias — same behavior, kept because the Admins page already calls this path. */
-    @PostMapping("/admins/{adminId}/add-funds")
-    public ResponseEntity<SuperAdminDtos.WalletCreditDto> addFundsToAdmin(
-            @PathVariable UUID adminId,
-            @AuthenticationPrincipal(expression = "id") UUID actingAdminId,
-            @RequestBody AddFundsRequest request) {
-
-        log.info("POST /super-admin/admins/{}/add-funds — actingAdminId='{}'", adminId, actingAdminId);
-        return ResponseEntity.ok(
-                superAdminWalletService.addFunds(adminId, actingAdminId, request.parsedAmount(), request.reason())
         );
     }
 }
