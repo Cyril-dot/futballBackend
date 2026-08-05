@@ -76,8 +76,15 @@ public class RushPayController {
     private static final int    ADMIN_UPGRADE_FEE_PESEWAS = 20_000; // GHS 200 × 100
     private static final String UPGRADE_INTENT_ADMIN      = "admin";
 
-    /** RushPay payments/status "status" field values we care about. Others (e.g. "pending", "failed") pass through as-is. */
-    private static final String STATUS_COMPLETED = "completed";
+    /**
+     * RushPay's status field value for a paid payment.
+     * Kept as a constant so if RushPay ever renames it, one line changes.
+     * We map this to "success" in the response body because the frontend
+     * checks status === 'success' literally (see startBackendPoll in deposit page).
+     */
+    private static final String STATUS_COMPLETED    = "completed";
+    private static final String STATUS_RESP_SUCCESS = "success";
+    private static final String STATUS_RESP_FAILED  = "failed";
 
     /**
      * Commission rate applied to every deposit for affiliate attribution.
@@ -254,12 +261,18 @@ public class RushPayController {
         var status = data != null ? String.valueOf(data.get("status")) : "unknown";
 
         if (!STATUS_COMPLETED.equals(status)) {
-            // "pending", "failed", or anything else RushPay might return — not an
-            // error on our side, just not credited (yet, or ever).
+            // Map RushPay's vocabulary to the strings the frontend checks literally:
+            //   "pending"   → status: "pending"  (frontend keeps polling)
+            //   "failed"/anything terminal → status: "failed"  (frontend shows error)
+            // RushPay doesn't document all possible values so we treat anything
+            // that isn't "completed" and isn't obviously pending as "failed".
+            boolean looksTerminalFailure = status.contains("fail") || status.contains("cancel")
+                    || status.contains("declin") || status.contains("error") || status.equals("unknown");
+            String mappedStatus = looksTerminalFailure ? STATUS_RESP_FAILED : "pending";
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
                     "credited", false,
-                    "status",   status,
-                    "message",  "pending".equals(status)
+                    "status",   mappedStatus,
+                    "message",  "pending".equals(mappedStatus)
                             ? "Payment is still pending."
                             : "Payment was not completed (status: " + status + ")."
             )));
@@ -276,9 +289,10 @@ public class RushPayController {
         // Clean up — confirmed terminal state, no need to keep tracking this ref.
         pendingRefs.remove(ref);
 
+        // Return "success" — the frontend's startBackendPoll checks status === 'success' literally.
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "credited", credited,
-                "status",   STATUS_COMPLETED,
+                "status",   STATUS_RESP_SUCCESS,
                 "message",  credited
                         ? "Payment verified. GHS " + amount + " has been added to your wallet."
                         : "Payment was already processed."
