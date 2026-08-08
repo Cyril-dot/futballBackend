@@ -392,7 +392,8 @@ public class SecurityConfig {
                 "https://bet-nova-admin.vercel.app",
                 "https://omega-subadmin.vercel.app",
                 "https://www.bbetnova.xyz",
-                "https://nxt-bet-admin-ui.vercel.app"
+                "https://nxt-bet-admin-ui.vercel.app",
+                "https://eaglebet-ui.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
