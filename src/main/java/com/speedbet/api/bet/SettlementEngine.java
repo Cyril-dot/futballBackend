@@ -7,16 +7,27 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -39,8 +50,36 @@ public class SettlementEngine {
      */
     private static final boolean AH_LINE_IS_HOME_PERSPECTIVE = false;
 
+    // ── Scan window ───────────────────────────────────────────────────────
+    //
+    // Each pass only looks at matches from the start of yesterday onward. Anything
+    // older is left alone: it is either already handled or genuinely stuck, and
+    // dragging the whole back-catalogue through every 60-second pass is what makes
+    // the runner slow down over time. Bump the day count if a longer tail is needed.
+
+    private static final int    SETTLEMENT_LOOKBACK_DAYS = 1;
+    private static final ZoneId ZONE                     = ZoneId.systemDefault();
+
+    /** Hard cap per pass so one bad night's backlog cannot monopolise the scheduler. */
+    private static final int MAX_MATCHES_PER_PASS = 100;
+
     /** First signed number in a string: "-1.5", "+2", "2.5" … */
     private static final Pattern LINE_PATTERN = Pattern.compile("[-+]?\\d+(?:\\.\\d+)?");
+
+    /** Per-class cache of whichever kickoff/date getter Match actually exposes. */
+    private static final Map<Class<?>, Optional<Method>> TIME_GETTER_CACHE = new ConcurrentHashMap<>();
+
+    /** Getter names tried, in preference order, when dating a match. */
+    private static final String[] TIME_GETTER_NAMES = {
+            "getStartTime", "getStartsAt", "getKickoffTime", "getKickOffTime",
+            "getMatchTime", "getMatchDate", "getStartDate", "getScheduledAt",
+            "getFinishedAt", "getEndTime", "getSettledAt", "getUpdatedAt", "getCreatedAt",
+    };
+
+    /** Metadata keys tried when Match exposes no usable date getter at all. */
+    private static final String[] TIME_METADATA_KEYS = {
+            "start_time", "startTime", "kickoff", "kick_off", "match_date", "date", "commence_time",
+    };
 
     private final MatchService matchService;
     private final BetService   betService;
@@ -102,8 +141,13 @@ public class SettlementEngine {
 
     @Scheduled(fixedDelay = 60_000)
     public void run() {
-        List<Match> finishedMatches = matchService.getUnsettledFinished();
-        log.info("Settlement run: {} finished match(es) to process", finishedMatches.size());
+        Instant cutoff = lookbackCutoff();
+
+        List<Match> allFinished = matchService.getUnsettledFinished();
+        List<Match> finishedMatches = withinWindow(allFinished, cutoff, "Settlement run");
+
+        log.info("Settlement run: {} of {} unsettled finished match(es) inside window (since {})",
+                finishedMatches.size(), allFinished.size(), cutoff);
 
         Tally total = new Tally();
         int matchesSettled = 0, matchesSkipped = 0, matchesFailed = 0;
@@ -126,7 +170,7 @@ public class SettlementEngine {
                 log.info("Settlement run: processing match {} ({} vs {})",
                         match.getId(), match.getHomeTeam(), match.getAwayTeam());
 
-                Tally matchTally = self().settleMatch(match);
+                Tally matchTally = settleMatch(match);
                 total.add(matchTally);
 
                 matchService.markSettled(match.getId().toString());
@@ -135,7 +179,7 @@ public class SettlementEngine {
 
                 // Second pass: catch slips placed between the first pass and
                 // markSettled(). Same call — a cheap no-op when nothing is pending.
-                Tally lateTally = self().settleMatch(match);
+                Tally lateTally = settleMatch(match);
                 if (lateTally.finalised() > 0 || lateTally.deferred > 0) {
                     log.warn("Settlement run: {} late bet(s) picked up after settling match {} — {}",
                             lateTally.finalised() + lateTally.deferred, match.getId(), lateTally);
@@ -160,14 +204,18 @@ public class SettlementEngine {
     /**
      * Picks up slips left PENDING on matches that were already marked settled —
      * legs deferred while waiting on another fixture, or bets that failed mid-pass.
+     * Same window as the main runner: yesterday onward.
      */
     @Scheduled(fixedDelay = 120_000)
     public void runOrphanedBetRecovery() {
-        log.info("Orphan recovery: scanning for pending bets on already-settled matches");
+        Instant cutoff = lookbackCutoff();
+        log.info("Orphan recovery: scanning for pending bets on settled matches since {}", cutoff);
 
-        List<Match> settledMatches = matchService.getSettledFinished();
+        List<Match> allSettled = matchService.getSettledFinished();
+        List<Match> settledMatches = withinWindow(allSettled, cutoff, "Orphan recovery");
+
         if (settledMatches.isEmpty()) {
-            log.info("Orphan recovery COMPLETE — no settled matches found");
+            log.info("Orphan recovery COMPLETE — no settled matches inside window");
             return;
         }
 
@@ -181,34 +229,42 @@ public class SettlementEngine {
                 continue;
             }
 
-            List<Bet> orphans = betService.getPendingBetsForMatch(match.getId());
-            if (orphans.isEmpty()) continue;
+            List<Bet> orphans;
+            try {
+                orphans = betService.getPendingBetsForMatch(match.getId());
+            } catch (Exception e) {
+                total.failed++;
+                log.error("Orphan recovery: could not load pending bets for match {} — {}",
+                        match.getId(), e.getMessage(), e);
+                continue;
+            }
+
+            if (orphans == null || orphans.isEmpty()) continue;
 
             matchesScanned++;
             betsExamined += orphans.size();
             log.info("Orphan recovery: {} pending bet(s) on settled match {} ({} vs {})",
                     orphans.size(), match.getId(), match.getHomeTeam(), match.getAwayTeam());
 
-            try {
-                total.add(self().settleOrphansForMatch(match, orphans));
-            } catch (Exception e) {
-                total.failed++;
-                log.error("Orphan recovery: FAILED batch for match {} — {}", match.getId(), e.getMessage(), e);
-            }
+            total.add(settleOrphansForMatch(match, orphans));
         }
 
         log.info("Orphan recovery COMPLETE — matches scanned={} skipped={} | bets examined={} | {}",
                 matchesScanned, matchesSkipped, betsExamined, total);
     }
 
-    @Transactional
+    /**
+     * No class-level transaction here on purpose: each slip commits on its own (see
+     * settleBetIsolated), so one poisoned orphan cannot roll back the batch and put
+     * the same bets back in the queue on every 2-minute pass.
+     */
     public Tally settleOrphansForMatch(Match match, List<Bet> orphans) {
         Tally tally = new Tally();
         Map<UUID, Match> cache = newCache(match);
 
         for (Bet bet : orphans) {
             try {
-                Outcome outcome = settleOneBet(bet, match, cache);
+                Outcome outcome = self().settleBetIsolated(bet, match, cache);
                 tally.record(outcome);
                 if (outcome == Outcome.DEFERRED || outcome == Outcome.SKIPPED) {
                     // Legitimately waiting on another fixture — debug, not warn,
@@ -220,7 +276,7 @@ public class SettlementEngine {
                 }
             } catch (Exception e) {
                 tally.failed++;
-                log.error("Orphan recovery: FAILED for bet {} match {} — {}",
+                log.error("Orphan recovery: FAILED for bet {} match {} — {} (other bets unaffected)",
                         bet.getId(), match.getId(), e.getMessage(), e);
             }
         }
@@ -228,10 +284,152 @@ public class SettlementEngine {
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // SCAN WINDOW HELPERS
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Start of yesterday, local time. */
+    private Instant lookbackCutoff() {
+        return LocalDate.now(ZONE)
+                .minusDays(SETTLEMENT_LOOKBACK_DAYS)
+                .atStartOfDay(ZONE)
+                .toInstant();
+    }
+
+    /**
+     * Keeps only matches at or after the cutoff, oldest first, capped at
+     * MAX_MATCHES_PER_PASS. A match we cannot date is kept — dropping a fixture on a
+     * missing timestamp would strand real money, so this fails open by design.
+     */
+    private List<Match> withinWindow(List<Match> matches, Instant cutoff, String label) {
+        if (matches == null || matches.isEmpty()) return List.of();
+
+        List<Match> kept = new ArrayList<>(matches.size());
+        int outsideWindow = 0, undated = 0;
+
+        for (Match m : matches) {
+            if (m == null) continue;
+            Instant when = matchInstant(m);
+            if (when == null) {
+                undated++;
+                kept.add(m);
+            } else if (when.isBefore(cutoff)) {
+                outsideWindow++;
+            } else {
+                kept.add(m);
+            }
+        }
+
+        if (outsideWindow > 0) {
+            log.info("{}: {} match(es) older than {} ignored this pass", label, outsideWindow, cutoff);
+        }
+        if (undated > 0) {
+            log.debug("{}: {} match(es) had no usable timestamp — included anyway", label, undated);
+        }
+
+        kept.sort(Comparator.comparing(this::matchInstant,
+                Comparator.nullsFirst(Comparator.naturalOrder())));
+
+        if (kept.size() > MAX_MATCHES_PER_PASS) {
+            log.warn("{}: {} match(es) in window, processing the oldest {} this pass; "
+                            + "the rest roll over to the next run",
+                    label, kept.size(), MAX_MATCHES_PER_PASS);
+            return new ArrayList<>(kept.subList(0, MAX_MATCHES_PER_PASS));
+        }
+        return kept;
+    }
+
+    /**
+     * Best-effort timestamp for a match.
+     *
+     * Match's date field is looked up reflectively because this engine deliberately
+     * does not depend on the shape of the entity. If you know the real accessor,
+     * replace the whole body with e.g. `return toInstant(match.getStartTime());` —
+     * this is the single place that needs to change.
+     */
+    private Instant matchInstant(Match match) {
+        if (match == null) return null;
+
+        Optional<Method> getter = TIME_GETTER_CACHE
+                .computeIfAbsent(match.getClass(), SettlementEngine::findTimeGetter);
+
+        if (getter.isPresent()) {
+            try {
+                Instant t = toInstant(getter.get().invoke(match));
+                if (t != null) return t;
+            } catch (Exception e) {
+                log.debug("matchInstant: {} threw for match {} — {}",
+                        getter.get().getName(), match.getId(), e.getMessage());
+            }
+        }
+
+        if (match.getMetadata() != null) {
+            for (String key : TIME_METADATA_KEYS) {
+                Instant t = toInstant(match.getMetadata().get(key));
+                if (t != null) return t;
+            }
+        }
+        return null;
+    }
+
+    private static Optional<Method> findTimeGetter(Class<?> type) {
+        for (String name : TIME_GETTER_NAMES) {
+            try {
+                Method m = type.getMethod(name);
+                if (m.getParameterCount() == 0 && m.getReturnType() != void.class) {
+                    return Optional.of(m);
+                }
+            } catch (NoSuchMethodException ignored) {
+                // try the next candidate
+            }
+        }
+        return Optional.empty();
+    }
+
+    /** Converts whatever the entity/metadata holds into an Instant, or null. */
+    private Instant toInstant(Object value) {
+        if (value == null) return null;
+
+        if (value instanceof Instant i)        return i;
+        if (value instanceof OffsetDateTime o) return o.toInstant();
+        if (value instanceof ZonedDateTime z)  return z.toInstant();
+        if (value instanceof LocalDateTime l)  return l.atZone(ZONE).toInstant();
+        if (value instanceof LocalDate d)      return d.atStartOfDay(ZONE).toInstant();
+        if (value instanceof java.sql.Date sd) return sd.toLocalDate().atStartOfDay(ZONE).toInstant();
+        if (value instanceof java.util.Date d) return d.toInstant();
+
+        if (value instanceof Number n) {
+            long raw = n.longValue();
+            if (raw <= 0) return null;
+            // Anything below ~year 5138 in seconds is an epoch-second value.
+            return raw < 100_000_000_000L ? Instant.ofEpochSecond(raw) : Instant.ofEpochMilli(raw);
+        }
+
+        if (value instanceof CharSequence cs) {
+            String s = cs.toString().trim();
+            if (s.isEmpty()) return null;
+            try { return Instant.parse(s); }                                  catch (Exception ignored) { }
+            try { return OffsetDateTime.parse(s).toInstant(); }               catch (Exception ignored) { }
+            try { return LocalDateTime.parse(s).atZone(ZONE).toInstant(); }   catch (Exception ignored) { }
+            try { return LocalDate.parse(s).atStartOfDay(ZONE).toInstant(); } catch (Exception ignored) { }
+            try {
+                long raw = Long.parseLong(s);
+                return toInstant(raw);
+            } catch (NumberFormatException ignored) { }
+        }
+        return null;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     // MATCH-LEVEL SETTLEMENT
     // ══════════════════════════════════════════════════════════════════════
 
-    @Transactional
+    /**
+     * Walks every pending slip on the match and settles the ones that can be settled
+     * right now. Deliberately NOT @Transactional: one transaction spanning the whole
+     * match meant a single failing slip rolled back everything settled before it, so
+     * the same bets were reprocessed pass after pass and the queue never drained.
+     * Each slip now commits independently via settleBetIsolated().
+     */
     public Tally settleMatch(Match match) {
         Tally tally = new Tally();
 
@@ -253,22 +451,22 @@ public class SettlementEngine {
         }
 
         List<Bet> pendingBets = betService.getPendingBetsForMatch(match.getId());
+        if (pendingBets == null) pendingBets = List.of();
         log.info("settleMatch: {} pending bet(s) found for match {}", pendingBets.size(), match.getId());
 
         Map<UUID, Match> cache = newCache(match);
 
         for (Bet bet : pendingBets) {
             try {
-                Outcome outcome = settleOneBet(bet, match, cache);
+                Outcome outcome = self().settleBetIsolated(bet, match, cache);
                 tally.record(outcome);
                 log.debug("settleMatch: bet {} → {}", bet.getId(), outcome);
             } catch (Exception e) {
-                // NOTE: if the failure came from the persistence layer the surrounding
-                // transaction may already be rollback-only, in which case the whole
-                // match retries next pass — safe, because settleOneBet only ever
-                // touches PENDING selections.
+                // Isolated: this slip's transaction rolled back on its own and stays
+                // PENDING for orphan recovery. Every other slip on the match is
+                // unaffected, so a single bad row cannot block the match.
                 tally.failed++;
-                log.error("settleMatch: FAILED bet {} on match {} — {}",
+                log.error("settleMatch: FAILED bet {} on match {} — {} (left PENDING, other bets unaffected)",
                         bet.getId(), match.getId(), e.getMessage(), e);
             }
         }
@@ -280,6 +478,19 @@ public class SettlementEngine {
     // ══════════════════════════════════════════════════════════════════════
     // BET-LEVEL SETTLEMENT
     // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * One slip, one transaction. REQUIRES_NEW so the unit of work is this bet and
+     * nothing else: it commits the moment the slip is priced, and a failure here
+     * marks only this transaction rollback-only.
+     *
+     * Must be called through self() — a direct call bypasses the Spring proxy and
+     * silently loses the transaction boundary.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public Outcome settleBetIsolated(Bet bet, Match triggerMatch, Map<UUID, Match> matchCache) {
+        return settleOneBet(bet, triggerMatch, matchCache);
+    }
 
     /**
      * Settles a single slip if — and only if — every leg can be resolved right now.
@@ -486,7 +697,7 @@ public class SettlementEngine {
     }
 
     private Map<UUID, Match> newCache(Match match) {
-        Map<UUID, Match> cache = new HashMap<>();
+        Map<UUID, Match> cache = new ConcurrentHashMap<>();
         if (match != null && match.getId() != null) cache.put(match.getId(), match);
         return cache;
     }
@@ -496,6 +707,10 @@ public class SettlementEngine {
      * For legs outside the trigger match we additionally require settledAt, so a
      * fixture with a merely provisional score does not settle other slips. Results
      * (including misses) are cached per pass to keep lookups down.
+     *
+     * Note: misses are cached as a sentinel rather than a null value, because the
+     * cache is now shared across independently-committed bet transactions and a
+     * ConcurrentHashMap will not store nulls.
      */
     private Match resolveSettleableMatch(UUID matchId, Match triggerMatch, Map<UUID, Match> cache) {
         if (matchId == null) {
@@ -507,7 +722,8 @@ public class SettlementEngine {
             return isSettleable(triggerMatch) ? triggerMatch : null;
         }
 
-        if (cache.containsKey(matchId)) return cache.get(matchId);
+        Match cached = cache.get(matchId);
+        if (cached != null) return cached == UNSETTLEABLE ? null : cached;
 
         Match m = null;
         try {
@@ -518,9 +734,12 @@ public class SettlementEngine {
         }
 
         Match usable = (m != null && m.getSettledAt() != null && isSettleable(m)) ? m : null;
-        cache.put(matchId, usable);
+        cache.put(matchId, usable == null ? UNSETTLEABLE : usable);
         return usable;
     }
+
+    /** Sentinel for "looked this one up, it is not settleable" — never dereferenced. */
+    private static final Match UNSETTLEABLE = new Match();
 
     // ══════════════════════════════════════════════════════════════════════
     // MARKET ROUTER
