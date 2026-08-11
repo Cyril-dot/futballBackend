@@ -32,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -39,20 +40,31 @@ import java.util.concurrent.ConcurrentHashMap;
  * RushPay Core v2 payment gateway controller.
  *
  * Flow (server-side portions only — the browser drives MoMo/card/gift-card funding
- * through a short-lived widget session token that this controller mints and hands out):
+ * through a short-lived widget session token that this controller mints and hands out,
+ * then proxies the customer-facing widget calls back through this controller so the
+ * widget session token never has to be trusted to talk to RushPay unmediated):
  *
  *   1. initDeposit / initAdminUpgrade
  *        POST /api/v1/merchant/payments/create          (X-API-Key)  -> payment_reference
  *        POST /api/v1/merchant/payments/widget-session  (X-API-Key)  -> widget_session_token
  *      We return { payment_reference, widget_session_token } to the frontend, which then
  *      embeds the hosted widget (core.rushpay.cash/widget/payment-widget-v2.js) or calls
- *      the funding endpoints directly with the widget session token.
+ *      the funding endpoints below (proxied through this controller).
  *
- *   2. RushPay calls back our webhook (charge/payment success) with a signed body.
+ *   2. Widget-session funding proxy endpoints (initiateMobileMoney, submitMomoOtp,
+ *      initiateCard, chargeStatus, validateGiftcard, processGiftcard, payWithWallet,
+ *      widgetContext) — the browser calls these on OUR API with the caller's session
+ *      cookie/JWT, never with the RushPay widget_session_token directly. We look up
+ *      the widget_session_token server-side from pendingWidgetSessions (populated at
+ *      init time) and forward the call to RushPay with X-RushPay-Widget-Session set.
+ *      This keeps the RushPay widget token out of the browser's network tab/JS
+ *      context entirely and lets us log/rate-limit each funding step centrally.
+ *
+ *   3. RushPay calls back our webhook (charge/payment success) with a signed body.
  *      We verify the signature, then credit the wallet or promote to admin — keyed by
  *      the metadata.userId we planted at create time, and made idempotent by reference.
  *
- *   3. status (manual fallback / polling) — mirrors the Moolre USSD controller's
+ *   4. status (manual fallback / polling) — mirrors the Moolre USSD controller's
  *      verifyPayment() pattern. The frontend polls this after opening the widget.
  *      We call RushPay's own GET /api/v1/merchant/payments/status endpoint directly
  *      (confirmed from RushPay's public API docs) and credit the wallet immediately
@@ -64,9 +76,22 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * IMPORTANT — webhook signature:
  *   RushPay's published OpenAPI spec issues a `webhook_secret` at application creation
- *   but does NOT document the signature header name or HMAC algorithm. This controller
- *   mirrors the Paystack convention (HMAC-SHA512 hex over the raw body) but keeps the
- *   header + secret configurable. CONFIRM WITH RUSHPAY SUPPORT BEFORE PRODUCTION.
+ *   but does NOT document the signature header name, HMAC algorithm, or the webhook
+ *   payload envelope at all (confirmed: no /webhooks/* path or WebhookEvent schema
+ *   exists in RushPay's openapi.json as of this writing). This controller mirrors the
+ *   Paystack convention (HMAC-SHA512 hex over the raw body) but keeps the header +
+ *   secret configurable, and tolerantly guesses at event/field names in the payload.
+ *   CONFIRM WITH RUSHPAY SUPPORT BEFORE PRODUCTION — until then, the status-poll path
+ *   is the only endpoint with a confirmed contract and is what actually guarantees
+ *   deposits get credited.
+ *
+ * IMPORTANT — widget-session proxy endpoints below:
+ *   RushPay's openapi.json documents the request schemas for initiate-mobile-money,
+ *   submit-momo-otp, and charge-status precisely. It does NOT document request bodies
+ *   for initiate-card or pay (their schemas are absent from the spec — only the auth
+ *   requirement and response wrapper are documented), so those two proxy methods pass
+ *   the caller's JSON body through unmodified rather than binding it to a typed DTO.
+ *   Tighten those once RushPay confirms the fields.
  */
 @Slf4j
 @RestController
@@ -85,6 +110,9 @@ public class RushPayController {
     private static final String STATUS_COMPLETED    = "completed";
     private static final String STATUS_RESP_SUCCESS = "success";
     private static final String STATUS_RESP_FAILED  = "failed";
+
+    /** Mobile money providers RushPay's widget-session API accepts (per openapi.json enum). */
+    private static final Set<String> VALID_MOMO_PROVIDERS = Set.of("mtn", "vod", "atl");
 
     /**
      * Commission rate applied to every deposit for affiliate attribution.
@@ -121,6 +149,19 @@ public class RushPayController {
      * restart-window gap needs closing.
      */
     private final ConcurrentHashMap<String, UUID> pendingRefs = new ConcurrentHashMap<>();
+
+    /**
+     * Tracks payment_reference -> RushPay widget_session_token, so the widget-session
+     * proxy endpoints below never require the browser to send the RushPay token
+     * itself — the browser only ever presents payment_reference (public, low-value)
+     * plus its own auth to us, and we attach X-RushPay-Widget-Session server-side.
+     *
+     * Same in-memory/restart caveat as pendingRefs. If lost, the browser falls back
+     * to a "please refresh checkout" state and re-inits, since a widget session is
+     * short-lived by design anyway (per RushPay's docs) and isn't meant to survive
+     * a restart regardless of where it's stored.
+     */
+    private final ConcurrentHashMap<String, String> pendingWidgetSessions = new ConcurrentHashMap<>();
 
     private final WalletService           walletService;
     private final UserService             userService;
@@ -163,7 +204,7 @@ public class RushPayController {
         log.info("initDeposit: RushPay checkout created ref='{}' for userId='{}'",
                 session.get("payment_reference"), user.getId());
 
-        pendingRefs.put(session.get("payment_reference").toString(), user.getId());
+        registerPendingSession(session, user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(session));
     }
@@ -192,7 +233,236 @@ public class RushPayController {
                 )
         );
 
+        registerPendingSession(session, user.getId());
+
         return ResponseEntity.ok(ApiResponse.ok(session));
+    }
+
+    /** Shared bookkeeping after any createCheckoutAndSession() call. */
+    private void registerPendingSession(Map<String, Object> session, UUID userId) {
+        var ref   = session.get("payment_reference").toString();
+        var token = session.get("widget_session_token").toString();
+        pendingRefs.put(ref, userId);
+        pendingWidgetSessions.put(ref, token);
+    }
+
+    // ─── Widget-session funding proxy endpoints ────────────────────────────────
+    //
+    // These sit between the checkout browser and RushPay's WidgetSession-authenticated
+    // endpoints. The browser authenticates to US the normal way (session/JWT) and sends
+    // only payment_reference; we resolve the matching widget_session_token server-side
+    // and forward to RushPay. This keeps the RushPay widget token out of browser JS.
+    //
+    // All of these require the caller to own the payment_reference (same ownership
+    // check as depositStatus()) and require the reference to still have a live widget
+    // session (i.e. init was called on this server instance and hasn't been cleaned
+    // up yet — see pendingWidgetSessions javadoc for the restart caveat).
+
+    @GetMapping("/api/wallet/deposit/rushpay/widget-context")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> widgetContext(
+            @AuthenticationPrincipal User user,
+            @RequestParam("ref") String ref) {
+
+        var widgetToken = resolveOwnedWidgetSession(user, ref);
+        var resp = rushpayWidgetGet("/api/v1/merchant/payments/widget-context", widgetToken);
+        return ResponseEntity.ok(ApiResponse.ok(dataOf(resp)));
+    }
+
+    @PostMapping("/api/wallet/deposit/rushpay/initiate-mobile-money")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> initiateMobileMoney(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var ref = requireString(req, "payment_reference");
+        var widgetToken = resolveOwnedWidgetSession(user, ref);
+
+        var email    = requireString(req, "email");
+        var phone    = requireString(req, "phone");
+        var provider = requireString(req, "provider").toLowerCase();
+        if (!VALID_MOMO_PROVIDERS.contains(provider))
+            throw ApiException.badRequest("provider must be one of " + VALID_MOMO_PROVIDERS);
+
+        var body = new java.util.HashMap<String, Object>();
+        body.put("payment_reference", ref);
+        body.put("email", email);
+        body.put("phone", phone);
+        body.put("provider", provider);
+        if (req.get("name") != null) body.put("name", req.get("name").toString());
+
+        log.info("initiateMobileMoney: userId='{}' ref='{}' provider='{}'", user.getId(), ref, provider);
+
+        var resp = rushpayWidgetPost("/api/v1/merchant/payments/initiate-mobile-money", widgetToken, body);
+        return ResponseEntity.ok(ApiResponse.ok(dataOf(resp)));
+    }
+
+    @PostMapping("/api/wallet/deposit/rushpay/initiate-card")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> initiateCard(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        // Request schema for initiate-card is not documented in RushPay's openapi.json
+        // (only WidgetSession auth + the Success envelope are specified), so we pass
+        // the body through unmodified rather than binding to a typed DTO. Tighten once
+        // RushPay confirms the fields.
+        var ref = requireString(req, "payment_reference");
+        var widgetToken = resolveOwnedWidgetSession(user, ref);
+
+        log.info("initiateCard: userId='{}' ref='{}'", user.getId(), ref);
+
+        var resp = rushpayWidgetPost("/api/v1/merchant/payments/initiate-card", widgetToken, req);
+        return ResponseEntity.ok(ApiResponse.ok(dataOf(resp)));
+    }
+
+    @PostMapping("/api/wallet/deposit/rushpay/submit-momo-otp")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> submitMomoOtp(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        // OtpSubmitRequest per openapi.json: { reference, otp } — NOTE this "reference"
+        // is the Paystack deposit/charge reference returned by initiate-mobile-money,
+        // NOT the payment_reference from create. We still require payment_reference in
+        // the request so we can look up the widget session + enforce ownership; the
+        // charge-level "reference" is a separate field forwarded to RushPay verbatim.
+        var paymentRef = requireString(req, "payment_reference");
+        var widgetToken = resolveOwnedWidgetSession(user, paymentRef);
+
+        var chargeRef = requireString(req, "reference");
+        var otp       = requireString(req, "otp");
+
+        log.info("submitMomoOtp: userId='{}' paymentRef='{}' chargeRef='{}'",
+                user.getId(), paymentRef, chargeRef);
+
+        var resp = rushpayWidgetPost("/api/v1/merchant/payments/submit-momo-otp", widgetToken,
+                Map.of("reference", chargeRef, "otp", otp));
+        return ResponseEntity.ok(ApiResponse.ok(dataOf(resp)));
+    }
+
+    @GetMapping("/api/wallet/deposit/rushpay/charge-status")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> chargeStatus(
+            @AuthenticationPrincipal User user,
+            @RequestParam("payment_reference") String paymentRef,
+            @RequestParam("reference") String chargeRef) {
+
+        var widgetToken = resolveOwnedWidgetSession(user, paymentRef);
+
+        var resp = rushpayWidgetGet(
+                "/api/v1/merchant/payments/charge-status?reference=" + chargeRef, widgetToken);
+        return ResponseEntity.ok(ApiResponse.ok(dataOf(resp)));
+    }
+
+    @PostMapping("/api/wallet/deposit/rushpay/validate-giftcard")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> validateGiftcard(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var ref = requireString(req, "payment_reference");
+        var widgetToken = resolveOwnedWidgetSession(user, ref);
+        var code = requireString(req, "giftcard_code");
+
+        var body = new java.util.HashMap<String, Object>();
+        body.put("payment_reference", ref);
+        body.put("giftcard_code", code);
+        if (req.get("amount") != null) body.put("amount", req.get("amount").toString());
+
+        log.info("validateGiftcard: userId='{}' ref='{}'", user.getId(), ref);
+
+        var resp = rushpayWidgetPost("/api/v1/merchant/payments/validate-giftcard", widgetToken, body);
+        return ResponseEntity.ok(ApiResponse.ok(dataOf(resp)));
+    }
+
+    @PostMapping("/api/wallet/deposit/rushpay/process-giftcard")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> processGiftcard(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var ref = requireString(req, "payment_reference");
+        var widgetToken = resolveOwnedWidgetSession(user, ref);
+        var code = requireString(req, "giftcard_code");
+
+        var body = new java.util.HashMap<String, Object>();
+        body.put("payment_reference", ref);
+        body.put("giftcard_code", code);
+        if (req.get("amount") != null) body.put("amount", req.get("amount").toString());
+
+        log.info("processGiftcard: userId='{}' ref='{}'", user.getId(), ref);
+
+        var resp = rushpayWidgetPost("/api/v1/merchant/payments/process-giftcard", widgetToken, body);
+
+        // process-giftcard can fully complete a checkout without a webhook ever firing
+        // (it's a wallet-covered payment, not an external charge), so treat a completed
+        // status here the same way depositStatus() treats a completed poll: credit once,
+        // idempotently, and stop tracking the ref.
+        var data = dataOf(resp);
+        if (STATUS_COMPLETED.equals(String.valueOf(data.get("status")))) {
+            var owner = pendingRefs.get(ref);
+            if (owner != null) {
+                var amountStr = req.get("amount");
+                // If the caller didn't pass a partial amount, giftcard covered the full
+                // checkout amount, which RushPay does not echo back here — so we can only
+                // safely auto-credit when we have an explicit amount to credit against.
+                // Full-checkout gift-card completions are still caught by the status poll.
+                if (amountStr != null) {
+                    verifyAndHandleDeposit(owner, ref, new BigDecimal(amountStr.toString()));
+                }
+            }
+        }
+
+        return ResponseEntity.ok(ApiResponse.ok(data));
+    }
+
+    @PostMapping("/api/wallet/deposit/rushpay/pay")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> payWithWallet(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        // Request schema for pay is not documented in RushPay's openapi.json beyond
+        // "email/account password or Bearer auth plus PIN, optional giftcard_code" —
+        // passed through unmodified. Tighten once RushPay confirms the fields.
+        var ref = requireString(req, "payment_reference");
+        var widgetToken = resolveOwnedWidgetSession(user, ref);
+
+        log.info("payWithWallet: userId='{}' ref='{}'", user.getId(), ref);
+
+        var resp = rushpayWidgetPost("/api/v1/merchant/payments/pay", widgetToken, req);
+        return ResponseEntity.ok(ApiResponse.ok(dataOf(resp)));
+    }
+
+    /** Ownership + liveness check shared by every widget-session proxy endpoint above. */
+    private String resolveOwnedWidgetSession(User user, String ref) {
+        if (ref == null || ref.isBlank())
+            throw ApiException.badRequest("payment_reference is required.");
+
+        var owner = pendingRefs.get(ref);
+        if (owner == null) {
+            log.error("widget proxy: unknown ref='{}' requested by userId='{}'", ref, user.getId());
+            throw ApiException.badRequest("Unknown payment reference. Please start a new deposit.");
+        }
+        if (!owner.equals(user.getId())) {
+            log.warn("widget proxy: userId='{}' attempted to use ref='{}' owned by userId='{}'",
+                    user.getId(), ref, owner);
+            throw ApiException.forbidden("This payment reference does not belong to your account.");
+        }
+
+        var widgetToken = pendingWidgetSessions.get(ref);
+        if (widgetToken == null) {
+            log.error("widget proxy: no widget session tracked for ref='{}' userId='{}'", ref, user.getId());
+            throw ApiException.badRequest(
+                    "Checkout session has expired. Please start a new deposit.");
+        }
+        return widgetToken;
+    }
+
+    private String requireString(Map<String, Object> req, String key) {
+        var v = req.get(key);
+        if (v == null || v.toString().isBlank())
+            throw ApiException.badRequest(key + " is required.");
+        return v.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> dataOf(Map<String, Object> envelope) {
+        var data = envelope.get("data");
+        return data instanceof Map ? (Map<String, Object>) data : Map.of();
     }
 
     // ─── Status (manual fallback / polling) ───────────────────────────────────
@@ -288,6 +558,7 @@ public class RushPayController {
         boolean credited = verifyAndHandleDeposit(owner, ref, amount);
         // Clean up — confirmed terminal state, no need to keep tracking this ref.
         pendingRefs.remove(ref);
+        pendingWidgetSessions.remove(ref);
 
         // Return "success" — the frontend's startBackendPoll checks status === 'success' literally.
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
@@ -330,7 +601,9 @@ public class RushPayController {
                     .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
 
             // RushPay envelopes typically look like { "event": "...", "data": { ... } }.
-            // Adjust the event name / nesting once confirmed against a real payload.
+            // Adjust the event name / nesting once confirmed against a real payload —
+            // there is no documented webhook schema in RushPay's openapi.json to verify
+            // this against, so this shape is a best-effort guess, not a confirmed contract.
             var eventType = String.valueOf(event.get("event"));
             log.info("RushPay webhook: received event='{}'", eventType);
 
@@ -367,6 +640,11 @@ public class RushPayController {
             } else {
                 handleDeposit(userId, ref, amount);
             }
+
+            // Terminal state reached via webhook too — stop tracking so the widget-session
+            // proxy endpoints correctly report "expired" instead of allowing further calls
+            // against an already-settled reference.
+            pendingWidgetSessions.remove(ref);
 
         } catch (ApiException e) {
             log.error("RushPay webhook: bad request — {}", e.getMessage(), e);
@@ -512,8 +790,11 @@ public class RushPayController {
      * Returns a compact map for the frontend:
      *   { "payment_reference": "...", "widget_session_token": "..." }
      *
-     * The browser then either mounts the hosted widget or calls the funding endpoints
-     * (initiate-mobile-money, submit-momo-otp, charge-status) with the widget token.
+     * NOTE: as of this controller, the frontend does not need to hold onto
+     * widget_session_token for funding calls — it's tracked server-side in
+     * pendingWidgetSessions and attached automatically by the widget-session proxy
+     * endpoints above. We still return it in case existing frontend code embeds the
+     * hosted RushPay widget script directly (RushPayV2.init(...)), which does need it.
      */
     private Map<String, Object> createCheckoutAndSession(BigDecimal amount, String description,
                                                          String callbackUrl,
@@ -660,6 +941,109 @@ public class RushPayController {
         if (Boolean.FALSE.equals(result.get("success"))) {
             var message = String.valueOf(result.getOrDefault("message", "RushPay declined the status request"));
             log.error("rushpayGetStatus: success=false ref='{}' — {}", paymentReference, message);
+            throw new RuntimeException("RushPay error: " + message);
+        }
+
+        return result;
+    }
+
+    /**
+     * POSTs to a RushPay WidgetSession-authenticated endpoint (X-RushPay-Widget-Session
+     * header, not X-API-Key). Same resilience shape as rushpayPost — 10s timeout, retry
+     * only on transient network failures, RushPay 4xx/5xx surfaced immediately.
+     *
+     * Used exclusively by the widget-session proxy endpoints above; the widget token
+     * itself is resolved server-side via resolveOwnedWidgetSession() and never
+     * accepted as input from the caller.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> rushpayWidgetPost(String path, String widgetSessionToken,
+                                                  Map<String, Object> body) {
+
+        var result = (Map<String, Object>) webClientBuilder.build()
+                .post().uri(baseUrl + path)
+                .header("X-RushPay-Widget-Session", widgetSessionToken)
+                .header("Content-Type", "application/json")
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(
+                        status -> status.isError(),
+                        clientResponse -> clientResponse.bodyToMono(String.class)
+                                .map(b -> {
+                                    log.error("RushPay widget API error: path={} status={} body={}",
+                                            path, clientResponse.statusCode(), b);
+                                    return new RuntimeException(
+                                            "RushPay returned " + clientResponse.statusCode() + ": " + b);
+                                })
+                )
+                .bodyToMono(Map.class)
+                .timeout(rushpayTimeout)
+                .retryWhen(Retry.max(rushpayRetryAttempts)
+                        .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
+                .onErrorMap(
+                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> {
+                            log.error("RushPay widget API unreachable after {} retries", rushpayRetryAttempts, ex);
+                            return new RuntimeException("RushPay is currently unavailable. Please try again.");
+                        }
+                )
+                .block();
+
+        if (result == null) {
+            throw new RuntimeException("RushPay widget endpoint returned an empty response.");
+        }
+
+        log.info("rushpayWidgetPost: path={} success='{}'", path, result.get("success"));
+
+        if (Boolean.FALSE.equals(result.get("success"))) {
+            var message = String.valueOf(result.getOrDefault("message", "RushPay declined the request"));
+            log.error("rushpayWidgetPost: success=false path={} — {}", path, message);
+            throw new RuntimeException("RushPay error: " + message);
+        }
+
+        return result;
+    }
+
+    /** GET variant of rushpayWidgetPost — same auth, resilience, and envelope handling. */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> rushpayWidgetGet(String pathWithQuery, String widgetSessionToken) {
+
+        var result = (Map<String, Object>) webClientBuilder.build()
+                .get().uri(baseUrl + pathWithQuery)
+                .header("X-RushPay-Widget-Session", widgetSessionToken)
+                .retrieve()
+                .onStatus(
+                        status -> status.isError(),
+                        clientResponse -> clientResponse.bodyToMono(String.class)
+                                .map(b -> {
+                                    log.error("RushPay widget API error: path={} status={} body={}",
+                                            pathWithQuery, clientResponse.statusCode(), b);
+                                    return new RuntimeException(
+                                            "RushPay returned " + clientResponse.statusCode() + ": " + b);
+                                })
+                )
+                .bodyToMono(Map.class)
+                .timeout(rushpayTimeout)
+                .retryWhen(Retry.max(rushpayRetryAttempts)
+                        .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
+                .onErrorMap(
+                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> {
+                            log.error("RushPay widget API unreachable after {} retries", rushpayRetryAttempts, ex);
+                            return new RuntimeException("RushPay is currently unavailable. Please try again.");
+                        }
+                )
+                .block();
+
+        if (result == null) {
+            throw new RuntimeException("RushPay widget endpoint returned an empty response.");
+        }
+
+        log.info("rushpayWidgetGet: path={} success='{}'", pathWithQuery, result.get("success"));
+
+        if (Boolean.FALSE.equals(result.get("success"))) {
+            var message = String.valueOf(result.getOrDefault("message", "RushPay declined the request"));
+            log.error("rushpayWidgetGet: success=false path={} — {}", pathWithQuery, message);
             throw new RuntimeException("RushPay error: " + message);
         }
 
