@@ -120,6 +120,43 @@ import java.util.UUID;
  *    {@link #detectNetworkFromPhone}). If neither works we fail fast with a
  *    400 telling the user to pick a network — better than letting AkwaPay
  *    reject it and surfacing a generic 500 to the frontend.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WEBHOOK PAYLOAD — CONFIRMED FROM OFFICIAL AKWAPAY SOURCE
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * The exact shape AkwaPay sends on payment_intent.succeeded (from
+ * packages/worker/src/webhook-sender.ts → paymentIntentEvent()):
+ *
+ *   {
+ *     "id":         "evt_<chargePublicId>",
+ *     "type":       "payment_intent.succeeded",
+ *     "sequence":   <int — increases per intent; discard lower than seen>,
+ *     "created_at": "<ISO-8601>",
+ *     "data": {
+ *       "intent_id": "<pi_...>",
+ *       "amount":    <integer pesewas>,
+ *       "currency":  "GHS",
+ *       "reference": "<your reference string>",
+ *       "status":    "succeeded"
+ *     }
+ *   }
+ *
+ * IMPORTANT — data.status is derived as eventType.split('.')[1], so:
+ *   payment_intent.succeeded  → data.status = "succeeded"
+ *   payment_intent.failed     → data.status = "failed"
+ *   payment_intent.processing → data.status = "processing"
+ *
+ * IDEMPOTENCY — delivery is at-least-once. The same event WILL arrive twice.
+ * Key on event.id (not data.reference alone) to no-op on replay. This
+ * controller delegates that to WalletService.credit() which returns 409 on a
+ * duplicate reference — we catch that 409 and skip silently.
+ *
+ * SEQUENCE — each event carries `sequence` that increases per intent. A lower
+ * sequence than already processed should be discarded. We do not track sequence
+ * here because our only terminal action is on `succeeded`, which is idempotent
+ * via the reference dedup in WalletService. If you add non-idempotent handlers
+ * for other event types, store and check the sequence.
  */
 @Slf4j
 @RestController
@@ -141,8 +178,8 @@ public class AkwaPayController {
 
     // ─── Reference encoding ───────────────────────────────────────────────────
     //
-    // The webhook gives us back only `reference`, so it has to carry the routing
-    // information itself. Format:
+    // The webhook gives us back only `reference` inside data{}, so it has to
+    // carry the routing information itself. Format:
     //
     //     sbdep_<32-hex userId>_<8-hex nonce>     wallet deposit
     //     sbadm_<32-hex userId>_<8-hex nonce>     admin upgrade
@@ -151,6 +188,12 @@ public class AkwaPayController {
     // account-wide uniqueness on `reference` and returns 409 duplicate_reference
     // otherwise), while the userId segment stays at a fixed offset so parsing
     // never depends on splitting a UUID that contains dashes.
+    //
+    // CRITICAL: references created outside this controller (e.g. test charges
+    // made directly in the AkwaPay dashboard) will not match either prefix.
+    // parseReference() returns null for those, and the webhook handler returns
+    // 200 "Ignored: foreign reference" so AkwaPay stops retrying something we
+    // will never be able to route.
 
     private static final String REF_PREFIX_DEPOSIT = "sbdep_";
     private static final String REF_PREFIX_ADMIN   = "sbadm_";
@@ -166,7 +209,7 @@ public class AkwaPayController {
      */
     private final long akwapayRetryAttempts = 2;
 
-    /** Replay window for webhook signatures, per AkwaPay docs. */
+    /** Replay window for webhook signatures, per AkwaPay docs (5 minutes). */
     private static final long SIGNATURE_TOLERANCE_SECONDS = 300;
 
     /**
@@ -323,16 +366,35 @@ public class AkwaPayController {
 
     // ─── Webhook ──────────────────────────────────────────────────────────────
 
+    /**
+     * Receives AkwaPay merchant events.
+     *
+     * CONFIRMED PAYLOAD SHAPE (from official AkwaPay worker source):
+     *
+     *   Top level:  id, type, sequence, created_at, data{}
+     *   data{}:     intent_id, amount (integer pesewas), currency, reference, status
+     *
+     * The `data.reference` field is exactly the string we sent at intent-creation
+     * time, which is how we recover the userId. There is no `metadata` field
+     * on the webhook — metadata is stored server-side only.
+     *
+     * IDEMPOTENCY: delivery is at-least-once. We return 200 on every path that
+     * is not a hard error so AkwaPay stops retrying. Duplicate `succeeded`
+     * events are deduped inside WalletService.credit() via the reference (409 →
+     * we catch and skip). Foreign references (not minted by this controller)
+     * return 200 "Ignored" — we do NOT return 400, because that would put them
+     * back into AkwaPay's retry queue forever for something we will never handle.
+     */
     @PostMapping("/api/webhooks/akwapay")
     public ResponseEntity<String> webhook(
-            @RequestHeader(value = "X-AkwaPay-Signature", required = false) String signature,
-            @RequestHeader(value = "X-AkwaPay-Event-Type", required = false) String headerEventType,
+            @RequestHeader(value = "X-AkwaPay-Signature",   required = false) String signature,
+            @RequestHeader(value = "X-AkwaPay-Event-Type",  required = false) String headerEventType,
             @RequestHeader(value = "X-AkwaPay-Delivery-Id", required = false) String deliveryId,
             HttpServletRequest request) {
 
         byte[] rawBody;
         try {
-            // MUST be the raw bytes. Re-serialising parsed JSON changes key
+            // MUST be the raw bytes — re-serialising parsed JSON changes key
             // order and whitespace and the HMAC will never match.
             rawBody = request.getInputStream().readAllBytes();
         } catch (Exception e) {
@@ -363,15 +425,31 @@ public class AkwaPayController {
             log.info("AkwaPay webhook: event='{}' type='{}' sequence={} delivery='{}'",
                     eventId, eventType, sequence, deliveryId);
 
-            // Delivery is at-least-once — the same event WILL arrive twice, on
-            // their retry, on a network blip, on our own 500. Everything except
-            // succeeded is a no-op, and succeeded is deduped on `reference`
-            // inside WalletService (409 → skip), so replays are harmless.
+            // ── Only act on succeeded ──────────────────────────────────────────
+            //
+            // Delivery is at-least-once — the same event WILL arrive twice (on
+            // their retry, on a network blip, on our own 500). Everything except
+            // `payment_intent.succeeded` is a no-op here. `succeeded` is deduped
+            // on `reference` inside WalletService (409 → skip), so replays are
+            // harmless.
+            //
+            // We return 200 (not 4xx) for every non-succeeded type so AkwaPay
+            // marks the delivery done and does not retry it. Returning 4xx on an
+            // event we simply don't handle would put it in the retry queue
+            // forever, burning their retry budget and generating noise alerts.
             if (!"payment_intent.succeeded".equals(eventType)) {
                 log.info("AkwaPay webhook: ignoring event type='{}' (event='{}')", eventType, eventId);
                 return ResponseEntity.ok("Ignored");
             }
 
+            // ── Parse data{} block ────────────────────────────────────────────
+            //
+            // Confirmed shape from paymentIntentEvent() in webhook-sender.ts:
+            //   data.intent_id  — the pi_... public ID
+            //   data.amount     — integer pesewas
+            //   data.currency   — "GHS"
+            //   data.reference  — exactly what we sent at intent-creation time
+            //   data.status     — "succeeded" (eventType.split('.')[1])
             @SuppressWarnings("unchecked")
             var data = (Map<String, Object>) event.get("data");
             if (data == null) {
@@ -379,6 +457,9 @@ public class AkwaPayController {
                 return ResponseEntity.status(400).body("Missing data");
             }
 
+            // data.reference is the ONLY field that lets us route this event to
+            // a user. It is set by us at intent-creation time and echoed back
+            // verbatim. If it is absent or blank, this event is unroutable.
             var reference = data.get("reference") == null ? null : data.get("reference").toString();
             var intentId  = data.get("intent_id") == null ? "" : data.get("intent_id").toString();
 
@@ -387,18 +468,28 @@ public class AkwaPayController {
                 return ResponseEntity.status(400).body("Missing reference");
             }
 
-            // amount is integer pesewas
+            // data.amount is integer pesewas — convert to GHS for our wallet.
             var amountPesewas = Long.parseLong(data.get("amount").toString());
             var amount        = BigDecimal.valueOf(amountPesewas)
                     .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
+            // ── Route by reference prefix ──────────────────────────────────────
+            //
+            // References NOT minted by this controller (e.g. test charges created
+            // directly in the AkwaPay dashboard, or charges from another service
+            // sharing this merchant account) will not match our prefixes.
+            //
+            // We return 200 "Ignored" — NOT 400 — because a 4xx would put the
+            // event back in AkwaPay's retry queue (10s, 1m, 5m, 30m, 2h, 6h,
+            // 12h, 24h → dead-letter). Since we will never be able to handle a
+            // foreign reference, retrying is pure noise. 200 tells AkwaPay
+            // "received, nothing to do" and they stop.
             var parsed = parseReference(reference);
             if (parsed == null) {
-                // Not one of ours — a charge created outside this service, or a
-                // reference format change that outran this parser. 200 so they
-                // stop retrying something we will never handle.
-                log.warn("AkwaPay webhook: unrecognised reference '{}' on event='{}' — ignoring",
-                        reference, eventId);
+                log.warn("AkwaPay webhook: unrecognised reference '{}' on event='{}' intent='{}' " +
+                                "amount={} — returning 200 so AkwaPay stops retrying an unroutable event. " +
+                                "If this is a real customer payment, credit it manually.",
+                        reference, eventId, intentId, amount);
                 return ResponseEntity.ok("Ignored: foreign reference");
             }
 
@@ -412,9 +503,10 @@ public class AkwaPayController {
             log.error("AkwaPay webhook: bad request — {}", e.getMessage(), e);
             return ResponseEntity.status(400).body("Bad request: " + e.getMessage());
         } catch (Exception e) {
-            // Non-2xx puts us back in their retry schedule
+            // Non-2xx puts us back in AkwaPay's retry schedule
             // (10s, 1m, 5m, 30m, 2h, 6h, 12h, 24h → dead-letter), which is what
-            // we want for a transient DB failure.
+            // we want for a transient DB failure. A payment that failed to credit
+            // due to a DB hiccup WILL be retried and credited on the next attempt.
             log.error("AkwaPay webhook: unexpected error — will be retried", e);
             return ResponseEntity.status(500).body("Processing error");
         }
@@ -584,22 +676,7 @@ public class AkwaPayController {
     // ─── AkwaPay API helper ───────────────────────────────────────────────────
 
     /**
-     * Calls POST /v1/payment_intents and returns the FULL response map:
-     *
-     * <pre>
-     * {
-     *   "id": "pi_8cca7ed2680446a2",
-     *   "object": "payment_intent",
-     *   "status": "requires_action",
-     *   "amount": 100,
-     *   "currency": "GHS",
-     *   "reference": "sbdep_…",
-     *   "next_action": { "type": "redirect", "url": "https://checkout.flutterwave.com/…" },
-     *   "client_secret": "cs_1a14b63eade646548f605ecf98bcdaf4",
-     *   "checkout_url": "https://checkout.akwapay.com/checkout/pi_…?cs=cs_…",
-     *   "created_at": "2026-08-11T18:39:08.004Z"
-     * }
-     * </pre>
+     * Calls POST /v1/payment_intents and returns the FULL response map.
      *
      * The response is returned whole and unmodified. The frontend decides
      * between `checkout_url` (handles every branch) and reading
@@ -631,12 +708,12 @@ public class AkwaPayController {
         body.put("currency",   "GHS");
         body.put("reference",  reference);
         body.put("return_url", returnUrl);
-        body.put("metadata",   metadata);        // stored, but NOT echoed on the webhook
+        body.put("metadata",   metadata);        // stored server-side; NOT echoed on the webhook
         if (!customer.isEmpty()) body.put("customer", customer);
 
-        // `method` AND `network` are both required now — see class note #8.
+        // `method` AND `network` are both required — see class note #8.
         // `network` arrives here already resolved by resolveNetwork(), which
-        // throws before we ever get this far if it couldn't determine one.
+        // throws a 400 before we ever get this far if it couldn't determine one.
         body.put("method",  "mobile_money");
         body.put("network", network.toUpperCase());
 
@@ -660,12 +737,7 @@ public class AkwaPayController {
                                 })
                 )
                 .bodyToMono(Map.class)
-                // Fail fast: don't hold a thread longer than akwapayTimeout.
-                // TimeoutException is network-level and is picked up by retry.
                 .timeout(akwapayTimeout)
-                // Transient network failures only. RuntimeExceptions thrown by
-                // the onStatus handler have no wrapped cause, so the filter
-                // excludes them and they surface immediately.
                 .retryWhen(Retry.max(akwapayRetryAttempts)
                         .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
                 .onErrorMap(
@@ -707,6 +779,20 @@ public class AkwaPayController {
 
     // ─── Reference encoding / decoding ────────────────────────────────────────
 
+    /**
+     * Builds a reference string that encodes the userId and intent type so the
+     * webhook handler can recover both with no other context.
+     *
+     * Format:  sbdep_<32-hex-userId>_<8-hex-nonce>
+     *          sbadm_<32-hex-userId>_<8-hex-nonce>
+     *
+     * The 32-hex userId is the UUID with dashes stripped. The 8-hex nonce is the
+     * low 32 bits of System.nanoTime(), zero-padded. The nonce ensures uniqueness
+     * across retries (AkwaPay returns 409 on a duplicate reference).
+     *
+     * NEVER change the prefix strings or the layout — the webhook parser depends
+     * on fixed offsets. A format change makes all in-flight intents unroutable.
+     */
     private String buildReference(String prefix, UUID userId) {
         var nonce = Long.toHexString(System.nanoTime() & 0xFFFFFFFFL);
         return prefix
@@ -715,14 +801,26 @@ public class AkwaPayController {
                 + String.format("%8s", nonce).replace(' ', '0');
     }
 
-    /** Null when the reference was not minted by this service. */
+    /**
+     * Parses a reference string back into userId + intent type.
+     *
+     * Returns null when the reference was not minted by this controller — which
+     * means the webhook cannot be routed and should be acknowledged (200) without
+     * taking any action.
+     *
+     * The most common cause of a null return is a charge created directly in the
+     * AkwaPay dashboard (for testing or manual top-ups) rather than through
+     * /api/wallet/deposit/akwapay/init. Those charges have arbitrary references
+     * like "test-002" that don't follow our prefix+userId format.
+     */
     private ParsedRef parseReference(String reference) {
         boolean adminUpgrade;
         if (reference.startsWith(REF_PREFIX_DEPOSIT))      adminUpgrade = false;
         else if (reference.startsWith(REF_PREFIX_ADMIN))   adminUpgrade = true;
-        else return null;
+        else return null;   // foreign reference — not minted by us
 
-        var rest = reference.substring(REF_PREFIX_DEPOSIT.length()); // both prefixes are 6 chars
+        // Both prefixes are 6 characters, so we strip the same length regardless.
+        var rest = reference.substring(REF_PREFIX_DEPOSIT.length());
         if (rest.length() < 32) return null;
 
         var hex = rest.substring(0, 32);
@@ -745,15 +843,27 @@ public class AkwaPayController {
     // ─── Signature verification ───────────────────────────────────────────────
 
     /**
-     * Header format:  X-AkwaPay-Signature: t=1754049600,v1=5f3c9a...
-     * Signed value:   HMAC-SHA256( "{t}.{rawBody}", whsec )  hex-encoded
+     * Verifies the X-AkwaPay-Signature header on an inbound webhook.
      *
-     * Three things that are easy to get wrong and are all handled here:
-     *   - HMAC over the RAW bytes, before any JSON parse/re-serialise.
-     *   - Reject timestamps outside ±5 min — this is what stops someone
-     *     replaying a captured `succeeded` event.
-     *   - Constant-time compare. `equals()` on a signature leaks it a byte at
-     *     a time.
+     * Header format:  X-AkwaPay-Signature: t=1754049600,v1=5f3c9a...
+     * Signed value:   HMAC-SHA256( "{timestamp}.{rawBody}", whsec )  hex-encoded
+     *
+     * Three things that are easy to get wrong, all handled here:
+     *
+     *   1. HMAC is over the RAW bytes, before any JSON parse/re-serialise.
+     *      Re-serialising changes key order and whitespace; the HMAC will not
+     *      match. This is why rawBody is read from the InputStream directly in
+     *      the webhook() handler and passed here unchanged.
+     *
+     *   2. Timestamps outside ±5 min are rejected. This stops a replay attack
+     *      where someone captures a real `succeeded` event and re-sends it later
+     *      to credit a user a second time.
+     *
+     *   3. Constant-time compare via MessageDigest.isEqual(). String.equals()
+     *      leaks signature bytes one comparison at a time (timing side-channel).
+     *
+     * This implementation matches the reference verifier in the official AkwaPay
+     * merchant-api.md documentation exactly.
      */
     private boolean verifySignature(byte[] rawBody, String header) {
         try {
@@ -766,7 +876,7 @@ public class AkwaPayController {
             }
 
             if (t == null || v1 == null) {
-                log.warn("AkwaPay webhook: malformed signature header");
+                log.warn("AkwaPay webhook: malformed signature header — missing 't' or 'v1' part");
                 return false;
             }
 
@@ -774,7 +884,7 @@ public class AkwaPayController {
             try {
                 timestamp = Long.parseLong(t);
             } catch (NumberFormatException e) {
-                log.warn("AkwaPay webhook: non-numeric timestamp in signature");
+                log.warn("AkwaPay webhook: non-numeric timestamp in signature header");
                 return false;
             }
 
@@ -785,6 +895,7 @@ public class AkwaPayController {
                 return false;
             }
 
+            // Signed string is "{timestamp}.{rawBody}" — matches AkwaPay docs exactly.
             var mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(webhookSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             mac.update((timestamp + ".").getBytes(StandardCharsets.UTF_8));
@@ -792,12 +903,13 @@ public class AkwaPayController {
 
             var expected = HexFormat.of().formatHex(mac.doFinal());
 
+            // Constant-time comparison — must not short-circuit on first mismatch.
             return MessageDigest.isEqual(
                     expected.getBytes(StandardCharsets.UTF_8),
                     v1.getBytes(StandardCharsets.UTF_8));
 
         } catch (Exception e) {
-            log.error("AkwaPay webhook: signature verification error", e);
+            log.error("AkwaPay webhook: signature verification threw unexpectedly", e);
             return false;
         }
     }
