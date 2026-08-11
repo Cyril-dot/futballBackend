@@ -100,6 +100,20 @@ import java.util.UUID;
  *    It means AkwaPay asked a gateway to move money and got no clear answer.
  *    They poll until it resolves and then fire the webhook. Never re-charge on
  *    it, never fail the deposit on it — you will double-debit real people.
+ *
+ * 8. `method` IS NOW REQUIRED ON EVERY payment_intents CALL.
+ *    AkwaPay used to accept a request with neither `method` nor `network` and
+ *    let the hosted checkout collect both. That is no longer true — omitting
+ *    `method` now comes back as a 400 `invalid_method`
+ *    ("method must be one of: mobile_money, card, bank_transfer"). Since this
+ *    controller only ever originates GHS mobile-money deposits, `method` is
+ *    hardcoded to "mobile_money" unconditionally in
+ *    {@link #akwapayCreateIntent}. `network` stays conditional — it's fine to
+ *    omit and let the hosted checkout collect it when we don't already know
+ *    which telco the customer is on. Do not move `method` back inside the
+ *    network-null check; that's exactly the regression that caused the 500s
+ *    (backend rethrows AkwaPay's 400 as a RuntimeException → 500) whenever a
+ *    user submits without picking a network up front.
  */
 @Slf4j
 @RestController
@@ -179,9 +193,11 @@ public class AkwaPayController {
 
         var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
 
-        // Optional — the customer's momo details. AkwaPay can drive the charge
-        // directly when both are present; without them it falls back to
-        // collecting them on the hosted checkout page.
+        // Optional — the customer's momo details. `network` is used only when
+        // the customer already told us which telco they're on; when absent,
+        // the hosted checkout collects it. `method` is NOT optional — see the
+        // class-level note #8 — and is always set to "mobile_money" inside
+        // akwapayCreateIntent regardless of whether network is present.
         var phone   = req.get("phone")   == null ? null : req.get("phone").toString();
         var network = req.get("network") == null ? null : req.get("network").toString();
 
@@ -393,7 +409,7 @@ public class AkwaPayController {
      *   The referring admin earns a percentage of every deposit made by users
      *   they referred. The rate is stored on the Referral entity and defaults
      *   to 70% of the platform commission. Resolution happens entirely inside
-     *   ReferralService.attributeCommission() — this method just triggers it.
+     *   ReferralService.attributeCommission(). This method just triggers it.
      *
      * Flow:
      *   deposit amount → walletService.credit          (user wallet)
@@ -532,11 +548,17 @@ public class AkwaPayController {
         body.put("metadata",   metadata);        // stored, but NOT echoed on the webhook
         if (!customer.isEmpty()) body.put("customer", customer);
 
-        // Only pin the method when we actually know the customer's network.
-        // Omitting both lets AkwaPay's hosted checkout collect them, which is a
-        // better experience than guessing MTN and being wrong.
+        // `method` is REQUIRED on every call — AkwaPay rejects a request that
+        // omits it with 400 invalid_method ("method must be one of:
+        // mobile_money, card, bank_transfer"). This controller only ever
+        // originates mobile-money deposits/upgrades, so it's hardcoded here,
+        // unconditionally — do not move this inside the network check below.
+        body.put("method", "mobile_money");
+
+        // `network` stays conditional. Only pin it when we actually know the
+        // customer's telco; omitting it lets AkwaPay's hosted checkout collect
+        // it, which is a better experience than guessing MTN and being wrong.
         if (network != null && !network.isBlank()) {
-            body.put("method",  "mobile_money");
             body.put("network", network.toUpperCase());
         }
 
@@ -629,10 +651,10 @@ public class AkwaPayController {
         try {
             var userId = UUID.fromString(
                     hex.substring(0, 8)  + "-" +
-                    hex.substring(8, 12) + "-" +
-                    hex.substring(12, 16) + "-" +
-                    hex.substring(16, 20) + "-" +
-                    hex.substring(20, 32));
+                            hex.substring(8, 12) + "-" +
+                            hex.substring(12, 16) + "-" +
+                            hex.substring(16, 20) + "-" +
+                            hex.substring(20, 32));
             return new ParsedRef(userId, adminUpgrade);
         } catch (IllegalArgumentException e) {
             log.warn("parseReference: malformed userId segment in ref='{}'", reference);
