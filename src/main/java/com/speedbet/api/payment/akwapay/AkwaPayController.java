@@ -34,7 +34,9 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -101,19 +103,23 @@ import java.util.UUID;
  *    They poll until it resolves and then fire the webhook. Never re-charge on
  *    it, never fail the deposit on it — you will double-debit real people.
  *
- * 8. `method` IS NOW REQUIRED ON EVERY payment_intents CALL.
+ * 8. `method` AND `network` ARE NOW BOTH REQUIRED ON EVERY payment_intents
+ *    CALL WHEN THE METHOD IS mobile_money.
  *    AkwaPay used to accept a request with neither `method` nor `network` and
- *    let the hosted checkout collect both. That is no longer true — omitting
- *    `method` now comes back as a 400 `invalid_method`
- *    ("method must be one of: mobile_money, card, bank_transfer"). Since this
- *    controller only ever originates GHS mobile-money deposits, `method` is
- *    hardcoded to "mobile_money" unconditionally in
- *    {@link #akwapayCreateIntent}. `network` stays conditional — it's fine to
- *    omit and let the hosted checkout collect it when we don't already know
- *    which telco the customer is on. Do not move `method` back inside the
- *    network-null check; that's exactly the regression that caused the 500s
- *    (backend rethrows AkwaPay's 400 as a RuntimeException → 500) whenever a
- *    user submits without picking a network up front.
+ *    let the hosted checkout collect both. That stopped being true in two
+ *    steps, both observed live:
+ *      a) omitting `method` → 400 invalid_method
+ *         ("method must be one of: mobile_money, card, bank_transfer")
+ *      b) sending method=mobile_money with no `network` → 400 invalid_network
+ *         ("mobile_money requires network: MTN, TELECEL or AIRTELTIGO")
+ *    This controller only ever originates GHS mobile-money deposits, so
+ *    `method` is hardcoded unconditionally in {@link #akwapayCreateIntent}.
+ *    `network` is resolved with a two-step fallback in
+ *    {@link #resolveNetwork}: use what the client explicitly sent, and if
+ *    that's blank, guess it from the Ghana MoMo number prefix (see
+ *    {@link #detectNetworkFromPhone}). If neither works we fail fast with a
+ *    400 telling the user to pick a network — better than letting AkwaPay
+ *    reject it and surfacing a generic 500 to the frontend.
  */
 @Slf4j
 @RestController
@@ -163,6 +169,26 @@ public class AkwaPayController {
     /** Replay window for webhook signatures, per AkwaPay docs. */
     private static final long SIGNATURE_TOLERANCE_SECONDS = 300;
 
+    /**
+     * Ghana MoMo number → network, by leading digits after normalising to the
+     * local 0XXXXXXXXX shape. This is a best-effort fallback ONLY — Ghana's
+     * NCA reassigns/ports ranges occasionally, so this table can drift. It
+     * exists purely to skip an extra tap for the common case; it is never the
+     * only way through (see {@link #resolveNetwork}), and it is intentionally
+     * a flat prefix table rather than a "smart" parser so it's a one-line diff
+     * to fix when a range changes.
+     *
+     * Sources: publicly documented NCA numbering plan ranges as of last
+     * verification. If AkwaPay starts rejecting a detected network as wrong,
+     * that prefix's mapping is stale — fix it here, not in the frontend.
+     */
+    private static final Map<String, String> GH_NETWORK_PREFIXES = new LinkedHashMap<>();
+    static {
+        for (var p : new String[]{"024", "025", "053", "054", "055", "059"}) GH_NETWORK_PREFIXES.put(p, "MTN");
+        for (var p : new String[]{"020", "050"})                             GH_NETWORK_PREFIXES.put(p, "TELECEL");
+        for (var p : new String[]{"026", "027", "056", "057"})               GH_NETWORK_PREFIXES.put(p, "AIRTELTIGO");
+    }
+
     private final WalletService           walletService;
     private final UserService             userService;
     private final AdminUpgradeChatService adminUpgradeChatService;
@@ -193,16 +219,12 @@ public class AkwaPayController {
 
         var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
 
-        // Optional — the customer's momo details. `network` is used only when
-        // the customer already told us which telco they're on; when absent,
-        // the hosted checkout collects it. `method` is NOT optional — see the
-        // class-level note #8 — and is always set to "mobile_money" inside
-        // akwapayCreateIntent regardless of whether network is present.
-        var phone   = req.get("phone")   == null ? null : req.get("phone").toString();
-        var network = req.get("network") == null ? null : req.get("network").toString();
+        var phone        = req.get("phone")   == null ? null : req.get("phone").toString();
+        var requestedNet = req.get("network") == null ? null : req.get("network").toString();
+        var network      = resolveNetwork(requestedNet, phone);
 
-        log.info("initDeposit: userId='{}' amount={} pesewas={} ref='{}' network='{}'",
-                user.getId(), amount, amountPesewas, reference, network);
+        log.info("initDeposit: userId='{}' amount={} pesewas={} ref='{}' requestedNetwork='{}' resolvedNetwork='{}'",
+                user.getId(), amount, amountPesewas, reference, requestedNet, network);
 
         var response = akwapayCreateIntent(
                 amountPesewas,
@@ -233,11 +255,12 @@ public class AkwaPayController {
 
         var reference = buildReference(REF_PREFIX_ADMIN, user.getId());
 
-        var phone   = req == null || req.get("phone")   == null ? null : req.get("phone").toString();
-        var network = req == null || req.get("network") == null ? null : req.get("network").toString();
+        var phone        = req == null || req.get("phone")   == null ? null : req.get("phone").toString();
+        var requestedNet = req == null || req.get("network") == null ? null : req.get("network").toString();
+        var network      = resolveNetwork(requestedNet, phone);
 
-        log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}'",
-                user.getId(), user.getEmail(), reference);
+        log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}' requestedNetwork='{}' resolvedNetwork='{}'",
+                user.getId(), user.getEmail(), reference, requestedNet, network);
 
         var response = akwapayCreateIntent(
                 ADMIN_UPGRADE_FEE_PESEWAS,
@@ -495,6 +518,69 @@ public class AkwaPayController {
         log.info("handleAdminUpgrade: upgrade chat created for userId='{}'", userId);
     }
 
+    // ─── Network resolution ────────────────────────────────────────────────────
+
+    /**
+     * Decides which network string ("MTN" | "TELECEL" | "AIRTELTIGO") to send
+     * to AkwaPay, since it's now mandatory whenever method=mobile_money.
+     *
+     * Order of preference:
+     *   1. Whatever the client explicitly sent — the user picked it, trust it.
+     *   2. A best-effort guess from the phone number's prefix.
+     *   3. Neither worked → 400, ask the user to pick one. This is
+     *      deliberately a 400 raised HERE, before we ever call AkwaPay, so the
+     *      frontend gets a specific, actionable message instead of a generic
+     *      500 bubbled up from AkwaPay's own rejection.
+     */
+    private String resolveNetwork(String requested, String phone) {
+        if (requested != null && !requested.isBlank()) {
+            var normalized = requested.trim().toUpperCase();
+            log.info("resolveNetwork: using client-selected network '{}'", normalized);
+            return normalized;
+        }
+
+        var detected = detectNetworkFromPhone(phone);
+        if (detected.isPresent()) {
+            log.info("resolveNetwork: auto-detected network '{}' from phone prefix", detected.get());
+            return detected.get();
+        }
+
+        log.warn("resolveNetwork: could not resolve a network from phone='{}' and no network was selected",
+                phone == null ? "null" : "<redacted>");
+        throw ApiException.badRequest(
+                "We couldn't tell which network that number is on. Please choose MTN, Telecel, or AirtelTigo.");
+    }
+
+    /**
+     * Best-effort guess of a Ghana MoMo number's network from its prefix.
+     * Returns empty when the number doesn't normalize to a recognisable Ghana
+     * mobile shape, or its prefix isn't in {@link #GH_NETWORK_PREFIXES}.
+     *
+     * This is a courtesy shortcut, not a source of truth — ranges get
+     * reassigned/ported occasionally, and it will never be as reliable as the
+     * user just picking their own network. {@link #resolveNetwork} always
+     * prefers an explicit client selection over this.
+     */
+    private Optional<String> detectNetworkFromPhone(String phone) {
+        if (phone == null || phone.isBlank()) return Optional.empty();
+
+        var digits = phone.replaceAll("[^\\d]", "");
+
+        // Normalise +233XXXXXXXXX / 233XXXXXXXXX / 0XXXXXXXXX to 0XXXXXXXXX.
+        String local;
+        if (digits.startsWith("233") && digits.length() == 12) {
+            local = "0" + digits.substring(3);
+        } else if (digits.length() == 10 && digits.startsWith("0")) {
+            local = digits;
+        } else {
+            return Optional.empty();
+        }
+
+        var prefix = local.substring(0, 3);
+        var network = GH_NETWORK_PREFIXES.get(prefix);
+        return Optional.ofNullable(network);
+    }
+
     // ─── AkwaPay API helper ───────────────────────────────────────────────────
 
     /**
@@ -548,19 +634,11 @@ public class AkwaPayController {
         body.put("metadata",   metadata);        // stored, but NOT echoed on the webhook
         if (!customer.isEmpty()) body.put("customer", customer);
 
-        // `method` is REQUIRED on every call — AkwaPay rejects a request that
-        // omits it with 400 invalid_method ("method must be one of:
-        // mobile_money, card, bank_transfer"). This controller only ever
-        // originates mobile-money deposits/upgrades, so it's hardcoded here,
-        // unconditionally — do not move this inside the network check below.
-        body.put("method", "mobile_money");
-
-        // `network` stays conditional. Only pin it when we actually know the
-        // customer's telco; omitting it lets AkwaPay's hosted checkout collect
-        // it, which is a better experience than guessing MTN and being wrong.
-        if (network != null && !network.isBlank()) {
-            body.put("network", network.toUpperCase());
-        }
+        // `method` AND `network` are both required now — see class note #8.
+        // `network` arrives here already resolved by resolveNetwork(), which
+        // throws before we ever get this far if it couldn't determine one.
+        body.put("method",  "mobile_money");
+        body.put("network", network.toUpperCase());
 
         var idempotencyKey = UUID.randomUUID().toString();
 
