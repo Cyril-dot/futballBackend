@@ -40,9 +40,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * AkwaPay payment integration.
@@ -51,23 +49,47 @@ import java.util.concurrent.ConcurrentHashMap;
  * RELIABILITY GUARANTEE — READ THIS FIRST
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Webhooks are the fast path but are NOT the only path. This controller
- * maintains an in-memory ledger ({@link #pendingIntents}) of every intent it
- * creates, and a scheduled sweep ({@link #reconcilePendingIntents}) polls
- * AkwaPay directly every 2 minutes for any intent that is still PENDING after
- * 3 minutes. This means: as long as AkwaPay successfully collected the money,
- * the user WILL be credited — even if:
- *   - the webhook never arrived (worker crash on our side or theirs)
- *   - the webhook secret is wrong and we rejected the delivery
- *   - the return_url redirect fired but the webhook was delayed
- *   - anything else that silences the webhook channel
+ * Webhooks are the fast path but are NOT the only path, and in this deployment
+ * they have never once fired. Every credit applied in production so far has
+ * come from the sweep below. Treat the sweep as the primary mechanism and the
+ * webhook as an optimisation, not the other way round.
  *
- * The two paths are fully safe to run concurrently:
- *   - {@link WalletService#credit} dedupes on `reference` and returns 409 on
- *     a duplicate. Both the webhook handler and the sweep catch that 409 and
- *     skip silently. No double-credit is possible.
- *   - The sweep marks intents SETTLED so it does not keep polling after one
- *     path has already applied the credit.
+ * Every intent this controller creates is written to the
+ * `akwapay_pending_intents` table. A scheduled sweep
+ * ({@link #reconcilePendingIntents}) polls AkwaPay directly every 2 minutes for
+ * any row older than 3 minutes and applies the credit if AkwaPay says
+ * `succeeded`. So as long as AkwaPay collected the money, the user WILL be
+ * credited — even if:
+ *   - the webhook never arrives at all (the current reality)
+ *   - the webhook secret is wrong and we reject every delivery
+ *   - this pod restarts mid-payment (the table survives; a map did not)
+ *   - AkwaPay's own webhook worker is down
+ *
+ * The two paths are safe to run concurrently:
+ *   - {@link WalletService#credit} dedupes on `reference` and returns 409 on a
+ *     duplicate. Both the webhook handler and the sweep catch that 409 and skip
+ *     silently. No double-credit is possible, whichever wins the race.
+ *   - Whichever settles first deletes the row; the other's delete is a no-op.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THE PENDING LEDGER IS A TABLE
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * It was a ConcurrentHashMap. That is fine until the process restarts, which on
+ * a PaaS is constantly — the 2026-08-12 deploy log shows three restarts inside
+ * ninety seconds. Two facts make an in-memory ledger unsafe here:
+ *
+ *   1. AkwaPay has NO endpoint that lists your payment intents. You can only
+ *      GET one by id. An intent whose id we forget can never be asked about
+ *      again — there is no way to rediscover it.
+ *   2. The webhook does not fire. The fallback that justified holding this in
+ *      memory is not operating.
+ *
+ * Together: intent created → deploy 30s later → map empties → no webhook ever
+ * comes → AkwaPay collected the customer's money and this service holds no
+ * record that it owes them anything. Silent and permanent.
+ *
+ * See {@link AkwaPayPendingIntent}.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * HOW THIS DIFFERS FROM {@code PaystackController} — READ BEFORE EDITING
@@ -94,9 +116,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *        sk_live_...   calls the API          (app.akwapay.secret-key)
  *        whsec_...     signs webhooks to you  (app.akwapay.webhook-secret)
  *
- *    The whsec is minted by POST /v1/webhook_endpoints and shown ONCE. It is
- *    encrypted at rest on their side, not hashed, but they will not show it
- *    again — losing it means re-registering the endpoint.
+ *    The whsec is minted by POST /v1/webhook_endpoints and shown ONCE.
  *
  * 3. SIGNATURE SCHEME IS HMAC-SHA256 OVER "{timestamp}.{rawBody}", NOT SHA512
  *    OVER THE BODY ALONE, and it carries a replay window:
@@ -122,38 +142,24 @@ import java.util.concurrent.ConcurrentHashMap;
  *    send the user to `checkout_url`, which handles all four.
  *
  * 6. AMOUNTS ARE INTEGER PESEWAS. GHS 50.00 is 5000. Sending 50.00 is a 400.
- *    Identical to Paystack in practice, but AkwaPay enforces it strictly —
- *    there is no decimal tolerance anywhere in the API.
  *
  * 7. `unknown` IS A REAL STATUS AND IS NOT A FAILURE.
  *    It means AkwaPay asked a gateway to move money and got no clear answer.
  *    They poll until it resolves and then fire the webhook. Never re-charge on
  *    it, never fail the deposit on it — you will double-debit real people.
  *
- * 8. `method` AND `network` ARE NOW BOTH REQUIRED ON EVERY payment_intents
- *    CALL WHEN THE METHOD IS mobile_money.
- *    AkwaPay used to accept a request with neither `method` nor `network` and
- *    let the hosted checkout collect both. That stopped being true in two
- *    steps, both observed live:
+ * 8. `method` AND `network` ARE BOTH REQUIRED WHEN THE METHOD IS mobile_money.
  *      a) omitting `method` → 400 invalid_method
- *         ("method must be one of: mobile_money, card, bank_transfer")
- *      b) sending method=mobile_money with no `network` → 400 invalid_network
- *         ("mobile_money requires network: MTN, TELECEL or AIRTELTIGO")
- *    This controller only ever originates GHS mobile-money deposits, so
- *    `method` is hardcoded unconditionally in {@link #akwapayCreateIntent}.
- *    `network` is resolved with a two-step fallback in
- *    {@link #resolveNetwork}: use what the client explicitly sent, and if
- *    that's blank, guess it from the Ghana MoMo number prefix (see
- *    {@link #detectNetworkFromPhone}). If neither works we fail fast with a
- *    400 telling the user to pick a network — better than letting AkwaPay
- *    reject it and surfacing a generic 500 to the frontend.
+ *      b) method=mobile_money with no `network` → 400 invalid_network
+ *    This controller only originates GHS mobile-money deposits, so `method` is
+ *    hardcoded in {@link #akwapayCreateIntent}. `network` is resolved with a
+ *    two-step fallback in {@link #resolveNetwork}.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WEBHOOK PAYLOAD — CONFIRMED FROM OFFICIAL AKWAPAY SOURCE
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * The exact shape AkwaPay sends on payment_intent.succeeded (from
- * packages/worker/src/webhook-sender.ts → paymentIntentEvent()):
+ * From packages/worker/src/webhook-sender.ts → paymentIntentEvent():
  *
  *   {
  *     "id":         "evt_<chargePublicId>",
@@ -169,21 +175,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *     }
  *   }
  *
- * IMPORTANT — data.status is derived as eventType.split('.')[1], so:
- *   payment_intent.succeeded  → data.status = "succeeded"
- *   payment_intent.failed     → data.status = "failed"
- *   payment_intent.processing → data.status = "processing"
- *
  * IDEMPOTENCY — delivery is at-least-once. The same event WILL arrive twice.
- * Key on event.id (not data.reference alone) to no-op on replay. This
- * controller delegates that to WalletService.credit() which returns 409 on a
- * duplicate reference — we catch that 409 and skip silently.
- *
- * SEQUENCE — each event carries `sequence` that increases per intent. A lower
- * sequence than already processed should be discarded. We do not track sequence
- * here because our only terminal action is on `succeeded`, which is idempotent
- * via the reference dedup in WalletService. If you add non-idempotent handlers
- * for other event types, store and check the sequence.
+ * Deduped inside WalletService.credit() via the reference (409 → skip).
  */
 @Slf4j
 @EnableScheduling
@@ -196,32 +189,26 @@ public class AkwaPayController {
 
     /**
      * Commission rate applied to every deposit for affiliate attribution.
-     * Admins earn 70% of the configured platform commission on each referred
-     * deposit. The actual per-admin rate lives on the Referral entity (set
-     * during upgradeToAdmin) and is resolved inside
-     * ReferralService.attributeCommission(). This constant is for
-     * logging/documentation only — do not branch on it.
+     * The actual per-admin rate lives on the Referral entity and is resolved
+     * inside ReferralService.attributeCommission(). This constant is for
+     * logging only — do not branch on it.
      */
     private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
 
     // ─── Reference encoding ───────────────────────────────────────────────────
     //
-    // The webhook gives us back only `reference` inside data{}, so it has to
-    // carry the routing information itself. Format:
-    //
     //     sbdep_<32-hex userId>_<8-hex nonce>     wallet deposit
     //     sbadm_<32-hex userId>_<8-hex nonce>     admin upgrade
     //
     // The nonce makes the reference unique per attempt (AkwaPay requires
-    // account-wide uniqueness on `reference` and returns 409 duplicate_reference
-    // otherwise), while the userId segment stays at a fixed offset so parsing
-    // never depends on splitting a UUID that contains dashes.
+    // account-wide uniqueness and returns 409 duplicate_reference otherwise),
+    // while the userId sits at a fixed offset so parsing never depends on
+    // splitting a UUID that contains dashes.
     //
-    // CRITICAL: references created outside this controller (e.g. test charges
-    // made directly in the AkwaPay dashboard) will not match either prefix.
-    // parseReference() returns null for those, and the webhook handler returns
-    // 200 "Ignored: foreign reference" so AkwaPay stops retrying something we
-    // will never be able to route.
+    // References created outside this controller (e.g. dashboard test charges)
+    // match neither prefix. parseReference() returns null for those and the
+    // webhook handler returns 200 "Ignored: foreign reference", so AkwaPay
+    // stops retrying something we can never route.
 
     private static final String REF_PREFIX_DEPOSIT = "sbdep_";
     private static final String REF_PREFIX_ADMIN   = "sbadm_";
@@ -230,77 +217,28 @@ public class AkwaPayController {
     private final Duration akwapayTimeout = Duration.ofSeconds(15);
 
     /**
-     * Retries on transient network failures only (connection reset, TCP
-     * timeout). AkwaPay 4xx/5xx are mapped to RuntimeException by the onStatus
-     * handler and are excluded from the retry predicate — retrying a 400 just
-     * burns time, and retrying a 402 would be actively wrong.
+     * Retries on transient network failures only. AkwaPay 4xx/5xx are mapped to
+     * RuntimeException by the onStatus handler and excluded from the retry
+     * predicate — retrying a 400 burns time, retrying a 402 would be wrong.
      */
     private final long akwapayRetryAttempts = 2;
 
     /** Replay window for webhook signatures, per AkwaPay docs (5 minutes). */
     private static final long SIGNATURE_TOLERANCE_SECONDS = 300;
 
-    // ─── In-memory pending intent ledger ──────────────────────────────────────
-    //
-    // Keyed by reference (our own string, globally unique per attempt).
-    // Written the moment we create an intent; removed when it settles or is
-    // abandoned. The sweep reads this map every 2 minutes — no DB needed.
-    //
-    // This survives pod restarts only as long as the JVM is running. On restart,
-    // the ledger starts empty and any in-flight intents from before the restart
-    // will settle via the webhook (which AkwaPay retries for 24 h) rather than
-    // via the sweep. That is acceptable — the webhook is the primary path. The
-    // sweep is the safety net for the case where the webhook never arrives at all
-    // (e.g. the pod crashed during the very delivery window).
-    //
-    // If you need cross-restart durability, replace this map with a lightweight
-    // DB-backed store (see the companion AkwaPayIntent entity in the design doc).
-    // The sweep logic below is identical either way.
+    /** How long the webhook gets to settle an intent before the sweep steps in. */
+    private static final Duration SWEEP_HEAD_START = Duration.ofMinutes(3);
 
-    /**
-     * Internal record held in {@link #pendingIntents} for each in-flight intent.
-     *
-     * @param intentId      The pi_... public ID returned by AkwaPay.
-     * @param userId        The user who initiated the payment.
-     * @param amount        GHS amount (already converted from pesewas).
-     * @param adminUpgrade  True for admin upgrade payments; false for deposits.
-     * @param createdAt     Wall clock at intent creation — used to decide when
-     *                      to abandon after 24 h.
-     * @param attempts      How many sweep cycles have already polled AkwaPay for
-     *                      this intent.
-     */
-    private record PendingIntent(
-            String    intentId,
-            UUID      userId,
-            BigDecimal amount,
-            boolean   adminUpgrade,
-            Instant   createdAt,
-            int       attempts
-    ) {
-        PendingIntent withAttempt() {
-            return new PendingIntent(intentId, userId, amount, adminUpgrade, createdAt, attempts + 1);
-        }
-    }
-
-    /**
-     * Live ledger of every intent this controller has created that has not yet
-     * settled. Thread-safe; written on every init call, read+removed by the
-     * scheduled sweep and by the webhook handler.
-     */
-    private final ConcurrentHashMap<String, PendingIntent> pendingIntents = new ConcurrentHashMap<>();
+    /** After this long with no resolution, stop polling and give up on a row. */
+    private static final Duration ABANDON_AFTER = Duration.ofHours(24);
 
     /**
      * Ghana MoMo number → network, by leading digits after normalising to the
-     * local 0XXXXXXXXX shape. This is a best-effort fallback ONLY — Ghana's
-     * NCA reassigns/ports ranges occasionally, so this table can drift. It
-     * exists purely to skip an extra tap for the common case; it is never the
-     * only way through (see {@link #resolveNetwork}), and it is intentionally
-     * a flat prefix table rather than a "smart" parser so it's a one-line diff
-     * to fix when a range changes.
-     *
-     * Sources: publicly documented NCA numbering plan ranges as of last
-     * verification. If AkwaPay starts rejecting a detected network as wrong,
-     * that prefix's mapping is stale — fix it here, not in the frontend.
+     * local 0XXXXXXXXX shape. Best-effort fallback ONLY — the NCA reassigns and
+     * ports ranges, so this drifts. It exists to skip a tap in the common case;
+     * it is never the only way through (see {@link #resolveNetwork}), and it is
+     * a flat prefix table rather than a "smart" parser so fixing a stale range
+     * is a one-line diff.
      */
     private static final Map<String, String> GH_NETWORK_PREFIXES = new LinkedHashMap<>();
     static {
@@ -309,12 +247,13 @@ public class AkwaPayController {
         for (var p : new String[]{"026", "027", "056", "057"})               GH_NETWORK_PREFIXES.put(p, "AIRTELTIGO");
     }
 
-    private final WalletService           walletService;
-    private final UserService             userService;
-    private final AdminUpgradeChatService adminUpgradeChatService;
-    private final ReferralService         referralService;
-    private final WebClient.Builder       webClientBuilder;
-    private final ObjectMapper            objectMapper;
+    private final WalletService                    walletService;
+    private final UserService                      userService;
+    private final AdminUpgradeChatService          adminUpgradeChatService;
+    private final ReferralService                  referralService;
+    private final AkwaPayPendingIntentRepository   pendingIntents;
+    private final WebClient.Builder                webClientBuilder;
+    private final ObjectMapper                     objectMapper;
 
     @Value("${app.akwapay.secret-key}")              private String     secretKey;
     @Value("${app.akwapay.webhook-secret}")          private String     webhookSecret;
@@ -356,15 +295,8 @@ public class AkwaPayController {
                 Map.of("userId", user.getId().toString(), "purpose", "deposit")
         );
 
-        // ── Register in the pending ledger immediately ──────────────────────────
-        // The webhook is the fast path. The scheduled sweep is the guarantee.
-        // We record the intent NOW so that if the webhook never arrives, the
-        // sweep will poll AkwaPay directly and apply the credit itself.
         var intentId = String.valueOf(response.get("id"));
-        pendingIntents.put(reference, new PendingIntent(
-                intentId, user.getId(), amount, false, Instant.now(), 0));
-        log.info("initDeposit: intent='{}' registered in pending ledger for userId='{}' — sweep will reconcile if webhook is lost",
-                intentId, user.getId());
+        recordPending(reference, intentId, user.getId(), amount, false);
 
         log.info("initDeposit: intent='{}' status='{}' next_action='{}' for userId='{}'",
                 intentId, response.get("status"), nextActionType(response), user.getId());
@@ -391,8 +323,8 @@ public class AkwaPayController {
         log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}' requestedNetwork='{}' resolvedNetwork='{}'",
                 user.getId(), user.getEmail(), reference, requestedNet, network);
 
-        // GHS 200 in GHS (not pesewas) — we store this for the sweep, which
-        // calls handleAdminUpgrade with the GHS amount, same as the webhook path.
+        // GHS, not pesewas — the sweep credits this value directly, and
+        // handleAdminUpgrade takes GHS the same way the webhook path does.
         var upgradeAmountGhs = BigDecimal.valueOf(ADMIN_UPGRADE_FEE_PESEWAS)
                 .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
@@ -409,12 +341,8 @@ public class AkwaPayController {
                 )
         );
 
-        // ── Register in the pending ledger immediately ──────────────────────────
         var intentId = String.valueOf(response.get("id"));
-        pendingIntents.put(reference, new PendingIntent(
-                intentId, user.getId(), upgradeAmountGhs, true, Instant.now(), 0));
-        log.info("initAdminUpgrade: intent='{}' registered in pending ledger for userId='{}' — sweep will reconcile if webhook is lost",
-                intentId, user.getId());
+        recordPending(reference, intentId, user.getId(), upgradeAmountGhs, true);
 
         log.info("initAdminUpgrade: intent='{}' status='{}' for userId='{}'",
                 intentId, response.get("status"), user.getId());
@@ -422,16 +350,39 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-    // ─── Status probe (fallback only) ─────────────────────────────────────────
+    /**
+     * Writes the pending row.
+     *
+     * Deliberately swallows persistence failures. The intent already exists at
+     * AkwaPay by the time we get here — throwing now would return an error to a
+     * customer whose payment is genuinely in flight, and they would try again
+     * and pay twice. A failure here degrades us to webhook-only for this one
+     * payment, which is logged at ERROR so it can be credited by hand.
+     */
+    private void recordPending(String reference, String intentId, UUID userId,
+                               BigDecimal amountGhs, boolean adminUpgrade) {
+        try {
+            pendingIntents.save(new AkwaPayPendingIntent(
+                    reference, intentId, userId, amountGhs, adminUpgrade, Instant.now(), 0));
+            log.info("recordPending: ref='{}' intent='{}' persisted — sweep will reconcile if the webhook is lost",
+                    reference, intentId);
+        } catch (Exception e) {
+            log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
+                            "this payment can now only be credited by webhook or by hand. Investigate.",
+                    reference, intentId, userId, amountGhs, e);
+        }
+    }
+
+    // ─── Status probe (read only) ─────────────────────────────────────────────
 
     /**
      * Lets the frontend poll while it waits, purely so the UI can say something
      * better than a spinner.
      *
-     * THIS MUST NOT CREDIT ANYTHING. Money moves on the webhook and only on the
-     * webhook. A user returning to your return_url proves their browser
-     * finished a redirect, nothing more, and anyone reading your JS can hit
-     * that URL directly.
+     * THIS MUST NOT CREDIT ANYTHING. A user arriving at return_url proves their
+     * browser finished a redirect and nothing more, and anyone reading the JS
+     * can call this endpoint directly. Money moves in the webhook handler and
+     * the sweep, both of which verify against AkwaPay first.
      */
     @GetMapping("/api/wallet/deposit/akwapay/status/{intentId}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> status(
@@ -467,21 +418,16 @@ public class AkwaPayController {
     /**
      * Receives AkwaPay merchant events.
      *
-     * CONFIRMED PAYLOAD SHAPE (from official AkwaPay worker source):
+     * NOTE: as of this writing no delivery has ever been observed in
+     * production. If you are debugging a missing credit, check the sweep logs
+     * first — that is where settlement actually happens today. If you never see
+     * a line starting "AkwaPay webhook: event=", the endpoint is not registered
+     * (POST /v1/webhook_endpoints) or AKWAPAY_WEBHOOK_SECRET is wrong.
      *
-     *   Top level:  id, type, sequence, created_at, data{}
-     *   data{}:     intent_id, amount (integer pesewas), currency, reference, status
-     *
-     * The `data.reference` field is exactly the string we sent at intent-creation
-     * time, which is how we recover the userId. There is no `metadata` field
-     * on the webhook — metadata is stored server-side only.
-     *
-     * IDEMPOTENCY: delivery is at-least-once. We return 200 on every path that
-     * is not a hard error so AkwaPay stops retrying. Duplicate `succeeded`
-     * events are deduped inside WalletService.credit() via the reference (409 →
-     * we catch and skip). Foreign references (not minted by this controller)
-     * return 200 "Ignored" — we do NOT return 400, because that would put them
-     * back into AkwaPay's retry queue forever for something we will never handle.
+     * We return 200 on every path that is not a hard error, so AkwaPay stops
+     * retrying. Foreign references get 200 "Ignored" rather than 400 — a 400
+     * would put them back in the retry queue forever for something we will
+     * never handle.
      */
     @PostMapping("/api/webhooks/akwapay")
     public ResponseEntity<String> webhook(
@@ -492,6 +438,8 @@ public class AkwaPayController {
 
         byte[] rawBody;
         try {
+            // MUST be the raw bytes. Re-serialising parsed JSON changes key
+            // order and whitespace, and the HMAC will never match.
             rawBody = request.getInputStream().readAllBytes();
         } catch (Exception e) {
             log.error("AkwaPay webhook: failed to read request body", e);
@@ -504,7 +452,8 @@ public class AkwaPayController {
         }
 
         if (!verifySignature(rawBody, signature)) {
-            log.warn("AkwaPay webhook: invalid signature, delivery='{}' eventType='{}'",
+            log.warn("AkwaPay webhook: invalid signature, delivery='{}' eventType='{}' — " +
+                            "check AKWAPAY_WEBHOOK_SECRET matches the whsec_ for this endpoint",
                     deliveryId, headerEventType);
             return ResponseEntity.status(400).body("Invalid signature");
         }
@@ -560,13 +509,9 @@ public class AkwaPayController {
                 handleDeposit(parsed.userId(), reference, amount, intentId);
             }
 
-            // ── Remove from pending ledger — webhook beat the sweep ─────────────
-            // The sweep checks this map; removing here means it won't re-poll
-            // AkwaPay for an intent that just settled cleanly via the webhook.
-            var removed = pendingIntents.remove(reference);
-            if (removed != null) {
-                log.info("AkwaPay webhook: ref='{}' removed from pending ledger after webhook settlement", reference);
-            }
+            // Webhook beat the sweep. Drop the row so the sweep doesn't re-poll
+            // AkwaPay for something already settled.
+            deletePending(reference, "settled by webhook");
 
         } catch (ApiException e) {
             log.error("AkwaPay webhook: bad request — {}", e.getMessage(), e);
@@ -582,85 +527,76 @@ public class AkwaPayController {
     // ─── Reconciliation sweep ─────────────────────────────────────────────────
 
     /**
-     * Runs every 2 minutes. For every intent in {@link #pendingIntents} that is
-     * older than 3 minutes (giving the webhook a head start), polls AkwaPay
-     * directly and applies the credit if AkwaPay says `succeeded`.
+     * Runs every 2 minutes. For every pending row older than
+     * {@link #SWEEP_HEAD_START}, polls AkwaPay directly and applies the credit
+     * if AkwaPay says `succeeded`.
      *
-     * This is the guarantee that makes the webhook optional rather than a single
-     * point of failure. As long as AkwaPay collected the money, the credit will
-     * happen — even if:
-     *   - the webhook delivery window was missed entirely (pod restart, crash)
-     *   - the webhook secret was wrong and we rejected every delivery
-     *   - AkwaPay's webhook worker had an outage
+     * This is what actually settles payments in this deployment. Because the
+     * rows are in Postgres rather than a field on this bean, a restart mid-sweep
+     * loses nothing: the next cycle on any instance picks the same rows up.
      *
      * Safety:
-     *   - Both paths call the SAME {@link #handleDeposit} /
-     *     {@link #handleAdminUpgrade} methods, which delegate to
-     *     {@link WalletService#credit}, which returns 409 on a duplicate
-     *     reference. Both callers catch 409 and skip. No double-credit possible.
-     *   - Intents still `processing` / `unknown` / `requires_action` are left
-     *     PENDING and re-checked next cycle.
-     *   - Intents older than 24 h are abandoned — these are almost always
-     *     customers who approved the MoMo prompt but the payment expired on the
-     *     gateway side. AkwaPay will have already fired `payment_intent.failed`
-     *     for them.
+     *   - Both paths call the SAME handleDeposit / handleAdminUpgrade, which
+     *     delegate to WalletService.credit(), which returns 409 on a duplicate
+     *     reference. No double-credit is possible.
+     *   - `processing` / `unknown` / `requires_action` rows are left in place
+     *     and re-checked next cycle. `unknown` in particular is NOT a failure.
+     *   - Rows older than {@link #ABANDON_AFTER} are deleted; those are intents
+     *     the customer never completed.
      */
     @Scheduled(fixedDelay = 120_000) // every 2 minutes
     public void reconcilePendingIntents() {
-        // Give the webhook a 3-minute head start. Most intents settle almost
-        // instantly via the webhook; don't poll AkwaPay for those.
-        var cutoff = Instant.now().minus(Duration.ofMinutes(3));
+        var cutoff = Instant.now().minus(SWEEP_HEAD_START);
 
-        var stale = pendingIntents.entrySet().stream()
-                .filter(e -> e.getValue().createdAt().isBefore(cutoff))
-                .toList();
-
+        var stale = pendingIntents.findByCreatedAtBeforeOrderByCreatedAtAsc(cutoff);
         if (stale.isEmpty()) return;
 
         log.info("reconcile: {} stale pending intent(s) to check", stale.size());
 
-        for (var entry : stale) {
-            var ref    = entry.getKey();
-            var intent = entry.getValue();
+        for (var intent : stale) {
             try {
-                reconcileOne(ref, intent);
+                reconcileOne(intent);
             } catch (Exception e) {
                 log.error("reconcile: unexpected error for ref='{}' intent='{}' — will retry next sweep",
-                        ref, intent.intentId(), e);
+                        intent.getReference(), intent.getIntentId(), e);
             }
         }
     }
 
     /**
-     * Polls AkwaPay for a single pending intent and acts on the result.
+     * Polls AkwaPay for one pending row and acts on the result.
      *
-     * Terminal outcomes:
-     *   succeeded → credit the user, remove from ledger
-     *   failed / declined / cancelled / expired → log, remove from ledger
-     *   > 24 h old → abandon, remove from ledger (payment expired on gateway)
+     * Terminal (row deleted):
+     *   succeeded                                → credit the user
+     *   failed / declined / cancelled / expired  → nothing to credit
+     *   older than ABANDON_AFTER                 → customer never completed it
      *
-     * Non-terminal outcomes (leave in ledger, retry next cycle):
-     *   processing / unknown / requires_action → still in flight, do nothing
-     *   network error / timeout → AkwaPay unreachable, try again in 2 min
+     * Non-terminal (row kept, retried next cycle):
+     *   processing / unknown / requires_action   → still in flight
+     *   network error / timeout                  → AkwaPay unreachable
      */
-    private void reconcileOne(String ref, PendingIntent intent) {
-        // Abandon after 24 h — these are almost certainly expired/failed intents
-        // whose payment_intent.failed webhook we already processed (or will
-        // process). Keeping them longer just burns AkwaPay API quota.
-        if (intent.createdAt().isBefore(Instant.now().minus(Duration.ofHours(24)))) {
-            log.warn("reconcile: abandoning ref='{}' intent='{}' after 24 h with no settlement",
-                    ref, intent.intentId());
-            pendingIntents.remove(ref);
+    private void reconcileOne(AkwaPayPendingIntent intent) {
+        var ref = intent.getReference();
+
+        if (intent.getCreatedAt().isBefore(Instant.now().minus(ABANDON_AFTER))) {
+            log.warn("reconcile: abandoning ref='{}' intent='{}' after {}h with no settlement",
+                    ref, intent.getIntentId(), ABANDON_AFTER.toHours());
+            deletePending(ref, "abandoned after " + ABANDON_AFTER.toHours() + "h");
             return;
         }
 
-        // Bump attempt counter before the network call so a crash mid-call still
-        // increments it on the next sweep.
-        pendingIntents.put(ref, intent.withAttempt());
+        // Bump before the network call so a crash mid-call still counts.
+        try {
+            intent.bumpAttempts();
+            pendingIntents.save(intent);
+        } catch (Exception e) {
+            // Diagnostics only — never let a counter write stop a settlement.
+            log.warn("reconcile: could not persist attempt counter for ref='{}': {}", ref, e.getMessage());
+        }
 
         @SuppressWarnings("unchecked")
         var result = (Map<String, Object>) webClientBuilder.build()
-                .get().uri(baseUrl + "/payment_intents/" + intent.intentId())
+                .get().uri(baseUrl + "/payment_intents/" + intent.getIntentId())
                 .header("Authorization", "Bearer " + secretKey)
                 .retrieve()
                 .onStatus(
@@ -675,50 +611,66 @@ public class AkwaPayController {
                 .timeout(akwapayTimeout)
                 .onErrorResume(e -> {
                     log.warn("reconcile: status check failed for ref='{}' intent='{}' — will retry next sweep: {}",
-                            ref, intent.intentId(), e.getMessage());
+                            ref, intent.getIntentId(), e.getMessage());
                     return Mono.empty();
                 })
                 .block();
 
         if (result == null) {
-            // Network error or timeout — already logged above. Leave in ledger.
+            // Network error or timeout — already logged. Leave the row alone.
             return;
         }
 
         var akwapayStatus = String.valueOf(result.get("status")).toLowerCase();
         log.info("reconcile: ref='{}' intent='{}' akwapayStatus='{}' attempt={}",
-                ref, intent.intentId(), akwapayStatus, intent.attempts() + 1);
+                ref, intent.getIntentId(), akwapayStatus, intent.getAttempts());
 
         switch (akwapayStatus) {
             case "succeeded" -> {
-                // Same code path the webhook uses. WalletService.credit() dedupes
-                // on reference (409 on repeat), so this is safe even if the real
-                // webhook fires seconds later — no double credit either way.
+                // Same code path the webhook uses. credit() dedupes on
+                // reference, so this stays safe even if a webhook lands
+                // seconds later.
                 log.info("reconcile: ref='{}' succeeded on sweep — applying credit now", ref);
-                if (intent.adminUpgrade()) {
-                    handleAdminUpgrade(intent.userId(), ref, intent.amount(), intent.intentId());
+                if (intent.isAdminUpgrade()) {
+                    handleAdminUpgrade(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
                 } else {
-                    handleDeposit(intent.userId(), ref, intent.amount(), intent.intentId());
+                    handleDeposit(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
                 }
-                pendingIntents.remove(ref);
-                log.info("reconcile: ref='{}' settled and removed from pending ledger", ref);
+                deletePending(ref, "settled by sweep");
             }
 
             case "failed", "declined", "cancelled", "expired" -> {
-                // Payment definitively failed on AkwaPay's side. Nothing to credit.
-                // The webhook for payment_intent.failed may or may not have arrived;
-                // either way we don't need to act. Log and clear.
-                log.warn("reconcile: ref='{}' intent='{}' terminal status='{}' — removing from ledger, no credit applied",
-                        ref, intent.intentId(), akwapayStatus);
-                pendingIntents.remove(ref);
+                log.warn("reconcile: ref='{}' intent='{}' terminal status='{}' — no credit applied",
+                        ref, intent.getIntentId(), akwapayStatus);
+                deletePending(ref, "terminal status " + akwapayStatus);
             }
 
             default ->
-                // processing / unknown / requires_action / anything else —
-                // still in flight. AkwaPay will resolve it and fire the webhook,
-                // OR the next sweep will catch it. Leave in the ledger.
+                // processing / unknown / requires_action / anything unfamiliar.
+                // Still in flight; the safe direction is always "keep waiting",
+                // never "tell them it failed".
                     log.info("reconcile: ref='{}' status='{}' — still in flight, will re-check next sweep",
                             ref, akwapayStatus);
+        }
+    }
+
+    /**
+     * Removes a settled or abandoned row.
+     *
+     * Failures are logged, not thrown. By the time this is called the credit has
+     * already been applied; a stuck row only causes a redundant status poll next
+     * cycle, and that poll finds a duplicate reference and skips. Throwing here
+     * would roll back a successful credit, which is far worse.
+     */
+    private void deletePending(String reference, String why) {
+        try {
+            if (pendingIntents.existsById(reference)) {
+                pendingIntents.deleteById(reference);
+                log.info("deletePending: ref='{}' removed from pending ledger ({})", reference, why);
+            }
+        } catch (Exception e) {
+            log.warn("deletePending: could not remove ref='{}' ({}) — harmless, sweep will re-check and skip: {}",
+                    reference, why, e.getMessage());
         }
     }
 
@@ -728,16 +680,9 @@ public class AkwaPayController {
      * Credits the depositing user's wallet, then attributes commission to their
      * referrer (if they were referred).
      *
-     * Called by BOTH the webhook handler AND the reconciliation sweep. Both paths
-     * are safe to call concurrently — WalletService.credit() returns 409 on a
-     * duplicate reference; we catch that and skip silently, so no double-credit
-     * is possible regardless of which path wins the race.
-     *
-     * Commission structure:
-     *   The referring admin earns a percentage of every deposit made by users
-     *   they referred. The rate is stored on the Referral entity and defaults
-     *   to 70% of the platform commission. Resolution happens entirely inside
-     *   ReferralService.attributeCommission(). This method just triggers it.
+     * Called by BOTH the webhook handler AND the sweep. Safe concurrently —
+     * WalletService.credit() returns 409 on a duplicate reference; we catch it
+     * and skip, so no double-credit is possible whichever wins the race.
      */
     private void handleDeposit(UUID userId, String ref, BigDecimal amount, String intentId) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}' intent='{}'",
@@ -754,7 +699,7 @@ public class AkwaPayController {
             throw ex;
         }
 
-        // ── Attribute commission to referring admin ──
+        // ── Attribute commission to the referring admin ──
         try {
             referralService.attributeCommission(userId, amount);
             log.info("handleDeposit: commission attributed for userId='{}' deposit={} adminRate={}",
@@ -767,17 +712,9 @@ public class AkwaPayController {
     }
 
     /**
-     * Handles an admin upgrade payment.
-     *
-     * Called by BOTH the webhook handler AND the reconciliation sweep. Both paths
-     * are safe to call concurrently — UserService.upgradeToAdmin() returns 409
-     * on a duplicate reference; we catch that and skip silently.
-     *
-     * Steps:
-     *   1. Validate amount >= GHS 200
-     *   2. Promote user to ADMIN + initialise their referral link at 70%
-     *   3. Record an audit transaction (AkwaPay collected the funds externally)
-     *   4. Create onboarding chat with Super Admin for commission confirmation
+     * Handles an admin upgrade payment. Called by BOTH the webhook handler and
+     * the sweep; upgradeToAdmin() returns 409 on a duplicate reference, which
+     * we catch and skip.
      */
     private void handleAdminUpgrade(UUID userId, String ref, BigDecimal amount, String intentId) {
         log.info("handleAdminUpgrade: userId='{}' amount={} ref='{}' intent='{}'",
@@ -815,13 +752,13 @@ public class AkwaPayController {
     // ─── Network resolution ────────────────────────────────────────────────────
 
     /**
-     * Decides which network string ("MTN" | "TELECEL" | "AIRTELTIGO") to send
-     * to AkwaPay, since it's now mandatory whenever method=mobile_money.
+     * Decides which network string ("MTN" | "TELECEL" | "AIRTELTIGO") to send,
+     * since it is mandatory whenever method=mobile_money.
      *
-     * Order of preference:
-     *   1. Whatever the client explicitly sent — the user picked it, trust it.
+     *   1. Whatever the client sent — the user picked it, trust it.
      *   2. A best-effort guess from the phone number's prefix.
-     *   3. Neither worked → 400, ask the user to pick one.
+     *   3. Neither → 400, ask the user to pick one. Better than letting AkwaPay
+     *      reject it and surfacing a generic 500.
      */
     private String resolveNetwork(String requested, String phone) {
         if (requested != null && !requested.isBlank()) {
@@ -844,8 +781,8 @@ public class AkwaPayController {
 
     /**
      * Best-effort guess of a Ghana MoMo number's network from its prefix.
-     * Returns empty when the number doesn't normalize to a recognisable Ghana
-     * mobile shape, or its prefix isn't in {@link #GH_NETWORK_PREFIXES}.
+     * Empty when the number doesn't normalise to a recognisable Ghana mobile
+     * shape, or its prefix isn't in {@link #GH_NETWORK_PREFIXES}.
      */
     private Optional<String> detectNetworkFromPhone(String phone) {
         if (phone == null || phone.isBlank()) return Optional.empty();
@@ -861,21 +798,17 @@ public class AkwaPayController {
             return Optional.empty();
         }
 
-        var prefix = local.substring(0, 3);
-        var network = GH_NETWORK_PREFIXES.get(prefix);
-        return Optional.ofNullable(network);
+        return Optional.ofNullable(GH_NETWORK_PREFIXES.get(local.substring(0, 3)));
     }
 
     // ─── AkwaPay API helper ───────────────────────────────────────────────────
 
     /**
-     * Calls POST /v1/payment_intents and returns the FULL response map.
-     *
-     * The response is returned whole and unmodified. The frontend decides
-     * between `checkout_url` (handles every branch) and reading
-     * `next_action.type` itself. Do not flatten it here — AkwaPay adds
-     * next_action variants without warning, and a flattening layer silently
-     * drops the ones it does not know about.
+     * Calls POST /v1/payment_intents and returns the FULL response map,
+     * unmodified. The frontend decides between `checkout_url` (handles every
+     * branch) and reading `next_action.type` itself. Do not flatten it here —
+     * AkwaPay adds next_action variants without warning and a flattening layer
+     * silently drops the ones it does not know about.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> akwapayCreateIntent(int amountPesewas,
@@ -891,11 +824,11 @@ public class AkwaPayController {
         if (phone != null && !phone.isBlank()) customer.put("phone", phone);
 
         var body = new HashMap<String, Object>();
-        body.put("amount",     amountPesewas);
+        body.put("amount",     amountPesewas);   // integer pesewas — never a decimal
         body.put("currency",   "GHS");
         body.put("reference",  reference);
         body.put("return_url", returnUrl);
-        body.put("metadata",   metadata);
+        body.put("metadata",   metadata);        // stored, but NOT echoed on the webhook
         if (!customer.isEmpty()) body.put("customer", customer);
 
         body.put("method",  "mobile_money");
@@ -963,14 +896,11 @@ public class AkwaPayController {
     // ─── Reference encoding / decoding ────────────────────────────────────────
 
     /**
-     * Builds a reference string that encodes the userId and intent type so the
-     * webhook handler can recover both with no other context.
+     * Builds a reference encoding the userId and intent type, so the webhook
+     * handler can recover both with no other context.
      *
-     * Format:  sbdep_<32-hex-userId>_<8-hex-nonce>
-     *          sbadm_<32-hex-userId>_<8-hex-nonce>
-     *
-     * NEVER change the prefix strings or the layout — the webhook parser depends
-     * on fixed offsets. A format change makes all in-flight intents unroutable.
+     * NEVER change the prefixes or the layout — the parser depends on fixed
+     * offsets, and a format change makes every in-flight intent unroutable.
      */
     private String buildReference(String prefix, UUID userId) {
         var nonce = Long.toHexString(System.nanoTime() & 0xFFFFFFFFL);
@@ -981,11 +911,9 @@ public class AkwaPayController {
     }
 
     /**
-     * Parses a reference string back into userId + intent type.
-     *
-     * Returns null when the reference was not minted by this controller — which
-     * means the webhook cannot be routed and should be acknowledged (200) without
-     * taking any action.
+     * Parses a reference back into userId + intent type. Null when the
+     * reference was not minted by this controller, which means the webhook
+     * cannot be routed and should be acknowledged without action.
      */
     private ParsedRef parseReference(String reference) {
         boolean adminUpgrade;
@@ -993,7 +921,7 @@ public class AkwaPayController {
         else if (reference.startsWith(REF_PREFIX_ADMIN))   adminUpgrade = true;
         else return null;
 
-        var rest = reference.substring(REF_PREFIX_DEPOSIT.length());
+        var rest = reference.substring(REF_PREFIX_DEPOSIT.length()); // both prefixes are 6 chars
         if (rest.length() < 32) return null;
 
         var hex = rest.substring(0, 32);
@@ -1016,16 +944,15 @@ public class AkwaPayController {
     // ─── Signature verification ───────────────────────────────────────────────
 
     /**
-     * Verifies the X-AkwaPay-Signature header on an inbound webhook.
-     *
      * Header format:  X-AkwaPay-Signature: t=1754049600,v1=5f3c9a...
      * Signed value:   HMAC-SHA256( "{timestamp}.{rawBody}", whsec )  hex-encoded
      *
      * Three things that are easy to get wrong, all handled here:
-     *
-     *   1. HMAC is over the RAW bytes, before any JSON parse/re-serialise.
-     *   2. Timestamps outside ±5 min are rejected (replay attack prevention).
-     *   3. Constant-time compare via MessageDigest.isEqual().
+     *   1. HMAC over the RAW bytes, before any parse/re-serialise.
+     *   2. Reject timestamps outside ±5 min — this is what stops someone
+     *      replaying a captured `succeeded` event.
+     *   3. Constant-time compare. equals() on a signature leaks it a byte at a
+     *      time.
      */
     private boolean verifySignature(byte[] rawBody, String header) {
         try {
