@@ -239,6 +239,9 @@ public class AkwaPayController {
      * How often the sweep ticks. This is NOT how often any one intent is
      * polled — see {@link #pollIntervalFor}.
      *
+     * Documentation only: the @Scheduled annotation below needs a literal and
+     * cannot read this. Change both together.
+     *
      * An idle tick is one indexed query returning nothing and no network calls
      * at all, so a fast tick costs essentially nothing when there are no
      * payments in flight.
@@ -395,11 +398,6 @@ public class AkwaPayController {
                 intentId, response.get("status"), user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(response));
-    }
-
-    /** Exposed so @Scheduled can reference the constant rather than duplicating it. */
-    public long getSweepIntervalMs() {
-        return SWEEP_INTERVAL_MS;
     }
 
     /**
@@ -604,7 +602,19 @@ public class AkwaPayController {
      *   - Poll rate decays with age, so an abandoned intent costs ~200 calls
      *     across the full 24h window rather than thousands.
      */
-    @Scheduled(fixedDelayString = "#{@akwaPayController.sweepIntervalMs}")
+    //
+    // NOTE: this literal must stay in step with SWEEP_INTERVAL_MS above.
+    //
+    // It cannot reference the constant. @Scheduled needs a compile-time
+    // constant or a property placeholder; a SpEL bean lookup like
+    // "#{@akwaPayController.sweepIntervalMs}" makes this bean depend on
+    // itself while it is still being constructed, and Spring rejects the
+    // whole context with "Expression parsing failed" plus a one-node
+    // dependency cycle. The application will not start at all.
+    //
+    // If you want it configurable, use a property instead:
+    //     @Scheduled(fixedDelayString = "${app.akwapay.sweep-interval-ms:5000}")
+    @Scheduled(fixedDelay = 5_000)
     public void reconcilePendingIntents() {
         var cutoff = Instant.now().minus(SWEEP_HEAD_START);
 
