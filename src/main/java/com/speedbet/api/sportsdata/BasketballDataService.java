@@ -73,7 +73,7 @@ import java.util.function.Supplier;
 public class BasketballDataService {
 
     // ── ESPN NBA base URL ──────────────────────────────────────────────────
-    private static final String BASE_URL       = "https://site.api.espn.com";
+    private static final String BASE_URL = "https://site.web.api.espn.com";
     private static final String NBA_PATH       = "/apis/site/v2/sports/basketball/nba";
     private static final long   CACHE_TTL_MIN  = 5;
     private static final long   REQUEST_TIMEOUT_SEC = 12;

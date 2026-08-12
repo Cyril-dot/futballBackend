@@ -85,7 +85,7 @@ import java.util.function.Supplier;
 public class TennisDataService {
 
     // ── ESPN Tennis base paths ─────────────────────────────────────────────
-    private static final String BASE_URL            = "https://site.api.espn.com";
+    private static final String BASE_URL = "https://site.web.api.espn.com";
     private static final String ATP_PATH            = "/apis/site/v2/sports/tennis/atp";
     private static final String WTA_PATH            = "/apis/site/v2/sports/tennis/wta";
     private static final long   CACHE_TTL_MIN       = 5;

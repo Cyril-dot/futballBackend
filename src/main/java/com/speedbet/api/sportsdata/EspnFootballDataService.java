@@ -20,8 +20,8 @@ import java.util.stream.Collectors;
 @Component
 public class EspnFootballDataService {
 
-    private static final String BASE_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer";
-
+    private static final String BASE_URL = "https://site.web.api.espn.com/apis/site/v2/sports/soccer";
+    
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
     private static final DateTimeFormatter ESPN_DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
