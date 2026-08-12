@@ -104,7 +104,21 @@ public class AkwaPayPendingIntent {
     @Column(name = "attempts", nullable = false)
     private int attempts;
 
-    public void bumpAttempts() {
+    /**
+     * When AkwaPay was last asked about this intent.
+     *
+     * This is what makes tiered polling possible: the sweep ticks every few
+     * seconds, but each individual row is only polled when enough time has
+     * passed for ITS age band. Without this column the choice is one flat
+     * interval for everything — either fast and wasteful, or cheap and slow.
+     *
+     * Null means never polled, which is treated as "due now".
+     */
+    @Column(name = "last_checked_at")
+    private Instant lastCheckedAt;
+
+    public void markChecked(Instant when) {
+        this.lastCheckedAt = when;
         this.attempts = this.attempts + 1;
     }
 }

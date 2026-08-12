@@ -226,8 +226,55 @@ public class AkwaPayController {
     /** Replay window for webhook signatures, per AkwaPay docs (5 minutes). */
     private static final long SIGNATURE_TOLERANCE_SECONDS = 300;
 
-    /** How long the webhook gets to settle an intent before the sweep steps in. */
-    private static final Duration SWEEP_HEAD_START = Duration.ofMinutes(3);
+    /**
+     * How long the webhook gets to settle an intent before the sweep touches it.
+     *
+     * Five seconds. Short enough that a customer who approves quickly is
+     * credited almost immediately; long enough that we are not polling an
+     * intent that AkwaPay only just created.
+     */
+    private static final Duration SWEEP_HEAD_START = Duration.ofSeconds(5);
+
+    /**
+     * How often the sweep ticks. This is NOT how often any one intent is
+     * polled — see {@link #pollIntervalFor}.
+     *
+     * An idle tick is one indexed query returning nothing and no network calls
+     * at all, so a fast tick costs essentially nothing when there are no
+     * payments in flight.
+     */
+    private static final long SWEEP_INTERVAL_MS = 5_000;
+
+    /**
+     * TIERED POLLING — the reason a deposit settles in seconds rather than
+     * minutes.
+     *
+     * A flat interval forces a bad trade: fast enough for a good checkout
+     * experience means hammering AkwaPay for hours on intents the customer
+     * abandoned. So the poll rate decays with the intent's age instead.
+     *
+     * The shape follows how people actually pay. Almost every real payment
+     * resolves in the first two minutes — that is someone with the prompt in
+     * front of them. Past ten minutes they have walked away, and the only
+     * reason to keep asking is the small chance a stuck gateway resolves late.
+     *
+     *     age < 2 min    poll every tick (5s)    → the common case, near-instant
+     *     2–10 min       every 30s               → slow approvals, gateway lag
+     *     10–60 min      every 2 min             → probably abandoned
+     *     > 60 min       every 10 min            → long-tail gateway recovery
+     *
+     * Cost for one abandoned intent over the full 24h window is ~24 + 16 + 25 +
+     * 138 ≈ 200 calls, against ~2,880 at a flat 30s. Twelve times cheaper AND
+     * six times faster in the case that actually matters.
+     */
+    private static final Duration TIER_HOT_UNTIL    = Duration.ofMinutes(2);
+    private static final Duration TIER_WARM_UNTIL   = Duration.ofMinutes(10);
+    private static final Duration TIER_COOL_UNTIL   = Duration.ofMinutes(60);
+
+    private static final Duration POLL_EVERY_HOT    = Duration.ofSeconds(5);
+    private static final Duration POLL_EVERY_WARM   = Duration.ofSeconds(30);
+    private static final Duration POLL_EVERY_COOL   = Duration.ofMinutes(2);
+    private static final Duration POLL_EVERY_COLD   = Duration.ofMinutes(10);
 
     /** After this long with no resolution, stop polling and give up on a row. */
     private static final Duration ABANDON_AFTER = Duration.ofHours(24);
@@ -350,6 +397,11 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
+    /** Exposed so @Scheduled can reference the constant rather than duplicating it. */
+    public long getSweepIntervalMs() {
+        return SWEEP_INTERVAL_MS;
+    }
+
     /**
      * Writes the pending row.
      *
@@ -362,8 +414,10 @@ public class AkwaPayController {
     private void recordPending(String reference, String intentId, UUID userId,
                                BigDecimal amountGhs, boolean adminUpgrade) {
         try {
+            // lastCheckedAt starts null — "never polled", which the sweep treats
+            // as due the moment the head start elapses.
             pendingIntents.save(new AkwaPayPendingIntent(
-                    reference, intentId, userId, amountGhs, adminUpgrade, Instant.now(), 0));
+                    reference, intentId, userId, amountGhs, adminUpgrade, Instant.now(), 0, null));
             log.info("recordPending: ref='{}' intent='{}' persisted — sweep will reconcile if the webhook is lost",
                     reference, intentId);
         } catch (Exception e) {
@@ -527,9 +581,13 @@ public class AkwaPayController {
     // ─── Reconciliation sweep ─────────────────────────────────────────────────
 
     /**
-     * Runs every 2 minutes. For every pending row older than
-     * {@link #SWEEP_HEAD_START}, polls AkwaPay directly and applies the credit
-     * if AkwaPay says `succeeded`.
+     * Ticks every {@link #SWEEP_INTERVAL_MS}ms. Each pending row is polled only
+     * when it is due for its age band ({@link #pollIntervalFor}), so a
+     * just-created intent is checked every 5 seconds while an hour-old one is
+     * checked every 10 minutes.
+     *
+     * Worst case from the customer approving to being credited is one tick plus
+     * the status call — around 5 seconds.
      *
      * This is what actually settles payments in this deployment. Because the
      * rows are in Postgres rather than a field on this bean, a restart mid-sweep
@@ -543,24 +601,58 @@ public class AkwaPayController {
      *     and re-checked next cycle. `unknown` in particular is NOT a failure.
      *   - Rows older than {@link #ABANDON_AFTER} are deleted; those are intents
      *     the customer never completed.
+     *   - Poll rate decays with age, so an abandoned intent costs ~200 calls
+     *     across the full 24h window rather than thousands.
      */
-    @Scheduled(fixedDelay = 120_000) // every 2 minutes
+    @Scheduled(fixedDelayString = "#{@akwaPayController.sweepIntervalMs}")
     public void reconcilePendingIntents() {
         var cutoff = Instant.now().minus(SWEEP_HEAD_START);
 
         var stale = pendingIntents.findByCreatedAtBeforeOrderByCreatedAtAsc(cutoff);
         if (stale.isEmpty()) return;
 
-        log.info("reconcile: {} stale pending intent(s) to check", stale.size());
+        // Only the rows actually due this tick. Logging the count of DUE rows
+        // rather than of all pending rows keeps the log readable — at a 5s tick
+        // the alternative is the same line twelve times a minute saying nothing
+        // happened.
+        var due = stale.stream().filter(i -> isDue(i, Instant.now())).toList();
+        if (due.isEmpty()) return;
 
-        for (var intent : stale) {
+        log.info("reconcile: {} of {} pending intent(s) due this tick", due.size(), stale.size());
+
+        for (var intent : due) {
             try {
                 reconcileOne(intent);
             } catch (Exception e) {
-                log.error("reconcile: unexpected error for ref='{}' intent='{}' — will retry next sweep",
+                log.error("reconcile: unexpected error for ref='{}' intent='{}' — will retry next tick",
                         intent.getReference(), intent.getIntentId(), e);
             }
         }
+    }
+
+    /**
+     * Whether this intent is due to be polled now, per its age band.
+     *
+     * Never polled before → always due. That is the first check after the head
+     * start elapses, and it is the one that settles the overwhelming majority
+     * of real payments.
+     */
+    private boolean isDue(AkwaPayPendingIntent intent, Instant now) {
+        var last = intent.getLastCheckedAt();
+        if (last == null) return true;
+        return last.plus(pollIntervalFor(intent, now)).isBefore(now);
+    }
+
+    /**
+     * How often to poll an intent of this age. See the TIER_* constants for the
+     * reasoning behind the shape.
+     */
+    private Duration pollIntervalFor(AkwaPayPendingIntent intent, Instant now) {
+        var age = Duration.between(intent.getCreatedAt(), now);
+        if (age.compareTo(TIER_HOT_UNTIL)  < 0) return POLL_EVERY_HOT;
+        if (age.compareTo(TIER_WARM_UNTIL) < 0) return POLL_EVERY_WARM;
+        if (age.compareTo(TIER_COOL_UNTIL) < 0) return POLL_EVERY_COOL;
+        return POLL_EVERY_COLD;
     }
 
     /**
@@ -585,13 +677,16 @@ public class AkwaPayController {
             return;
         }
 
-        // Bump before the network call so a crash mid-call still counts.
+        // Mark BEFORE the network call. If the call hangs or the pod dies
+        // mid-flight, the row is already stamped and will not be re-polled on
+        // the very next tick — which at a 5s cadence would otherwise pile up
+        // duplicate in-flight requests against AkwaPay for the same intent.
         try {
-            intent.bumpAttempts();
+            intent.markChecked(Instant.now());
             pendingIntents.save(intent);
         } catch (Exception e) {
-            // Diagnostics only — never let a counter write stop a settlement.
-            log.warn("reconcile: could not persist attempt counter for ref='{}': {}", ref, e.getMessage());
+            // Diagnostics only — never let a bookkeeping write stop a settlement.
+            log.warn("reconcile: could not stamp lastCheckedAt for ref='{}': {}", ref, e.getMessage());
         }
 
         @SuppressWarnings("unchecked")
@@ -649,8 +744,8 @@ public class AkwaPayController {
                 // processing / unknown / requires_action / anything unfamiliar.
                 // Still in flight; the safe direction is always "keep waiting",
                 // never "tell them it failed".
-                    log.info("reconcile: ref='{}' status='{}' — still in flight, will re-check next sweep",
-                            ref, akwapayStatus);
+                    log.info("reconcile: ref='{}' status='{}' — still in flight, next check in {}s",
+                            ref, akwapayStatus, pollIntervalFor(intent, Instant.now()).toSeconds());
         }
     }
 

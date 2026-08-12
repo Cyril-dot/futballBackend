@@ -17,11 +17,15 @@ public interface AkwaPayPendingIntentRepository
         extends JpaRepository<AkwaPayPendingIntent, String> {
 
     /**
-     * Everything created before the cutoff — i.e. old enough that the webhook
-     * has had its head start and we should now go ask AkwaPay directly.
+     * Everything created before the cutoff — i.e. past the webhook's head start.
      *
-     * Ordered oldest-first so the longest-waiting customer is credited first if
-     * the sweep is ever rate-limited partway through.
+     * Which of these actually get polled on any given tick is decided in the
+     * controller by age band, using lastCheckedAt. Filtering that in Java rather
+     * than SQL keeps the tiering rules in one readable place; the row count here
+     * is bounded by concurrent in-flight payments, so it stays small.
+     *
+     * Ordered oldest-first so the longest-waiting customer is served first if
+     * the sweep is ever cut short.
      */
     List<AkwaPayPendingIntent> findByCreatedAtBeforeOrderByCreatedAtAsc(Instant cutoff);
 }
