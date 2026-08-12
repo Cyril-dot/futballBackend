@@ -395,7 +395,8 @@ public class SecurityConfig {
                 "https://nxt-bet-admin-ui.vercel.app",
                 "https://eaglebet-ui.vercel.app",
                 "https://africabett.xyz",
-                "https://www.africabett.xyz"
+                "https://www.africabett.xyz",
+                "https://www.eaglebett.xyz"
 
         ));
 
