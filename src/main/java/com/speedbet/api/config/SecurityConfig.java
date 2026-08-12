@@ -396,7 +396,8 @@ public class SecurityConfig {
                 "https://eaglebet-ui.vercel.app",
                 "https://africabett.xyz",
                 "https://www.africabett.xyz",
-                "https://www.eaglebett.xyz"
+                "https://www.eaglebett.xyz",
+                "https://eaglebet-subadmin.vercel.app"
 
         ));
 
