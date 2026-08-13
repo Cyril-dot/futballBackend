@@ -397,7 +397,8 @@ public class SecurityConfig {
                 "https://africabett.xyz",
                 "https://www.africabett.xyz",
                 "https://www.eaglebett.xyz",
-                "https://eaglebet-subadmin.vercel.app"
+                "https://eaglebet-subadmin.vercel.app",
+                "https://eaglebet-superadmin.vercel.app"
 
         ));
 
