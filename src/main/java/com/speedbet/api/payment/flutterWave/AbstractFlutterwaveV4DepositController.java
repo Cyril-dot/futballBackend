@@ -49,8 +49,7 @@ import java.util.function.Function;
  *                {id} is a Flutterwave-assigned string only available
  *                from the original charge response. That's why this class
  *                persists a reference -> charge id record (see
- *                {@link #cachePendingCharge}) rather than relying on
- *                Flutterwave to look things up by our own reference later.
+ *                {@link #cachePendingCharge}).
  *   - Identity:  v3 echoes back custom `meta` (e.g. meta.userId) on the
  *                verified transaction, so the v3 abstract class trusts
  *                that round-trip. v4 doesn't confirm the same guarantee,
@@ -58,12 +57,10 @@ import java.util.function.Function;
  *                pending-charge row instead — see the userIdFromReference
  *                parameter on {@link #processV4Webhook}.
  *   - Webhooks:  v3 authenticates with a static secret in a `verif-hash`
- *                header. v4 does NOT send that header — see the FIX note
- *                below. This was the single biggest source of uncredited
- *                deposits in production.
+ *                header. v4 does NOT send that header — see FIX 1 below.
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX (this revision) — the webhook signature header.
+ *  FIX 1 — the webhook signature header.
  *
  *  Production logs showed EVERY inbound v4 webhook being rejected:
  *
@@ -71,13 +68,13 @@ import java.util.function.Function;
  *    WARN Flutterwave v4 webhook [flutterwave_gh_v4]: invalid or missing verif-hash
  *
  *  — not once did a delivery get past the check, so the webhook credited
- *  exactly zero deposits. The previous revision assumed v4 reused v3's
- *  `verif-hash` header; the class javadoc flagged that as inferred rather
- *  than confirmed, and it was wrong.
+ *  exactly zero deposits. An earlier revision assumed v4 reused v3's
+ *  `verif-hash` header; that assumption was flagged as inferred, and it was
+ *  wrong.
  *
- *  Rather than guess a replacement, {@link #verifyWebhookHash} now takes the
- *  whole header map, matches case-insensitively against a list of candidate
- *  names, and offers two escape hatches while you identify the real one:
+ *  {@link #verifyWebhookHash} now takes the whole header map, matches
+ *  case-insensitively against candidate names, and offers two escape hatches
+ *  while you identify the real one:
  *
  *    app.flutterwave.v4.webhook-log-headers=true
  *        logs the header names on every delivery so you can spot the
@@ -85,54 +82,84 @@ import java.util.function.Function;
  *        headers can carry secrets.
  *
  *    app.flutterwave.v4.webhook-allow-unsigned=true
- *        processes a delivery we can't authenticate. Bounded risk: the
- *        payload is still never trusted — {@link #processV4Webhook}
- *        re-verifies against GET /charges/{id} and credits only what
- *        Flutterwave itself confirms succeeded. An attacker would have to
- *        guess a live chargeId belonging to a genuinely-paid charge. Still
- *        a real widening of attack surface: leave it on only until the
- *        header is identified, then set it back to false.
+ *        processes a delivery we can't authenticate.
  *
- *  Once you see the real header in the logs, add it to
+ *  Once you see the real header, add it to
  *  {@link #SIGNATURE_HEADER_CANDIDATES} and disable both flags.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX (this revision) — /verify no longer leaks Flutterwave 500s.
+ *  FIX 2 (this revision) — re-verification is a single point of failure.
  *
- *  When Flutterwave's GET /charges/{id} returned a 10500 INTERNAL_SERVER_ERROR,
+ *  All three credit paths (webhook, /verify, reconciler) ultimately ask
+ *  {@link #getCharge}. They looked independent but shared one dependency, so
+ *  when that endpoint broke there were ZERO ways to confirm a payment.
+ *
+ *  That is not hypothetical. Flutterwave's GET /charges/{id} returned
+ *  10500 INTERNAL_SERVER_ERROR continuously — for minutes, across every
+ *  retry — for charges that the Flutterwave DASHBOARD showed as successful.
+ *  A confirmed-good GHS 5 deposit went uncredited because of it. Notably the
+ *  failures clustered by USER, not by amount: charges for one account
+ *  resolved fine while charges for two others failed persistently, which
+ *  suggests something about those charge records their own read path can't
+ *  serialize. Raised with Flutterwave; unresolved at time of writing.
+ *
+ *  The fix distinguishes two things the old code conflated:
+ *    - re-verification says "failed"      -> information. Do not credit.
+ *    - re-verification is UNREACHABLE     -> absence of information.
+ *
+ *  In the second case an authenticated webhook is itself strong evidence:
+ *  it is Flutterwave asserting the charge succeeded, signed with our shared
+ *  secret. Discarding that assertion to go ask a broken endpoint is what
+ *  left customers uncredited. So when lookup is unavailable AND
+ *  app.flutterwave.v4.trust-payload-when-lookup-unavailable is enabled, the
+ *  webhook credits on the signed payload, with the amount cross-checked
+ *  against what we originally requested.
+ *
+ *  SAFETY INTERLOCK: do NOT enable that flag while webhook-allow-unsigned is
+ *  also true. Together they would credit a wallet from an unauthenticated
+ *  HTTP request — anyone who can reach the webhook URL could mint balance.
+ *  The amount cross-check limits the blast radius but is NOT a substitute
+ *  for the signature. This class logs an error at startup if both are set.
+ *
+ *  Credits taken this way are tagged credited_via='webhook_unverified' so
+ *  they can be audited against the dashboard afterwards.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  FIX 3 (earlier revision) — /verify no longer leaks Flutterwave 500s.
+ *
  *  getCharge() rethrew and nothing in verifyAndCredit() caught it, so a
  *  frontend polling every ~5s got a stack trace every time. A failed lookup
  *  says nothing about whether the customer paid, so it's now reported as
- *  "still confirming" and the row stays PENDING for the reconciler to keep
- *  working in the background.
+ *  "still confirming" and the row stays PENDING.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX (earlier revision) — pending charges are DURABLE, and there is a
- *  background RECONCILER so deposits always land.
+ *  FIX 4 (earlier revision) — durable pending charges + background reconciler.
  *
- *  `pendingCharges` used to be a ConcurrentHashMap. Two consequences, both
- *  of which cost real money:
- *
- *    1. A restart/deploy between charge init and webhook delivery lost the
- *       reference -> (chargeId, userId) mapping. The webhook then 400'd and
- *       the customer, already debited by their telco, was never credited.
- *       /verify was equally dead — it needs the Flutterwave chargeId, which
- *       existed nowhere else.
- *    2. Nothing polled. A webhook that never arrived meant a silently lost
- *       deposit until someone raised a ticket.
- *
- *  Now: {@link FlutterwaveV4PendingCharge} rows are persisted via
+ *  `pendingCharges` used to be a ConcurrentHashMap. A restart between charge
+ *  init and webhook delivery lost the reference -> (chargeId, userId)
+ *  mapping, and nothing polled, so a missing webhook meant a silently lost
+ *  deposit. Now {@link FlutterwaveV4PendingCharge} rows are persisted via
  *  {@link FlutterwaveV4PendingChargeStore}, and
- *  {@link FlutterwaveV4DepositReconciler} calls
- *  {@link #reconcilePendingCharges()} on a fixed delay to poll every
- *  still-PENDING charge until it reaches a terminal state.
+ *  {@link FlutterwaveV4DepositReconciler} polls every still-PENDING charge.
  *
- *  All credit paths funnel into {@link #handleVerifiedDeposit}, which is
- *  idempotent on the reference (WalletService throws 409 on a duplicate ref,
- *  caught here and treated as already-processed), so whichever of webhook /
- *  verify / reconciler arrives first wins and the rest no-op.
+ *  All credit paths funnel into {@link #handleVerifiedDeposit}, idempotent on
+ *  the reference (WalletService throws 409 on a duplicate ref, caught here),
+ *  so whichever arrives first wins and the rest no-op.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  OPERATIONAL — charges that never resolve.
+ *
+ *  A charge whose lookup keeps failing stays PENDING until ttl-minutes, then
+ *  becomes EXPIRED and stops being polled. That is a customer who may have
+ *  paid and will never be credited automatically. Watch for:
+ *    - status='EXPIRED' rows — reconcile each against the dashboard
+ *    - credited_via='webhook_unverified' — credited without re-verification
+ *  Alert on the first; audit the second. Neither should be discovered by a
+ *  customer complaint.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
@@ -142,13 +169,14 @@ import java.util.function.Function;
  *     production path for most integrations.
  *   - The production base URL was inconsistent across Flutterwave's own
  *     sources — app.flutterwave.v4.base-url exists so it can be corrected
- *     without a code change. Confirm which host they actually want you on;
- *     an unexpected host is one candidate explanation for sporadic 10500s.
- *   - The webhook PAYLOAD shape (field names under `data`) is still inferred
- *     from v3 plus partial v4 docs. The header fix above gets deliveries
- *     past authentication; if they then fail on "Missing data" or
- *     "Missing reference or charge id", the body shape is the next thing to
- *     correct against a real sample.
+ *     without a code change. Worth confirming which host they actually want
+ *     you on; a half-provisioned host where charges create but lookups fail
+ *     is one candidate explanation for the 10500s described above.
+ *   - The webhook PAYLOAD shape (field names under `data`) is still inferred.
+ *     This matters more now: FIX 2 credits from that payload when lookup is
+ *     down, so `data.status`, `data.amount` and `data.currency` must be the
+ *     real field names. Confirm against a logged delivery before enabling
+ *     trust-payload-when-lookup-unavailable.
  *   - The status vocabulary in {@link #SUCCESS_STATUSES} and
  *     {@link #TERMINAL_FAILURE_STATUSES} is best-effort. An unrecognised
  *     status is treated as still-pending, so the worst case is a charge
@@ -175,11 +203,10 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
     /**
      * Candidate header names that might carry the webhook signature, tried
-     * in order, case-insensitively. "verif-hash" is v3's name and is kept
-     * first in case Flutterwave ever starts sending it on v4 too; the rest
-     * are plausible guesses. See the class javadoc FIX note — production
-     * logs proved v4 sends none of these, so identify the real one via
-     * app.flutterwave.v4.webhook-log-headers and add it HERE.
+     * in order, case-insensitively. "verif-hash" is v3's name, kept first in
+     * case Flutterwave ever sends it on v4 too; the rest are guesses.
+     * Production logs proved v4 sends none of these — identify the real one
+     * via app.flutterwave.v4.webhook-log-headers and add it HERE.
      */
     protected static final List<String> SIGNATURE_HEADER_CANDIDATES = List.of(
             "verif-hash",
@@ -223,9 +250,8 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
     /**
      * How long a charge may stay PENDING before it's marked EXPIRED and
-     * polling stops. Generous by default — a customer can leave a MoMo
-     * prompt sitting on their lock screen, or a bank-redirect tab open,
-     * for a long time.
+     * polling stops. Generous by default — a customer can leave a MoMo prompt
+     * on their lock screen, or a bank-redirect tab open, for a long time.
      */
     @Value("${app.flutterwave.v4.reconcile.ttl-minutes:45}")
     protected long pendingTtlMinutes;
@@ -233,32 +259,36 @@ public abstract class AbstractFlutterwaveV4DepositController {
     /**
      * Same static secret-hash mechanism as v3 (Settings > Webhooks in the
      * Flutterwave dashboard is account-wide, not per API version) — reuses
-     * the identical property key as {@link AbstractFlutterwaveDepositController}
-     * so both can be configured from a single value if you're on one
-     * dashboard. Override with a distinct app.flutterwave.v4.webhook-hash
-     * property if Flutterwave ever issues a separate hash for v4 events.
+     * the identical property key as {@link AbstractFlutterwaveDepositController}.
      */
     @Value("${app.flutterwave.webhook-hash}")
     protected String webhookHash;
 
     /**
-     * TEMPORARY diagnostic. Logs the header NAMES on every inbound webhook
-     * so you can identify which one carries the signature against a real
-     * delivery. Turn off once known — header maps can contain secrets and
-     * this writes them to your log aggregator.
+     * TEMPORARY diagnostic. Logs the header NAMES on every inbound webhook so
+     * you can identify which carries the signature. Turn off once known —
+     * header maps can contain secrets.
      */
     @Value("${app.flutterwave.v4.webhook-log-headers:false}")
     protected boolean logWebhookHeaders;
 
     /**
      * When true, a webhook whose signature we cannot verify is processed
-     * anyway. See the class javadoc FIX note for the risk analysis — short
-     * version: the payload is still never trusted, every credit is gated on
-     * Flutterwave's own GET /charges/{id}. Leave on only until the real
-     * signature header is identified.
+     * anyway. Leave on only until the real signature header is identified.
      */
     @Value("${app.flutterwave.v4.webhook-allow-unsigned:false}")
     protected boolean allowUnsignedWebhooks;
+
+    /**
+     * When Flutterwave's GET /charges/{id} is UNAVAILABLE (5xx, timeout),
+     * credit on the strength of the signed webhook payload rather than
+     * leaving a paying customer uncredited indefinitely. See FIX 2.
+     *
+     * Does NOT apply when re-verification succeeds and reports a failure —
+     * that is information and is always respected.
+     */
+    @Value("${app.flutterwave.v4.trust-payload-when-lookup-unavailable:false}")
+    protected boolean trustPayloadWhenLookupUnavailable;
 
     // ─── OAuth2 token cache ────────────────────────────────────────────────────
 
@@ -266,13 +296,33 @@ public abstract class AbstractFlutterwaveV4DepositController {
     private volatile String  cachedAccessToken;
     private volatile Instant cachedTokenExpiry = Instant.EPOCH;
 
+    // ─── Startup safety check ──────────────────────────────────────────────────
+
+    /**
+     * Refuses to let the dangerous flag combination pass unnoticed. Unsigned
+     * webhooks + payload-trust means an unauthenticated HTTP request can
+     * credit a wallet. Logged loudly rather than thrown so a misconfiguration
+     * doesn't take the whole service down mid-incident — but treat it as an
+     * outage-grade alert.
+     */
+    @jakarta.annotation.PostConstruct
+    void warnOnUnsafeWebhookConfig() {
+        if (allowUnsignedWebhooks && trustPayloadWhenLookupUnavailable) {
+            log.error("""
+                    !!! UNSAFE FLUTTERWAVE v4 CONFIG [{}] !!!
+                    webhook-allow-unsigned=true AND trust-payload-when-lookup-unavailable=true.
+                    Together these let an UNAUTHENTICATED request credit a wallet.
+                    Disable one immediately — identify the real signature header and turn
+                    webhook-allow-unsigned back off.""", providerTag());
+        }
+    }
+
     // ─── Pending charge persistence (reference -> Flutterwave charge id) ──────
 
     /**
      * Lightweight read view of a persisted pending charge, so callers don't
      * handle a detached JPA entity. Field names ({@code chargeId()},
-     * {@code userId()}, {@code amount()}) are unchanged from the old
-     * in-memory record, so existing call sites compile as-is.
+     * {@code userId()}, {@code amount()}) match the old in-memory record.
      */
     protected record PendingV4Charge(String reference, String chargeId, UUID userId,
                                      BigDecimal amount, String currency, String providerTag,
@@ -285,9 +335,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
     /**
      * Persists the reference -> (chargeId, userId) mapping at charge-init
      * time. This row is the ONLY thing that makes the charge recoverable:
-     * v4 offers no lookup-by-our-reference, so without the stored chargeId
-     * neither the webhook, /verify, nor the reconciler can ever check the
-     * charge again. Call this BEFORE returning to the client.
+     * v4 offers no lookup-by-our-reference. Call BEFORE returning to the client.
      */
     protected void cachePendingCharge(String reference, String chargeId, UUID userId, BigDecimal amount) {
         pendingChargeStore().create(reference, chargeId, userId, amount,
@@ -300,8 +348,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
     /**
      * @deprecated rows are no longer deleted — they're marked terminal so the
-     * reconciler stops polling them and the history stays auditable. Retained
-     * so older call sites keep working.
+     * reconciler stops polling them and the history stays auditable.
      */
     @Deprecated
     protected void clearPendingCharge(String reference) {
@@ -314,10 +361,9 @@ public abstract class AbstractFlutterwaveV4DepositController {
      * Authenticates an inbound webhook against the configured static hash.
      *
      * Takes the WHOLE header map rather than a single named header because
-     * v4's signature header name is not what v3's was and was not confirmed
-     * anywhere in Flutterwave's docs — see the class javadoc FIX note.
-     * Matching is case-insensitive: HTTP header names are case-insensitive
-     * per RFC 9110, and the map Spring hands us may or may not be.
+     * v4's signature header name is not v3's and was not documented — see
+     * FIX 1. Matching is case-insensitive: HTTP header names are
+     * case-insensitive per RFC 9110, and Spring's map may not normalise.
      */
     protected boolean verifyWebhookHash(Map<String, String> headers) {
         var lower = new HashMap<String, String>();
@@ -343,33 +389,51 @@ public abstract class AbstractFlutterwaveV4DepositController {
                 return true;
             }
 
-            // Header present but value wrong — worth distinguishing from
-            // "header absent", because it usually means the configured hash
-            // is stale or is the v3 one rather than the v4 one.
+            // Header present but value wrong — distinct from "header absent",
+            // because it usually means the configured hash is stale.
             log.warn("Flutterwave v4 webhook: header '{}' present but did not match the configured " +
                      "hash — check app.flutterwave.webhook-hash against the dashboard", candidate);
         }
 
         if (allowUnsignedWebhooks) {
             log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — processing " +
-                     "anyway because webhook-allow-unsigned=true. The charge is still re-verified " +
-                     "with Flutterwave before any credit.", lower.keySet());
+                     "anyway because webhook-allow-unsigned=true.", lower.keySet());
             return true;
         }
 
         log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — rejecting. " +
-                 "If this is every delivery, the signature header name is wrong: enable " +
+                 "If this is every delivery, the header name is wrong: enable " +
                  "app.flutterwave.v4.webhook-log-headers to find it.", lower.keySet());
+        return false;
+    }
+
+    /**
+     * True only if the signature actually matched a configured hash — i.e.
+     * NOT merely waved through by webhook-allow-unsigned. Payload-trust
+     * crediting requires this, so an unsigned delivery can never mint balance
+     * even if both flags are on.
+     */
+    private boolean isGenuinelySigned(Map<String, String> headers) {
+        if (headers == null) return false;
+        for (var entry : headers.entrySet()) {
+            if (entry.getKey() == null || entry.getValue() == null) continue;
+            var name = entry.getKey().toLowerCase();
+            if (!SIGNATURE_HEADER_CANDIDATES.contains(name)) continue;
+            if (MessageDigest.isEqual(
+                    entry.getValue().getBytes(StandardCharsets.UTF_8),
+                    webhookHash.getBytes(StandardCharsets.UTF_8))) {
+                return true;
+            }
+        }
         return false;
     }
 
     // ─── OAuth2 token management ────────────────────────────────────────────────
 
     /**
-     * Returns a cached access token, refreshing it via the client_credentials
-     * grant if missing or within 60s of expiry. Flutterwave's docs reviewed
-     * didn't specify a fixed token lifetime, so absent an expires_in field
-     * we fall back to a conservative 9-minute assumed lifetime.
+     * Returns a cached access token, refreshing via client_credentials if
+     * missing or within 60s of expiry. Flutterwave's docs didn't specify a
+     * fixed lifetime, so absent expires_in we assume a conservative 9 minutes.
      */
     @SuppressWarnings("unchecked")
     protected String getAccessToken() {
@@ -435,8 +499,8 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
     /**
      * POSTs to /orchestration/direct-charges with the given body. Country
-     * controllers build the payment_method-specific payload and pass it in
-     * here so the auth/retry/timeout plumbing lives in one place.
+     * controllers build the payment_method-specific payload and pass it in so
+     * the auth/retry/timeout plumbing lives in one place.
      */
     @SuppressWarnings("unchecked")
     protected Map<String, Object> orchestratorCharge(Map<String, Object> body) {
@@ -490,13 +554,12 @@ public abstract class AbstractFlutterwaveV4DepositController {
     /**
      * GET /charges/{chargeId} — the only way to re-check a v4 charge later.
      *
-     * NOTE: Flutterwave has been observed returning 10500 INTERNAL_SERVER_ERROR
-     * from this endpoint for certain charges. In production logs those were
-     * consistently very small amounts (GHS 1) while larger charges on the same
-     * account resolved fine, which points at a server-side floor rather than
-     * anything wrong with the request. Callers must treat a throw from here as
-     * "unknown", never as "failed" — a lookup error says nothing about whether
-     * the customer actually paid.
+     * KNOWN UNRELIABLE. Flutterwave has returned 10500 INTERNAL_SERVER_ERROR
+     * from this endpoint persistently — for minutes, across every retry — for
+     * charges their own dashboard showed as SUCCESSFUL. Callers must treat a
+     * throw from here as "unknown", never as "failed": a lookup error says
+     * nothing about whether the customer paid. See FIX 2 for how the webhook
+     * degrades when this is down.
      */
     @SuppressWarnings("unchecked")
     protected Map<String, Object> getCharge(String chargeId) {
@@ -549,11 +612,14 @@ public abstract class AbstractFlutterwaveV4DepositController {
     /**
      * Shared body for every v4 controller's /verify endpoint.
      *
-     * Unlike v3's statusResponse() (deliberately read-only, because v3's
-     * redirect flows can be replayed by the client), this DOES credit on
-     * success. Safe for the same reason the Moolre USSD controller's is: the
-     * only client input is our own opaque reference, and every status acted
-     * on comes from Flutterwave's live API, never from the client.
+     * Unlike v3's statusResponse() (read-only, because v3's redirect flows can
+     * be replayed by the client), this DOES credit on success. Safe because the
+     * only client input is our own opaque reference, and every status acted on
+     * comes from Flutterwave's live API.
+     *
+     * NOTE: unlike the webhook, this does NOT fall back to any client-supplied
+     * data when lookup fails — there's nothing to fall back TO. A polling
+     * client has no signed assertion from Flutterwave, only a reference string.
      */
     protected Map<String, Object> verifyAndCredit(
             UUID requestingUserId, String reference, String expectedCurrency, String providerTag) {
@@ -566,8 +632,6 @@ public abstract class AbstractFlutterwaveV4DepositController {
             throw ApiException.forbidden("This payment reference does not belong to your account.");
         }
 
-        // Already settled by the webhook or reconciler — don't re-hit
-        // Flutterwave, just report the outcome.
         if (pending.isCredited()) {
             return Map.of("credited", false, "status", "succeeded",
                     "message", "Payment was already processed.");
@@ -577,10 +641,9 @@ public abstract class AbstractFlutterwaveV4DepositController {
                     "message", "Payment failed or was cancelled.");
         }
 
-        // FIX: a Flutterwave-side error here used to propagate out to the
-        // client as a 500 with a stack trace, on every poll. A failed lookup
-        // is not a failed payment — report "still confirming" and leave the
-        // row PENDING for the reconciler.
+        // A Flutterwave-side error here used to propagate to the client as a
+        // 500 with a stack trace, on every poll. A failed lookup is not a
+        // failed payment — report "still confirming" and leave the row PENDING.
         Map<String, Object> result;
         try {
             result = getCharge(pending.chargeId());
@@ -600,8 +663,6 @@ public abstract class AbstractFlutterwaveV4DepositController {
                 return Map.of("credited", false, "status", status,
                         "message", "Payment failed or was cancelled.");
             }
-            // Still in flight. Leave PENDING so the reconciler keeps watching
-            // even if the customer closes the app right now.
             return Map.of("credited", false, "status", status,
                     "message", "Payment is still pending. Please approve the prompt on your phone.");
         }
@@ -627,20 +688,10 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
     /**
      * Polls every PENDING charge for this provider whose backoff window has
-     * elapsed, and settles the ones Flutterwave now reports as terminal.
-     * Invoked by {@link FlutterwaveV4DepositReconciler} on a fixed delay.
-     *
-     * This is what guarantees the customer gets credited when the webhook
-     * never shows up — which, per the signature-header FIX note above, was
-     * 100% of deliveries at one point. Deliberately conservative:
-     *   - only Flutterwave's own live GET /charges/{id} is trusted;
-     *   - an unrecognised status is treated as still-pending, never credited;
-     *   - a transport error just reschedules — the row stays PENDING;
-     *   - crediting reuses the idempotent handleVerifiedDeposit path, so a
-     *     race with an in-flight webhook cannot double-credit.
-     *
-     * Each row is handled in isolation: one poisoned charge can't stall the
-     * queue behind it.
+     * elapsed. Deliberately conservative: only Flutterwave's live API is
+     * trusted, an unrecognised status is treated as still-pending, a transport
+     * error just reschedules, and crediting reuses the idempotent
+     * handleVerifiedDeposit path so a race with a webhook can't double-credit.
      *
      * @return number of charges that reached a terminal state this pass
      */
@@ -674,12 +725,15 @@ public abstract class AbstractFlutterwaveV4DepositController {
             return false; // settled by webhook/verify in the meantime
         }
 
-        // Give up eventually rather than polling a dead charge forever.
         if (pendingChargeStore().isOlderThan(reference, expiryCutoff)) {
-            log.warn("reconcileOne[{}]: ref='{}' still pending after {}min — marking EXPIRED. " +
-                            "If the customer reports being debited, check chargeId='{}' in the " +
-                            "Flutterwave dashboard manually.",
-                    providerTag(), reference, pendingTtlMinutes, pending.chargeId());
+            // ALERT-WORTHY: this may be a customer who paid and will now never
+            // be credited automatically. See the OPERATIONAL note in the class
+            // javadoc — EXPIRED rows must be reconciled against the dashboard.
+            log.error("reconcileOne[{}]: ref='{}' still PENDING after {}min — marking EXPIRED. " +
+                            "chargeId='{}' userId='{}' amount={}. CHECK THE FLUTTERWAVE DASHBOARD: " +
+                            "if this charge succeeded, the customer paid and was NOT credited.",
+                    providerTag(), reference, pendingTtlMinutes, pending.chargeId(),
+                    pending.userId(), pending.amount());
             pendingChargeStore().markExpired(reference);
             return true;
         }
@@ -689,7 +743,6 @@ public abstract class AbstractFlutterwaveV4DepositController {
             result = getCharge(pending.chargeId());
         } catch (RuntimeException ex) {
             // Transport/auth/500 failure — says nothing about the charge.
-            // Keep it PENDING and try again after the backoff.
             log.warn("reconcileOne[{}]: lookup failed for ref='{}' — will retry. {}",
                     providerTag(), reference, ex.getMessage());
             pendingChargeStore().reschedule(reference, "lookup_failed", safeMessage(ex));
@@ -707,8 +760,6 @@ public abstract class AbstractFlutterwaveV4DepositController {
         }
 
         if (!isSuccess(status)) {
-            // Still in flight, or a status we don't recognise — same treatment,
-            // because guessing here would mean crediting on an unknown state.
             pendingChargeStore().reschedule(reference, status, null);
             return false;
         }
@@ -731,8 +782,6 @@ public abstract class AbstractFlutterwaveV4DepositController {
             return false;
         }
 
-        // Credit what Flutterwave says was collected, not what we asked for —
-        // but shout if they differ, because that's a partial payment or a bug.
         if (pending.amount() != null && pending.amount().compareTo(amount) != 0) {
             log.warn("reconcileOne[{}]: amount differs for ref='{}' requested={} settled={} — " +
                             "crediting the settled amount",
@@ -742,8 +791,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
         handleVerifiedDeposit(pending.userId(), reference, amount, expectedCurrency(), providerTag());
         pendingChargeStore().markCredited(reference, "reconciler");
 
-        log.info("reconcileOne[{}]: RECOVERED deposit via polling — ref='{}' userId='{}' amount={} {} " +
-                        "(webhook never credited this one)",
+        log.info("reconcileOne[{}]: RECOVERED deposit via polling — ref='{}' userId='{}' amount={} {}",
                 providerTag(), reference, pending.userId(), amount, expectedCurrency());
         return true;
     }
@@ -767,14 +815,22 @@ public abstract class AbstractFlutterwaveV4DepositController {
     /**
      * Shared body for every v4 controller's webhook endpoint.
      *
-     * Takes the full header map (not a single named header) — see the class
-     * javadoc FIX note on the signature header.
+     * Takes the full header map (not a single named header) — see FIX 1.
      *
-     * @param userIdFromReference resolves the owning userId for a reference.
-     *                             v4 doesn't reliably echo back custom meta
-     *                             the way v3 does, so controllers look this
-     *                             up from their persisted pending-charge row
-     *                             rather than trusting the payload.
+     * Credit decision, in order:
+     *   1. Signature must verify (or webhook-allow-unsigned is on).
+     *   2. Re-verify via GET /charges/{id}. If it answers, its verdict is
+     *      final — success credits, failure doesn't.
+     *   3. If it is UNREACHABLE and payload-trust is enabled AND the delivery
+     *      was genuinely signed, credit from the signed payload with the
+     *      amount cross-checked against what we requested. See FIX 2.
+     *   4. Otherwise 500, so Flutterwave retries and the reconciler keeps the
+     *      row PENDING.
+     *
+     * @param userIdFromReference resolves the owning userId for a reference,
+     *                             from the persisted pending-charge row rather
+     *                             than the payload (v4 doesn't reliably echo
+     *                             custom meta the way v3 does)
      */
     @SuppressWarnings("unchecked")
     protected org.springframework.http.ResponseEntity<String> processV4Webhook(
@@ -787,6 +843,12 @@ public abstract class AbstractFlutterwaveV4DepositController {
             return org.springframework.http.ResponseEntity.status(401).body("Invalid signature");
         }
 
+        // Distinct from verifyWebhookHash(): true only if a signature actually
+        // MATCHED, not if it was waved through by webhook-allow-unsigned.
+        // Payload-trust crediting requires this, so an unsigned delivery can
+        // never mint balance even with both flags on.
+        var genuinelySigned = isGenuinelySigned(headers);
+
         Map<String, Object> event;
         try {
             event = (Map<String, Object>) objectMapper()
@@ -798,9 +860,9 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
         var data = (Map<String, Object>) event.get("data");
         if (data == null) {
-            // Now that deliveries get past auth, this is the next place a
-            // wrong payload-shape assumption will surface. Log the top-level
-            // keys so the real shape is one delivery away from being known.
+            // Once deliveries get past auth, this is where a wrong payload-shape
+            // assumption surfaces. Log top-level keys so the real shape is one
+            // delivery away from being known.
             log.warn("Flutterwave v4 webhook [{}]: missing 'data' field — top-level keys were {}",
                     providerTag, event.keySet());
             return org.springframework.http.ResponseEntity.status(400).body("Missing data");
@@ -825,54 +887,83 @@ public abstract class AbstractFlutterwaveV4DepositController {
         var ref = reference.toString();
         UUID userId = userIdFromReference.apply(ref);
         if (userId == null) {
-            // The pending-charge row is durable, so this means the reference
-            // was never ours (or was pruned long ago). 400 rather than 500 so
-            // Flutterwave stops retrying something we can never satisfy.
+            // The pending-charge row is durable, so this means the reference was
+            // never ours (or was pruned). 400 rather than 500 so Flutterwave
+            // stops retrying something we can never satisfy.
             log.error("Flutterwave v4 webhook [{}]: no pending charge for reference='{}'", providerTag, ref);
             return org.springframework.http.ResponseEntity.status(400).body("Unknown reference");
         }
 
-        // Never trust the payload's status/amount — re-verify server-side.
-        Map<String, Object> verified;
+        // Never trust the payload's status/amount when we CAN check. But
+        // distinguish "Flutterwave says it failed" from "Flutterwave can't
+        // answer": the first is information, the second is an outage, and
+        // treating an outage as a failure is what left paid customers
+        // uncredited. See FIX 2.
+        Map<String, Object> verifiedData;
+        boolean reVerified;
         try {
-            verified = getCharge(chargeId.toString());
+            verifiedData = dataOf(getCharge(chargeId.toString()));
+            reVerified = true;
         } catch (RuntimeException ex) {
-            // 500 asks Flutterwave to retry, and the reconciler will pick this
-            // up regardless — the row is still PENDING.
-            log.error("Flutterwave v4 webhook [{}]: re-verification failed for chargeId='{}' — will retry",
-                    providerTag, chargeId, ex);
-            return org.springframework.http.ResponseEntity.status(500).body("Verification failed, will retry");
+            if (!trustPayloadWhenLookupUnavailable || !genuinelySigned) {
+                log.error("Flutterwave v4 webhook [{}]: re-verification unavailable for chargeId='{}' " +
+                                "(payloadTrust={}, genuinelySigned={}) — will retry",
+                        providerTag, chargeId, trustPayloadWhenLookupUnavailable, genuinelySigned, ex);
+                return org.springframework.http.ResponseEntity.status(500).body("Verification failed, will retry");
+            }
+            log.warn("Flutterwave v4 webhook [{}]: re-verification unavailable for chargeId='{}' — " +
+                            "falling back to the SIGNED PAYLOAD. {}",
+                    providerTag, chargeId, ex.getMessage());
+            verifiedData = data;
+            reVerified = false;
         }
 
-        var verifiedData   = dataOf(verified);
         var verifiedStatus = String.valueOf(verifiedData.getOrDefault("status", "unknown"));
 
         if (!isSuccess(verifiedStatus)) {
             if (isTerminalFailure(verifiedStatus)) {
                 pendingChargeStore().markFailed(ref, verifiedStatus);
             }
-            log.info("Flutterwave v4 webhook [{}]: verified status='{}' for ref='{}' — not crediting yet",
+            log.info("Flutterwave v4 webhook [{}]: status='{}' for ref='{}' — not crediting",
                     providerTag, verifiedStatus, ref);
             return org.springframework.http.ResponseEntity.ok("Ignored — not yet successful");
         }
 
         var verifiedCurrency = String.valueOf(verifiedData.get("currency"));
         if (!expectedCurrency.equalsIgnoreCase(verifiedCurrency)) {
-            log.error("Flutterwave v4 webhook [{}]: verified currency mismatch='{}' for ref='{}'",
+            log.error("Flutterwave v4 webhook [{}]: currency mismatch='{}' for ref='{}'",
                     providerTag, verifiedCurrency, ref);
             return org.springframework.http.ResponseEntity.status(400).body("Currency mismatch on verification");
         }
 
         try {
             var amount = new BigDecimal(String.valueOf(verifiedData.get("amount")));
+
+            // When we couldn't re-verify, the payload is our only source for the
+            // amount — so cross-check it against what we asked Flutterwave to
+            // charge. A payload claiming MORE than we requested is the one thing
+            // an attacker with a leaked webhook secret could exploit here.
+            if (!reVerified) {
+                var pending = getPendingCharge(ref);
+                if (pending != null && pending.amount() != null
+                        && amount.compareTo(pending.amount()) > 0) {
+                    log.error("Flutterwave v4 webhook [{}]: UNVERIFIED payload claims amount={} but we " +
+                                    "requested {} for ref='{}' — refusing to credit, INVESTIGATE",
+                            providerTag, amount, pending.amount(), ref);
+                    return org.springframework.http.ResponseEntity.status(400).body("Amount exceeds requested");
+                }
+                log.warn("Flutterwave v4 webhook [{}]: crediting ref='{}' userId='{}' amount={} on an " +
+                                "UNVERIFIED signed payload — audit against the Flutterwave dashboard",
+                        providerTag, ref, userId, amount);
+            }
+
             handleVerifiedDeposit(userId, ref, amount, expectedCurrency, providerTag);
-            pendingChargeStore().markCredited(ref, "webhook");
+            pendingChargeStore().markCredited(ref, reVerified ? "webhook" : "webhook_unverified");
         } catch (ApiException e) {
             log.error("Flutterwave v4 webhook [{}]: bad request — {}", providerTag, e.getMessage(), e);
             return org.springframework.http.ResponseEntity.status(400).body("Bad request: " + e.getMessage());
         } catch (Exception e) {
-            // Row stays PENDING — Flutterwave retries AND the reconciler will
-            // catch it. Two independent recovery paths.
+            // Row stays PENDING — Flutterwave retries AND the reconciler catches it.
             log.error("Flutterwave v4 webhook [{}]: unexpected error — will retry", providerTag, e);
             return org.springframework.http.ResponseEntity.status(500).body("Processing error");
         }
@@ -883,17 +974,17 @@ public abstract class AbstractFlutterwaveV4DepositController {
     // ─── Shared deposit crediting (identical contract to v3's) ─────────────────
 
     /**
-     * Idempotent on {@code ref}. This is the single choke point every credit
-     * path (webhook, /verify, reconciler) goes through, which is precisely
-     * what makes it safe to have three of them racing.
+     * Idempotent on {@code ref}. The single choke point every credit path
+     * (webhook, /verify, reconciler) goes through, which is what makes it safe
+     * to have three of them racing.
      *
      * REQUIRES_NEW so a rollback here can't take out the caller's transaction
-     * (and vice versa) — the pending-charge bookkeeping and the wallet credit
-     * are deliberately independent.
+     * (and vice versa) — pending-charge bookkeeping and the wallet credit are
+     * deliberately independent.
      *
-     * NOTE: public, not protected, so Spring's proxy-based AOP can actually
-     * apply @Transactional. As a protected method it was being self-called
-     * within the class and the annotation was silently doing nothing.
+     * public, not protected, so Spring's proxy-based AOP can actually apply
+     * @Transactional — as a protected self-called method the annotation was
+     * silently doing nothing.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean handleVerifiedDeposit(UUID userId, String ref, BigDecimal amount,
