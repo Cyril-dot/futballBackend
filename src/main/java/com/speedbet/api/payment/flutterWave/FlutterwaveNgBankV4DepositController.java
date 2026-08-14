@@ -34,121 +34,76 @@ import java.util.UUID;
  * "Pay with Bank" equivalent (redirect/auth_url-based, mirroring the v3
  * "mono" charge but through /orchestration/direct-charges).
  *
- * Sibling to {@link FlutterwaveNgBankDepositController} (the v3 version)
- * and {@link FlutterwaveGhV4DepositController} (the v4 Ghana MoMo
- * controller, whose reference-length and userId-resolution fixes are
- * applied here too — see the FIX notes below).
+ * Sibling to {@link FlutterwaveNgBankDepositController} (v3) and
+ * {@link FlutterwaveGhV4DepositController} (v4 Ghana MoMo, whose fixes are
+ * applied here too).
  *
  * ══════════════════════════════════════════════════════════════════════════
  *  IMPORTANT — read {@link AbstractFlutterwaveV4DepositController}'s class
- *  javadoc before deploying this. v4 is public beta, the production base
- *  URL needs confirming with Flutterwave, and this controller specifically
- *  still has TWO unconfirmed points (flagged inline below):
+ *  javadoc before deploying. Beyond the shared v4 caveats, this controller
+ *  has TWO of its own unconfirmed points (flagged inline):
  *    - the payment_method.type discriminator/shape for a bank-redirect
- *      charge (no equivalent to Ghana's confirmed GET /mobile-networks
- *      check exists for this yet)
- *    - which field in the charge response carries the customer-facing
- *      redirect/auth URL
- *  Everything else (reference format, userId resolution, customer object
- *  shape) now follows the pattern confirmed working in
- *  {@link FlutterwaveGhV4DepositController}.
+ *      charge (no equivalent to Ghana's confirmed /mobile-networks check)
+ *    - which response field carries the customer-facing redirect/auth URL
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX (this revision) — deposits no longer depend on the webhook arriving,
- *  and pending charges survive restarts.
+ *  FIX (this revision) — webhook signature header.
  *
- *  The base class's abstract contract grew three members, which this
- *  controller now implements:
+ *  v4 does not send v3's `verif-hash` header. Binding to that one name meant
+ *  every delivery failed authentication and the webhook credited nothing —
+ *  confirmed in production logs on the GH v4 endpoint, and this controller
+ *  had the identical bug. The webhook below now forwards the whole header
+ *  map to the shared handler. See the abstract class's FIX note for the two
+ *  temporary config flags used to identify the real header name.
  *
- *    - pendingChargeStore() — the durable {@link FlutterwaveV4PendingChargeStore}
- *      that replaced the in-memory `pendingCharges` ConcurrentHashMap. That
- *      map was the ONLY place the reference -> (chargeId, userId) mapping
- *      lived, so a restart or deploy between charge init and webhook
- *      delivery destroyed the only handle we had on the charge: the webhook
- *      then 400'd and the customer, already debited by their bank, was never
- *      credited. /verify was equally dead — it needs the Flutterwave
- *      chargeId, which existed nowhere else.
+ *  This matters more here than for MoMo: the bank-redirect flow is the most
+ *  webhook-dependent of the lot, because the customer authorizes on their
+ *  bank's site and may close the tab rather than return through /redirect.
+ * ══════════════════════════════════════════════════════════════════════════
  *
- *    - expectedCurrency() / providerTag() — exposed to the base class
- *      because {@link FlutterwaveV4DepositReconciler} runs on a schedule
- *      with no request context: no principal, no ref, nothing but this bean.
- *      providerTag() routes PENDING rows in the pending-charge table back to
- *      the controller that created them; expectedCurrency() is re-checked
- *      against Flutterwave's live response before any credit, so a charge in
- *      the wrong currency is never paid out.
+ * ══════════════════════════════════════════════════════════════════════════
+ *  FIX (earlier revision) — durable pending charges + background reconciler.
  *
- *  The practical effect for this endpoint: the bank-redirect flow is the
- *  most webhook-dependent of the lot, because the customer authorizes on
- *  their bank's site and may well close the tab instead of coming back
- *  through /redirect. Previously, if the webhook was also dropped, that
- *  deposit was silently lost. Now the reconciler polls GET /charges/{id}
- *  until the charge settles and credits it regardless.
- *
- *  The webhook and /verify paths below are UNCHANGED in behaviour — they're
- *  still the fast paths. All three routes funnel through the idempotent
- *  handleVerifiedDeposit(), so whichever gets there first wins and the
- *  others no-op.
+ *  Pending charges are now {@link FlutterwaveV4PendingCharge} rows rather
+ *  than an in-memory map (a restart between init and webhook used to destroy
+ *  the only handle we had on the charge), and
+ *  {@link FlutterwaveV4DepositReconciler} polls every still-PENDING charge
+ *  until it settles. That polling is what guarantees an abandoned-tab
+ *  deposit still lands.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
  *  FIX (earlier revision) — reference length.
  *
- *  The revision before last used:
- *    "SPB-NGB4" + ":" + <36-char userId UUID> + ":" + <36-char random UUID>
- *  — about 85 characters. Flutterwave's v4 orchestrator API rejects any
- *  `reference` outside 6–42 characters (see FlutterwaveGhV4DepositController's
- *  class javadoc for the exact validation error this produces). Every
- *  charge on this endpoint would have failed at orchestratorCharge() with
- *  a 400 before that fix, identically to the GH v4 bug.
- *
- *  Reference is now "NGBV4-" (6 chars) + 32 hex chars = 38 chars total,
- *  safely inside the 6–42 window.
- * ══════════════════════════════════════════════════════════════════════════
- *
- * ══════════════════════════════════════════════════════════════════════════
- *  FIX (earlier revision) — userId resolution.
- *
- *  Embedding userId in the reference string is no longer necessary (and no
- *  longer fits, per the fix above). The base class records userId against
- *  the reference at charge-initiation time via cachePendingCharge(), and
- *  the webhook resolves it back via getPendingCharge(ref) — see
- *  resolveUserIdFromStore() below — instead of parsing it out of the
- *  reference string. userIdFromReference() and the REF_DELIM constant from
- *  that revision are removed.
- *
- *  That lookup was originally backed by the in-memory map and so was
- *  restart-fragile; as of the fix above it's a database row, so it's now
- *  durable across restarts and safe across instances.
+ *  The old format ("SPB-NGB4" + ":" + userId UUID + ":" + random UUID, ~85
+ *  chars) exceeded Flutterwave v4's 6–42 character limit on `reference`, so
+ *  every charge on this endpoint failed at orchestratorCharge() with a 400 —
+ *  identically to the GH v4 bug. Now "NGBV4-" + 32 hex = 38 chars, and the
+ *  userId is resolved from the persisted pending-charge row instead of being
+ *  parsed out of the reference string.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * Flow:
  *   1. POST .../init
- *        -> calls POST /orchestration/direct-charges with a bank-redirect
- *           payment_method, passing redirect_url pointing back at THIS
+ *        -> POST /orchestration/direct-charges with a bank-redirect
+ *           payment_method, passing redirect_url pointing at this
  *           controller's /redirect endpoint
- *        -> PERSISTS reference -> Flutterwave charge id + userId via
- *           cachePendingCharge(). This row is what the webhook, /verify AND
- *           the background reconciler all key off — without it the charge is
- *           unrecoverable, since v4 offers no lookup-by-our-reference.
+ *        -> PERSISTS reference -> charge id + userId via cachePendingCharge().
+ *           Without this row the charge is unrecoverable.
  *        -> returns the reference + redirect/auth URL to the frontend
- *   2. Customer completes authorization at that URL. Flutterwave redirects
- *      the browser back to our /redirect endpoint — UX hop only, does NOT
- *      credit the wallet.
- *   3. Frontend polls GET .../verify?ref=... until credited=true, OR
- *   4. Flutterwave sends a webhook -> processV4Webhook() re-verifies via
- *      GET /charges/{id} and credits, OR
- *   5. {@link FlutterwaveV4DepositReconciler} polls this controller's
- *      still-PENDING rows in the background and credits — the safety net
- *      for when the customer abandons the tab AND the webhook goes missing.
- *   Whichever of (3)/(4)/(5) lands first wins; handleVerifiedDeposit() is
- *   idempotent on ref.
+ *   2. Customer authorizes at that URL. Flutterwave redirects the browser to
+ *      our /redirect endpoint — UX hop only, does NOT credit.
+ *   3. Frontend polls GET .../verify?ref=... , OR
+ *   4. Flutterwave sends a webhook -> processV4Webhook() re-verifies and
+ *      credits, OR
+ *   5. The reconciler polls this controller's PENDING rows in the background.
+ *   Whichever lands first wins; handleVerifiedDeposit() is idempotent on ref.
  *
  * ─── application.properties keys needed ──────────────────────────────────
- *   See AbstractFlutterwaveV4DepositController for the shared v4 keys
- *   (client-id, client-secret, base-url, token-url, webhook-hash) and the
- *   app.flutterwave.v4.reconcile.* tuning keys.
- *   This controller additionally needs:
+ *   See AbstractFlutterwaveV4DepositController for the shared v4 keys and
+ *   the reconcile/webhook-diagnostic keys. This controller additionally
+ *   needs:
  *     app.platform.min-deposit-amount-ngn (default: 20000)
  *     app.platform.backend-public-url
  *     app.platform.frontend-url
@@ -162,11 +117,10 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     static final String PROVIDER_TAG      = "flutterwave_ng_bank_v4";
     static final String TXREF_PREFIX      = "NGBV4-";
 
-    private final WalletService     walletService;
-    private final ReferralService   referralService;
-    private final WebClient.Builder webClientBuilder;
-    private final ObjectMapper      objectMapper;
-
+    private final WalletService                   walletService;
+    private final ReferralService                 referralService;
+    private final WebClient.Builder               webClientBuilder;
+    private final ObjectMapper                    objectMapper;
     private final FlutterwaveV4PendingChargeStore pendingChargeStore;
 
     @Value("${app.platform.min-deposit-amount-ngn:20000}")
@@ -175,8 +129,8 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     /**
      * Publicly reachable base URL of THIS backend, used to build the
      * redirect_url Flutterwave calls back after bank authorization.
-     * Distinct from frontendUrl, which is where we forward the browser to
-     * *after* the customer lands back on our /redirect endpoint.
+     * Distinct from frontendUrl, which is where we forward the browser
+     * *after* it lands back on our /redirect endpoint.
      */
     @Value("${app.platform.backend-public-url}")
     private String backendPublicUrl;
@@ -189,15 +143,13 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     @Override protected WebClient.Builder webClientBuilder()  { return webClientBuilder; }
     @Override protected ObjectMapper      objectMapper()      { return objectMapper; }
 
-    /** Durable pending-charge store — replaced the in-memory map (see class javadoc FIX note). */
+    /** Durable pending-charge store — replaced the in-memory map. */
     @Override protected FlutterwaveV4PendingChargeStore pendingChargeStore() { return pendingChargeStore; }
 
     /**
-     * Currency and provider tag are exposed to the base class because the
-     * background reconciler runs outside any request context. providerTag()
-     * MUST match the value passed to verifyAndCredit()/processV4Webhook()
-     * below — if they diverge, the reconciler looks for rows under a tag
-     * nothing writes and silently polls nothing.
+     * Exposed to the base class because the reconciler runs without a request
+     * context. providerTag() MUST match what's passed to verifyAndCredit()
+     * and processV4Webhook() below.
      */
     @Override public String expectedCurrency() { return EXPECTED_CURRENCY; }
     @Override public String providerTag()      { return PROVIDER_TAG; }
@@ -223,8 +175,7 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         }
 
         // Flutterwave v4 requires `reference` to be 6–42 characters. Short,
-        // opaque, random token — userId is NOT embedded here, it's persisted
-        // against this reference below (see class javadoc FIX notes).
+        // opaque, random — userId is persisted against it below, not embedded.
         var reference = TXREF_PREFIX + UUID.randomUUID().toString().replace("-", "");
 
         log.info("initDeposit(NG-Bank v4): userId='{}' amount={} reference='{}'",
@@ -255,18 +206,16 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
                     : "Payment initiation failed. Please try again.");
         }
 
-        // CRITICAL: this row is the only handle we'll ever have on this charge
-        // — v4 has no lookup-by-our-reference. It carries the userId for the
-        // webhook, the chargeId for /verify, and puts the charge on the
-        // reconciler's queue so it gets credited even if the customer never
-        // returns through /redirect and the webhook never arrives. Written
-        // before the client responds.
+        // CRITICAL: the only handle we'll ever have on this charge. Carries the
+        // userId for the webhook, the chargeId for /verify, and queues it for
+        // the reconciler so it credits even if the customer never returns
+        // through /redirect and the webhook never arrives.
         cachePendingCharge(reference, chargeId, user.getId(), amount);
 
         var redirectAuthUrl = extractRedirectUrl(data);
         if (redirectAuthUrl == null) {
             log.warn("initDeposit(NG-Bank v4): could not find a redirect/auth URL in charge response, " +
-                            "reference='{}', chargeId='{}' — inspect the raw response and fix extractRedirectUrl()",
+                    "reference='{}', chargeId='{}' — inspect the raw response and fix extractRedirectUrl()",
                     reference, chargeId);
         }
 
@@ -285,20 +234,19 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     // ─── Webhook ──────────────────────────────────────────────────────────────
 
     /**
-     * Standalone NG-Bank v4 webhook endpoint. Kept for direct testing
-     * (e.g. curl), but Flutterwave itself should be pointed at a router
-     * URL instead if you're running this alongside other v4/v3
-     * controllers — only one webhook URL can be registered per account.
+     * Standalone NG-Bank v4 webhook endpoint. Kept for direct testing (curl),
+     * but Flutterwave should be pointed at a router URL if you're running
+     * this alongside other v4/v3 controllers — one webhook URL per account.
      *
-     * userId is resolved from the persisted pending-charge row written in
-     * initDeposit() — durable across restarts and instances, unlike the
-     * in-memory map this replaced.
+     * Takes the FULL header map rather than a named @RequestHeader: v4 does
+     * not send v3's "verif-hash", and binding to that name is what made every
+     * delivery fail authentication.
      */
     @PostMapping("/api/webhooks/flutterwave/v4/ng-bank")
     public ResponseEntity<String> webhook(
-            @RequestHeader(value = "verif-hash", required = false) String verifHash,
+            @RequestHeader Map<String, String> headers,
             @RequestBody byte[] rawBody) {
-        return processV4Webhook(verifHash, rawBody, EXPECTED_CURRENCY, PROVIDER_TAG,
+        return processV4Webhook(headers, rawBody, EXPECTED_CURRENCY, PROVIDER_TAG,
                 this::resolveUserIdFromStore);
     }
 
@@ -316,17 +264,15 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     // ─── Redirect callback (browser hop, UX only) ──────────────────────────────
 
     /**
-     * Same cosmetic role as the v3 controller's /redirect endpoint: just
-     * decides which waiting/result screen to show while the frontend polls
-     * /verify (or waits on the webhook, or the reconciler picks it up).
-     * Query params here are whatever Flutterwave's v4 bank-redirect flow
-     * appends — unconfirmed against a real sandbox redirect yet, so we
-     * tolerate a missing "reference" param and just send the customer to a
-     * generic "confirming" state.
+     * Same cosmetic role as the v3 controller's /redirect: decides which
+     * waiting/result screen to show while the frontend polls /verify. Query
+     * params are whatever Flutterwave's v4 bank-redirect flow appends —
+     * unconfirmed against a real sandbox redirect, so a missing "reference"
+     * param is tolerated and the customer goes to a generic "confirming" state.
      *
      * Nothing about crediting depends on the customer arriving here: if they
-     * close the tab at their bank instead, the charge is still PENDING in the
-     * store and the reconciler will settle it.
+     * close the tab at their bank, the charge is still PENDING in the store
+     * and the reconciler settles it.
      */
     @GetMapping("/api/wallet/deposit/flutterwave/v4/ng-bank/redirect")
     public ResponseEntity<Void> redirect(
@@ -351,9 +297,9 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
     /**
      * Resolves the owning userId for a reference from the persisted
-     * pending-charge row. Returns null (causing the webhook to reject with
-     * 400) only if no such row exists — which now means the reference was
-     * never ours or was pruned after settling, not merely that we restarted.
+     * pending-charge row. Returns null (webhook rejects with 400) only if no
+     * such row exists — the reference was never ours or was pruned after
+     * settling, not merely that we restarted.
      */
     private UUID resolveUserIdFromStore(String reference) {
         var pending = getPendingCharge(reference);
@@ -366,12 +312,11 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
     /**
      * UNCONFIRMED against real v4 docs/sandbox — best guess mirroring v3's
-     * "mono" charge body shape, adapted to the orchestrator's unified
-     * payment_method envelope. The customer object shape (name.first/last,
-     * phone.country_code/number) matches what's confirmed working in
-     * FlutterwaveGhV4DepositController; the payment_method.type discriminator
-     * and its nested bank/redirect fields are still unconfirmed — verify
-     * against sandbox and adjust before relying on this in production.
+     * "mono" charge body, adapted to the orchestrator's unified
+     * payment_method envelope. The customer object shape matches what's
+     * confirmed working in FlutterwaveGhV4DepositController; the
+     * payment_method.type discriminator and its nested fields are still
+     * guesses — verify against sandbox before relying on this.
      */
     private static Map<String, Object> chargeBody(
             BigDecimal amount, User user, String phoneNumber, String reference, String redirectUrl) {
@@ -390,10 +335,10 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         customer.put("phone", phone);
 
         var bank = new LinkedHashMap<String, Object>();
-        bank.put("redirect_url", redirectUrl); // TODO: confirm actual nested field name in v4 sandbox
+        bank.put("redirect_url", redirectUrl); // TODO: confirm nested field name in v4 sandbox
 
         var paymentMethod = new LinkedHashMap<String, Object>();
-        paymentMethod.put("type", "bank"); // TODO: confirm actual discriminator in v4 sandbox
+        paymentMethod.put("type", "bank"); // TODO: confirm discriminator in v4 sandbox
         paymentMethod.put("bank", bank);
 
         var body = new LinkedHashMap<String, Object>();
