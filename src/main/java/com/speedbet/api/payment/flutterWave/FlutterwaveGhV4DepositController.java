@@ -46,7 +46,33 @@ import java.util.UUID;
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX (this revision) — Flutterwave's v4 orchestrator API rejects any
+ *  FIX (this revision) — deposits no longer depend on the webhook arriving.
+ *
+ *  Symptom: a customer approves the MoMo prompt, is debited by their telco,
+ *  and nothing lands in their wallet. Cause: the webhook was the only
+ *  automatic credit path, and it can go missing (dropped retry, our endpoint
+ *  down mid-deploy, router misrouting, Flutterwave retry exhaustion). Worse,
+ *  the reference -> (chargeId, userId) mapping lived in an in-memory map, so
+ *  a restart between init and callback destroyed the ONLY handle we had on
+ *  the charge — after that neither the webhook nor /verify could recover it.
+ *
+ *  Fix, in the shared abstract class:
+ *    - pending charges are persisted as {@link FlutterwaveV4PendingCharge}
+ *      rows (durable across restarts, safe across instances);
+ *    - {@link FlutterwaveV4DepositReconciler} polls every still-PENDING
+ *      charge against Flutterwave's live GET /charges/{id} on a fixed delay
+ *      (~8s initially, backing off to 2min, giving up after 45min) and
+ *      credits on confirmed success.
+ *
+ *  The webhook and /verify flows below are UNCHANGED in behaviour — they're
+ *  still the fast paths. All three routes funnel through the idempotent
+ *  handleVerifiedDeposit(), so whichever gets there first wins and the
+ *  others no-op. Worst case now is a deposit landing seconds-to-minutes
+ *  late instead of never.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  FIX (earlier revision) — Flutterwave's v4 orchestrator API rejects any
  *  `reference` outside 6–42 characters:
  *
  *    {"status":"failed","error":{"type":"REQUEST_NOT_VALID","code":"10400",
@@ -56,33 +82,19 @@ import java.util.UUID;
  *  The previous reference format —
  *    "SPB-GH-V4-" + <36-char user UUID> + "-" + <36-char random UUID>
  *  — is ~85 characters, so EVERY v4 Ghana charge was failing at
- *  orchestratorCharge() with a 400 before this fix.
+ *  orchestratorCharge() with a 400 before that fix.
  *
- *  The user UUID was embedded in the reference so the webhook could
- *  recover the userId from the reference string alone (v4 doesn't
- *  reliably echo custom `meta` back the way v3 does). That's no longer
- *  necessary: {@link AbstractFlutterwaveV4DepositController} already
- *  caches userId against this exact reference in `pendingCharges` at
- *  charge-initiation time (see {@code cachePendingCharge}), and the
- *  webhook can just look it up from there instead of parsing it out of
- *  the string. So the reference is now a short, opaque, random token
- *  ("GHV4-" + 32 hex chars = 37 chars, safely inside the 6–42 window),
- *  and {@code webhook()} below resolves userId via
- *  {@code getPendingCharge(ref)} rather than a string-parsing helper.
- *
- *  NOTE: this means the reference -> userId mapping now lives ONLY in the
- *  in-memory `pendingCharges` cache. If the app restarts between charge
- *  initiation and the webhook arriving, that mapping is lost and the
- *  webhook will 400 (see the "Invalid reference format" log line) — this
- *  was already a stated limitation of the in-memory cache (see that
- *  class's javadoc: "In a multi-instance deployment replace this with
- *  Redis or a DB table"), just newly reachable now that init() actually
- *  succeeds. Worth moving `pendingCharges` to Redis/a DB table before
- *  relying on this in production.
+ *  The user UUID had been embedded in the reference so the webhook could
+ *  recover the userId from the reference string alone (v4 doesn't reliably
+ *  echo custom `meta` back the way v3 does). It's no longer needed: the
+ *  reference is now a short opaque token ("GHV4-" + 32 hex = 37 chars) and
+ *  userId is looked up from the persisted pending-charge row instead. That
+ *  lookup used to be the in-memory map (and so was restart-fragile); as of
+ *  the fix above it's a DB row, so this is now durable.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX (this revision) — Ghana mobile money network values corrected
+ *  FIX (earlier revision) — Ghana mobile money network values corrected
  *  against Flutterwave's live GET /mobile-networks?country=GH response:
  *
  *    {"status":"success","data":[
@@ -91,23 +103,17 @@ import java.util.UUID;
  *      {"id":"80","network":"VODAFONE","name":"Vodafone"}
  *    ]}
  *
- *  This SUPERSEDES the previous revision's assumption. The prior fix
- *  guessed that Flutterwave had renamed Vodafone Ghana to "TELECEL" on
- *  the API side (following the real-world Telecel rebrand) and sent
- *  "TELECEL" on the wire, flagging that guess as unconfirmed. The live
- *  endpoint above confirms that guess was wrong: Flutterwave's API still
- *  expects the literal value "VODAFONE" for that network, and "TELECEL"
- *  is not a recognized network value at all. Sending "TELECEL" would
- *  have failed every Vodafone/Telecel deposit in production.
- *
- *  VALID_NETWORKS / NETWORK values are now taken directly from this
- *  confirmed API response: MTN, AIRTELTIGO, VODAFONE. No more guessing.
+ *  This SUPERSEDES an earlier assumption that Flutterwave had renamed
+ *  Vodafone Ghana to "TELECEL" on the API side (following the real-world
+ *  Telecel rebrand). The live endpoint confirms that guess was wrong:
+ *  Flutterwave still expects the literal value "VODAFONE", and "TELECEL"
+ *  is not a recognized network value at all. Sending "TELECEL" would have
+ *  failed every Vodafone/Telecel deposit in production.
  *
  *  Backward compatibility: resolveNetwork() below still accepts "TIGO"
  *  and "AIRTEL" (pre-merger legacy values) and "TELECEL" (in case any
- *  client already picked up the previous, incorrect revision) from any
- *  client that hasn't been updated yet, and maps them onto the correct
- *  current network names rather than rejecting them.
+ *  client already picked up the previous, incorrect revision) and maps
+ *  them onto the correct current network names rather than rejecting them.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ─── Flow ─────────────────────────────────────────────────────────────────
@@ -116,41 +122,48 @@ import java.util.UUID;
  *     POST /api/wallet/deposit/flutterwave/gh/v4/init
  *     • Accepts { amount, phoneNumber?, network }.
  *     • Calls orchestratorCharge() with payment_method.type = "mobile_money".
- *     • Caches reference -> Flutterwave charge id + userId via
- *       cachePendingCharge().
+ *     • PERSISTS reference -> Flutterwave charge id + userId via
+ *       cachePendingCharge(). This row is what the webhook, /verify AND the
+ *       background reconciler all key off — without it the charge is
+ *       unrecoverable, so it's written before the client gets a response.
  *     • Returns { txRef, message }. No OTP screen — frontend goes straight
  *       to "waiting for approval on your phone".
  *
- *  2. Payment Verification (manual fallback / polling)
+ *  2. Payment Verification (frontend polling)
  *     POST /api/wallet/deposit/flutterwave/gh/v4/verify
  *     • Delegates to the shared verifyAndCredit() — safe to poll, credits
  *       once Flutterwave's own API confirms success.
  *
- *  3. Webhook (primary / automatic credit path)
+ *  3. Webhook (primary automatic credit path)
  *     POST /api/webhooks/flutterwave/gh/v4
  *     • Delegates to the shared processV4Webhook(), which re-verifies via
  *       Flutterwave's API before crediting and never trusts the payload
- *       directly. Resolves userId via the pendingCharges cache (see FIX
- *       note above) rather than parsing the reference string.
+ *       directly. Resolves userId from the persisted pending-charge row.
  *     • Also reachable via {@link FlutterwaveWebhookRouterController}, which
  *       is the URL actually registered in the Flutterwave dashboard (only
  *       one webhook URL is allowed per account).
  *
+ *  4. Background reconciler (safety net — no endpoint)
+ *     • {@link FlutterwaveV4DepositReconciler} polls this controller's
+ *       PENDING rows via reconcilePendingCharges() until every charge
+ *       settles. This is what guarantees a customer who approved the prompt
+ *       gets credited even if 2 and 3 both fail and they close the app.
+ *
  * ─── txRef / reference convention ────────────────────────────────────────
  *   "GHV4-<32 hex chars>" (37 chars total) — an opaque random token; the
- *   owning userId is resolved via the pendingCharges cache, not parsed
- *   out of this string (see FIX note above).
+ *   owning userId is resolved from the persisted pending-charge row, not
+ *   parsed out of this string (see FIX notes above).
  *
  * ─── network values accepted from the frontend ───────────────────────────
  *   "MTN", "AIRTELTIGO", "VODAFONE" — confirmed against Flutterwave's live
- *   /mobile-networks endpoint (see FIX note above) — plus the legacy
- *   "TIGO"/"AIRTEL" and the now-known-incorrect "TELECEL" value, accepted
- *   for backward compatibility and mapped onto "AIRTELTIGO" / "VODAFONE"
- *   respectively (see resolveNetwork()).
+ *   /mobile-networks endpoint — plus the legacy "TIGO"/"AIRTEL" and the
+ *   now-known-incorrect "TELECEL" value, accepted for backward
+ *   compatibility and mapped onto "AIRTELTIGO" / "VODAFONE" respectively.
  *
  * ─── application.properties keys needed ──────────────────────────────────
  *   See AbstractFlutterwaveV4DepositController for the shared v4 keys
- *   (client-id, client-secret, base-url, token-url, webhook-hash).
+ *   (client-id, client-secret, base-url, token-url, webhook-hash) and the
+ *   app.flutterwave.v4.reconcile.* tuning keys.
  *   This controller additionally needs:
  *     app.platform.min-deposit-amount-ghs (default: 1)
  */
@@ -175,10 +188,11 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
     private static final String TXREF_PREFIX        = "GHV4-";
     private static final String PROVIDER_TAG        = "flutterwave_gh_v4";
 
-    private final WalletService     walletService;
-    private final ReferralService   referralService;
-    private final WebClient.Builder webClientBuilder;
-    private final ObjectMapper      objectMapper;
+    private final WalletService                   walletService;
+    private final ReferralService                 referralService;
+    private final WebClient.Builder               webClientBuilder;
+    private final ObjectMapper                    objectMapper;
+    private final FlutterwaveV4PendingChargeStore pendingChargeStore;
 
     @Value("${app.platform.min-deposit-amount-ghs:1}")
     private BigDecimal minDeposit;
@@ -187,6 +201,12 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
     @Override protected ReferralService   referralService()   { return referralService; }
     @Override protected WebClient.Builder webClientBuilder()  { return webClientBuilder; }
     @Override protected ObjectMapper      objectMapper()      { return objectMapper; }
+
+    @Override protected FlutterwaveV4PendingChargeStore pendingChargeStore() { return pendingChargeStore; }
+
+    /** Used by the reconciler, which runs without a request context. */
+    @Override public String expectedCurrency() { return EXPECTED_CURRENCY; }
+    @Override public String providerTag()      { return PROVIDER_TAG; }
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
@@ -216,13 +236,9 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
         // recognizes — see class javadoc FIX note.
         var network = resolveNetwork(rawNetwork.toString());
 
-        // FIX: Flutterwave v4 requires `reference` to be 6–42 characters.
-        // The old format ("SPB-GH-V4-" + userId UUID + "-" + random UUID,
-        // ~85 chars) always failed validation. userId no longer needs to be
-        // embedded here — it's resolved from the pendingCharges cache in
-        // the webhook instead (see class javadoc FIX note). This keeps the
-        // reference short, unique, and opaque:
-        //   "GHV4-" (5 chars) + 32 hex chars = 37 chars total.
+        // Flutterwave v4 requires `reference` to be 6–42 characters, so this
+        // stays short and opaque: "GHV4-" (5) + 32 hex = 37 chars. The userId
+        // is NOT encoded here — it's persisted against this reference below.
         var txRef = TXREF_PREFIX + UUID.randomUUID().toString().replace("-", "");
 
         log.info("initDeposit(GH v4): userId='{}' amount={} network='{}' txRef='{}'",
@@ -268,9 +284,11 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
                 throw new RuntimeException("Flutterwave did not return a charge id.");
             }
 
-            // userId is cached against txRef here — this is now the ONLY
-            // place the reference -> userId mapping lives, since the
-            // reference itself no longer encodes it (see FIX note above).
+            // CRITICAL: this row is the only handle we'll ever have on this
+            // charge — v4 has no lookup-by-our-reference. It carries the
+            // userId for the webhook, the chargeId for /verify, and puts the
+            // charge on the reconciler's queue so it gets credited even if
+            // every other path fails. Written before the client responds.
             cachePendingCharge(txRef, chargeId, user.getId(), amount);
 
             @SuppressWarnings("unchecked")
@@ -323,33 +341,30 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
      * FlutterwaveWebhookRouterController's /api/webhooks/flutterwave instead
      * — only one webhook URL can be registered per Flutterwave dashboard.
      *
-     * userId is resolved via the pendingCharges cache (populated in
-     * initDeposit() above) rather than parsed out of the reference string —
-     * see the class javadoc FIX note for why.
+     * userId is resolved from the persisted pending-charge row written in
+     * initDeposit() — durable across restarts and instances, unlike the
+     * in-memory map this replaced.
      */
     @PostMapping("/api/webhooks/flutterwave/gh/v4")
     public ResponseEntity<String> webhook(
             @RequestHeader(value = "verif-hash", required = false) String verifHash,
             @RequestBody byte[] rawBody) {
         return processV4Webhook(verifHash, rawBody, EXPECTED_CURRENCY, PROVIDER_TAG,
-                this::resolveUserIdFromCache);
+                this::resolveUserIdFromStore);
     }
 
     // ─── Helpers ────────────────────────────────────────────────────────────────
 
     /**
-     * Resolves the owning userId for a reference via the in-memory
-     * pendingCharges cache populated at charge-initiation time. Returns
-     * null (causing the webhook to reject with 400) if the mapping isn't
-     * found — e.g. a restart happened between init and webhook delivery.
-     * See class javadoc FIX note: move pendingCharges to Redis/a DB table
-     * to make this durable across restarts.
+     * Resolves the owning userId for a reference from the persisted
+     * pending-charge row. Returns null (causing the webhook to reject with
+     * 400) only if no such row exists — which now means the reference was
+     * never ours or was pruned, not merely that we restarted.
      */
-    private UUID resolveUserIdFromCache(String txRef) {
+    private UUID resolveUserIdFromStore(String txRef) {
         var pending = getPendingCharge(txRef);
         if (pending == null) {
-            log.error("resolveUserIdFromCache(GH v4): no cached charge found for txRef='{}' " +
-                    "(app restart between init and webhook? consider a durable cache)", txRef);
+            log.error("resolveUserIdFromStore(GH v4): no pending charge row for txRef='{}'", txRef);
             return null;
         }
         return pending.userId();

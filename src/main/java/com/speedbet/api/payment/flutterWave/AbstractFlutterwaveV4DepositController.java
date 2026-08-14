@@ -7,6 +7,9 @@ import com.speedbet.api.wallet.WalletService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.util.retry.Retry;
 
@@ -16,8 +19,8 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 
@@ -43,17 +46,52 @@ import java.util.function.Function;
  *                way to check a charge later is GET /charges/{id}, and
  *                {id} is a Flutterwave-assigned string only available
  *                from the original charge response. That's why this class
- *                keeps a local reference -> charge id cache (see
+ *                persists a reference -> charge id record (see
  *                {@link #cachePendingCharge}) rather than relying on
  *                Flutterwave to look things up by our own reference later.
  *   - Identity:  v3 echoes back custom `meta` (e.g. meta.userId) on the
  *                verified transaction, so the v3 abstract class trusts
  *                that round-trip. Flutterwave's v4 docs don't confirm the
  *                same guarantee for the orchestrator flow, so v4
- *                controllers are expected to encode the userId in their
- *                own reference string instead and extract it themselves
- *                — see the userIdFromReference parameter on
+ *                controllers resolve the userId from the persisted
+ *                pending-charge record instead — see the
+ *                userIdFromReference parameter on
  *                {@link #processV4Webhook}.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  CHANGE (this revision) — pending charges are now DURABLE, and there is a
+ *  background RECONCILER so deposits always land.
+ *
+ *  Previously `pendingCharges` was a ConcurrentHashMap. Two consequences,
+ *  both of which cost real money:
+ *
+ *    1. A restart/deploy between charge init and webhook delivery lost the
+ *       reference -> (chargeId, userId) mapping. The webhook then 400'd
+ *       ("Invalid reference format") and the customer was debited by their
+ *       telco but never credited. /verify was equally dead — it needs the
+ *       Flutterwave chargeId, which only ever existed in that map.
+ *    2. Nothing polled. If the webhook was simply never delivered (dropped
+ *       retry, our endpoint 500ing, single-webhook-URL misrouting) and the
+ *       customer closed the app before the frontend polled /verify, the
+ *       deposit was silently lost until someone raised a ticket.
+ *
+ *  Now: {@link FlutterwaveV4PendingCharge} rows are persisted via
+ *  {@link FlutterwaveV4PendingChargeStore}, and
+ *  {@link FlutterwaveV4DepositReconciler} calls
+ *  {@link #reconcilePendingCharges()} on a fixed delay to poll every still-
+ *  PENDING charge against Flutterwave's live GET /charges/{id} until it
+ *  reaches a terminal state. This ALSO makes the store multi-instance safe,
+ *  which the old map never was.
+ *
+ *  The webhook and /verify paths are behaviourally unchanged and remain the
+ *  fast paths. All three funnel into {@link #handleVerifiedDeposit}, which is
+ *  idempotent on the reference (WalletService throws 409 on a duplicate ref,
+ *  caught here and treated as already-processed), so whichever arrives first
+ *  wins and the rest no-op.
+ *
+ *  Subclasses must now additionally implement {@link #pendingChargeStore()},
+ *  {@link #expectedCurrency()} and {@link #providerTag()}.
+ * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
  *  CAVEATS — confirm against Flutterwave's v4 sandbox before going live
@@ -68,7 +106,13 @@ import java.util.function.Function;
  *     still applying unchanged) is inferred from Flutterwave's v3
  *     behavior plus partial v4 docs, not a confirmed v4 webhook sample.
  *     Log and inspect the first few real webhook deliveries in sandbox
- *     before trusting this in production.
+ *     before trusting this in production. NOTE: the reconciler below is
+ *     what makes this caveat survivable — even if the webhook shape is
+ *     wrong and every delivery is rejected, polling still credits.
+ *   - The terminal-status vocabulary in {@link #TERMINAL_FAILURE_STATUSES}
+ *     and {@link #SUCCESS_STATUSES} is best-effort. An unrecognised status
+ *     is treated as still-pending, so the worst case is a charge polling
+ *     until the TTL expires rather than a wrong credit.
  */
 @Slf4j
 public abstract class AbstractFlutterwaveV4DepositController {
@@ -76,10 +120,32 @@ public abstract class AbstractFlutterwaveV4DepositController {
     protected final Duration flwTimeout = Duration.ofSeconds(10);
     protected final long     flwRetryAttempts = 2;
 
+    /** Statuses that mean "money is in". Compared case-insensitively. */
+    protected static final Set<String> SUCCESS_STATUSES =
+            Set.of("succeeded", "successful", "success", "completed");
+
+    /**
+     * Statuses that mean "this will never succeed" — stop polling.
+     * Anything NOT in either set is treated as still in flight, so an
+     * unknown status costs us extra polls, never a bad credit.
+     */
+    protected static final Set<String> TERMINAL_FAILURE_STATUSES =
+            Set.of("failed", "cancelled", "canceled", "declined", "expired",
+                   "reversed", "voided", "abandoned", "rejected", "error");
+
     protected abstract WalletService     walletService();
     protected abstract ReferralService   referralService();
     protected abstract WebClient.Builder webClientBuilder();
     protected abstract ObjectMapper      objectMapper();
+
+    /** Durable replacement for the old in-memory pendingCharges map. */
+    protected abstract FlutterwaveV4PendingChargeStore pendingChargeStore();
+
+    /** e.g. "GHS" — used by the reconciler, which has no request context. */
+    public abstract String expectedCurrency();
+
+    /** e.g. "flutterwave_gh_v4" — routes reconciler work to this controller. */
+    public abstract String providerTag();
 
     @Value("${app.flutterwave.v4.client-id}")
     protected String clientId;
@@ -95,6 +161,18 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
     @Value("${app.flutterwave.v4.token-url:https://idp.flutterwave.com/realms/flutterwave/protocol/openid-connect/token}")
     protected String tokenUrl;
+
+    /** Max pending charges polled per provider, per reconciler pass. */
+    @Value("${app.flutterwave.v4.reconcile.batch-size:50}")
+    protected int reconcileBatchSize;
+
+    /**
+     * How long a charge may stay PENDING before it's marked EXPIRED and
+     * polling stops. Generous by default — a customer can leave a MoMo
+     * prompt sitting on their lock screen for a long time.
+     */
+    @Value("${app.flutterwave.v4.reconcile.ttl-minutes:45}")
+    protected long pendingTtlMinutes;
 
     /**
      * Same static secret-hash mechanism as v3 (Settings > Webhooks in the
@@ -114,30 +192,47 @@ public abstract class AbstractFlutterwaveV4DepositController {
     private volatile String  cachedAccessToken;
     private volatile Instant cachedTokenExpiry = Instant.EPOCH;
 
-    // ─── Pending charge cache (reference -> Flutterwave charge id) ────────────
+    // ─── Pending charge persistence (reference -> Flutterwave charge id) ──────
 
     /**
-     * Keyed by OUR reference (whatever string the controller generates,
-     * e.g. "SPB-GH-V4-<userId>-<uuid>"). Populated at charge-initiation
-     * time and consulted by /verify polling endpoints and the webhook
-     * handler alike, since v4 has no "look up by our reference" API of
-     * its own. In a multi-instance deployment replace this with Redis or
-     * a DB table.
+     * Lightweight read view of a persisted pending charge, so callers don't
+     * handle a detached JPA entity. Field names ({@code chargeId()},
+     * {@code userId()}, {@code amount()}) are unchanged from the old
+     * in-memory record, so existing call sites compile as-is.
      */
-    private final ConcurrentHashMap<String, PendingV4Charge> pendingCharges = new ConcurrentHashMap<>();
+    protected record PendingV4Charge(String reference, String chargeId, UUID userId,
+                                     BigDecimal amount, String currency, String providerTag,
+                                     FlutterwaveV4ChargeStatus status) {
 
-    protected record PendingV4Charge(String chargeId, UUID userId, BigDecimal amount) {}
+        public boolean isPending() { return status == FlutterwaveV4ChargeStatus.PENDING; }
+        public boolean isCredited() { return status == FlutterwaveV4ChargeStatus.CREDITED; }
+    }
 
+    /**
+     * Persists the reference -> (chargeId, userId) mapping at charge-init
+     * time. This row is the ONLY thing that makes the charge recoverable:
+     * v4 offers no lookup-by-our-reference, so without the stored chargeId
+     * neither the webhook, /verify, nor the reconciler can ever check the
+     * charge again. Call this BEFORE returning to the client.
+     */
     protected void cachePendingCharge(String reference, String chargeId, UUID userId, BigDecimal amount) {
-        pendingCharges.put(reference, new PendingV4Charge(chargeId, userId, amount));
+        pendingChargeStore().create(reference, chargeId, userId, amount,
+                expectedCurrency(), providerTag());
     }
 
     protected PendingV4Charge getPendingCharge(String reference) {
-        return pendingCharges.get(reference);
+        return pendingChargeStore().find(reference).orElse(null);
     }
 
+    /**
+     * @deprecated rows are no longer deleted — they're marked terminal so the
+     * reconciler stops polling them and the history stays auditable. Retained
+     * so existing call sites keep working; prefer letting the credit paths
+     * call {@code markCredited} themselves.
+     */
+    @Deprecated
     protected void clearPendingCharge(String reference) {
-        pendingCharges.remove(reference);
+        pendingChargeStore().markCredited(reference, "legacy");
     }
 
     // ─── Webhook auth (identical mechanism to v3) ──────────────────────────────
@@ -323,6 +418,14 @@ public abstract class AbstractFlutterwaveV4DepositController {
         }
     }
 
+    /** Pulls the "data" object out of a v4 response, or an empty map. */
+    @SuppressWarnings("unchecked")
+    protected Map<String, Object> dataOf(Map<String, Object> response) {
+        if (response == null) return Map.of();
+        var data = response.get("data");
+        return data instanceof Map ? (Map<String, Object>) data : Map.of();
+    }
+
     // ─── Shared verify-and-credit (polling fallback) ───────────────────────────
 
     /**
@@ -335,7 +438,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
      * opaque reference string, and every status this method acts on comes
      * from Flutterwave's live API (getCharge), never from anything the
      * client asserts directly. Crediting is idempotent on ref regardless of
-     * whether this path or the webhook reaches it first.
+     * whether this path, the webhook, or the reconciler reaches it first.
      */
     protected Map<String, Object> verifyAndCredit(
             UUID requestingUserId, String reference, String expectedCurrency, String providerTag) {
@@ -348,19 +451,31 @@ public abstract class AbstractFlutterwaveV4DepositController {
             throw ApiException.forbidden("This payment reference does not belong to your account.");
         }
 
-        var result = getCharge(pending.chargeId());
-
-        @SuppressWarnings("unchecked")
-        var data = (Map<String, Object>) result.get("data");
-        var status = data != null ? String.valueOf(data.get("status")) : "unknown";
-
-        if ("pending".equalsIgnoreCase(status) || "processing".equalsIgnoreCase(status)) {
-            return Map.of("credited", false, "status", status,
-                    "message", "Payment is still pending. Please approve the prompt on your phone.");
+        // Already settled by the webhook or the reconciler — don't re-hit
+        // Flutterwave, just report the outcome.
+        if (pending.isCredited()) {
+            return Map.of("credited", false, "status", "succeeded",
+                    "message", "Payment was already processed.");
+        }
+        if (pending.status() == FlutterwaveV4ChargeStatus.FAILED) {
+            return Map.of("credited", false, "status", "failed",
+                    "message", "Payment failed or was cancelled.");
         }
 
-        if (!"succeeded".equalsIgnoreCase(status) && !"successful".equalsIgnoreCase(status)) {
-            return Map.of("credited", false, "status", status, "message", "Payment failed or was cancelled.");
+        var result = getCharge(pending.chargeId());
+        var data   = dataOf(result);
+        var status = String.valueOf(data.getOrDefault("status", "unknown"));
+
+        if (!isSuccess(status)) {
+            if (isTerminalFailure(status)) {
+                pendingChargeStore().markFailed(reference, status);
+                return Map.of("credited", false, "status", status,
+                        "message", "Payment failed or was cancelled.");
+            }
+            // Still in flight. Leave the row PENDING so the reconciler keeps
+            // watching it even if the customer closes the app right now.
+            return Map.of("credited", false, "status", status,
+                    "message", "Payment is still pending. Please approve the prompt on your phone.");
         }
 
         var currency = String.valueOf(data.get("currency"));
@@ -372,7 +487,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
         var amount = new BigDecimal(String.valueOf(data.get("amount")));
         var credited = handleVerifiedDeposit(pending.userId(), reference, amount, expectedCurrency, providerTag);
-        clearPendingCharge(reference);
+        pendingChargeStore().markCredited(reference, "verify");
 
         return Map.of("credited", credited, "status", "succeeded",
                 "message", credited
@@ -380,15 +495,158 @@ public abstract class AbstractFlutterwaveV4DepositController {
                         : "Payment was already processed.");
     }
 
+    // ─── Background reconciliation (the safety net) ────────────────────────────
+
+    /**
+     * Polls every PENDING charge for this provider whose backoff window has
+     * elapsed, and settles the ones Flutterwave now reports as terminal.
+     * Invoked by {@link FlutterwaveV4DepositReconciler} on a fixed delay.
+     *
+     * This is what guarantees the customer gets credited when the webhook
+     * never shows up. It is deliberately conservative:
+     *   - only Flutterwave's own live GET /charges/{id} is trusted;
+     *   - an unrecognised status is treated as still-pending, never credited;
+     *   - a transport error just reschedules — the row stays PENDING;
+     *   - crediting reuses the same idempotent handleVerifiedDeposit path,
+     *     so a race with an in-flight webhook cannot double-credit.
+     *
+     * Each row is handled in isolation: one poisoned charge can't stall the
+     * queue behind it.
+     *
+     * @return number of charges that reached a terminal state this pass
+     */
+    public int reconcilePendingCharges() {
+        var now    = Instant.now();
+        var cutoff = now.minusSeconds(pendingTtlMinutes * 60);
+        var due    = pendingChargeStore().findDue(
+                providerTag(), now, PageRequest.of(0, Math.max(1, reconcileBatchSize)));
+
+        if (due.isEmpty()) return 0;
+
+        log.debug("reconcilePendingCharges[{}]: {} charge(s) due", providerTag(), due.size());
+
+        var settled = 0;
+        for (var reference : due) {
+            try {
+                if (reconcileOne(reference, cutoff)) settled++;
+            } catch (Exception ex) {
+                log.error("reconcilePendingCharges[{}]: unexpected error on ref='{}'",
+                        providerTag(), reference, ex);
+                pendingChargeStore().reschedule(reference, "error", safeMessage(ex));
+            }
+        }
+        return settled;
+    }
+
+    /** @return true if this charge reached a terminal state. */
+    private boolean reconcileOne(String reference, Instant expiryCutoff) {
+        var pending = getPendingCharge(reference);
+        if (pending == null || !pending.isPending()) {
+            return false; // settled by webhook/verify in the meantime — nothing to do
+        }
+
+        // Give up eventually rather than polling a dead charge forever.
+        if (pendingChargeStore().isOlderThan(reference, expiryCutoff)) {
+            log.warn("reconcileOne[{}]: ref='{}' still pending after {}min — marking EXPIRED. " +
+                            "If the customer reports being debited, check this charge in the " +
+                            "Flutterwave dashboard manually (chargeId='{}').",
+                    providerTag(), reference, pendingTtlMinutes, pending.chargeId());
+            pendingChargeStore().markExpired(reference);
+            return true;
+        }
+
+        Map<String, Object> result;
+        try {
+            result = getCharge(pending.chargeId());
+        } catch (RuntimeException ex) {
+            // Transport/auth failure — this says nothing about the charge.
+            // Keep it PENDING and try again after the backoff.
+            log.warn("reconcileOne[{}]: lookup failed for ref='{}' — will retry. {}",
+                    providerTag(), reference, ex.getMessage());
+            pendingChargeStore().reschedule(reference, "lookup_failed", safeMessage(ex));
+            return false;
+        }
+
+        var data   = dataOf(result);
+        var status = String.valueOf(data.getOrDefault("status", "unknown"));
+
+        if (isTerminalFailure(status)) {
+            log.info("reconcileOne[{}]: ref='{}' terminal failure status='{}'",
+                    providerTag(), reference, status);
+            pendingChargeStore().markFailed(reference, status);
+            return true;
+        }
+
+        if (!isSuccess(status)) {
+            // Still in flight (or a status we don't recognise — same treatment,
+            // because guessing here would mean crediting on an unknown state).
+            pendingChargeStore().reschedule(reference, status, null);
+            return false;
+        }
+
+        var currency = String.valueOf(data.get("currency"));
+        if (!expectedCurrency().equalsIgnoreCase(currency)) {
+            log.error("reconcileOne[{}]: currency mismatch on ref='{}' expected='{}' got='{}' — NOT crediting",
+                    providerTag(), reference, expectedCurrency(), currency);
+            pendingChargeStore().markFailed(reference, "currency_mismatch:" + currency);
+            return true;
+        }
+
+        BigDecimal amount;
+        try {
+            amount = new BigDecimal(String.valueOf(data.get("amount")));
+        } catch (NumberFormatException ex) {
+            log.error("reconcileOne[{}]: unparseable amount '{}' on ref='{}' — NOT crediting",
+                    providerTag(), data.get("amount"), reference);
+            pendingChargeStore().reschedule(reference, status, "unparseable amount");
+            return false;
+        }
+
+        // Credit what Flutterwave says was actually collected, not what we
+        // asked for — but shout if they differ, because that's either a
+        // partial payment or a bug worth knowing about.
+        if (pending.amount() != null && pending.amount().compareTo(amount) != 0) {
+            log.warn("reconcileOne[{}]: amount differs for ref='{}' requested={} settled={} — " +
+                            "crediting the settled amount",
+                    providerTag(), reference, pending.amount(), amount);
+        }
+
+        handleVerifiedDeposit(pending.userId(), reference, amount, expectedCurrency(), providerTag());
+        pendingChargeStore().markCredited(reference, "reconciler");
+
+        log.info("reconcileOne[{}]: RECOVERED deposit via polling — ref='{}' userId='{}' amount={} {} " +
+                        "(webhook never credited this one)",
+                providerTag(), reference, pending.userId(), amount, expectedCurrency());
+        return true;
+    }
+
+    protected static boolean isSuccess(String status) {
+        return status != null && SUCCESS_STATUSES.contains(status.trim().toLowerCase());
+    }
+
+    protected static boolean isTerminalFailure(String status) {
+        return status != null && TERMINAL_FAILURE_STATUSES.contains(status.trim().toLowerCase());
+    }
+
+    private static String safeMessage(Exception ex) {
+        var msg = ex.getMessage();
+        if (msg == null) return ex.getClass().getSimpleName();
+        return msg.length() > 480 ? msg.substring(0, 480) : msg;
+    }
+
     // ─── Shared webhook processing ──────────────────────────────────────────────
 
     /**
      * Shared body for every v4 controller's webhook endpoint.
      *
-     * @param userIdFromReference extracts the userId encoded in this
-     *                             controller's own reference format (v4
-     *                             doesn't reliably echo back custom meta
-     *                             the way v3 does, so we don't depend on it)
+     * Still the primary, fast credit path — the reconciler exists only to
+     * catch what this misses.
+     *
+     * @param userIdFromReference resolves the owning userId for a reference.
+     *                             v4 doesn't reliably echo back custom meta
+     *                             the way v3 does, so controllers look this
+     *                             up from their persisted pending-charge row
+     *                             rather than trusting the payload.
      */
     @SuppressWarnings("unchecked")
     protected org.springframework.http.ResponseEntity<String> processV4Webhook(
@@ -433,8 +691,12 @@ public abstract class AbstractFlutterwaveV4DepositController {
         var ref = reference.toString();
         UUID userId = userIdFromReference.apply(ref);
         if (userId == null) {
-            log.error("Flutterwave v4 webhook [{}]: cannot parse userId from reference='{}'", providerTag, ref);
-            return org.springframework.http.ResponseEntity.status(400).body("Invalid reference format");
+            // Now genuinely unexpected: the pending-charge row is durable, so
+            // this means the reference was never ours (or was pruned long ago).
+            // 400 rather than 500 so Flutterwave stops retrying a request we
+            // can never satisfy.
+            log.error("Flutterwave v4 webhook [{}]: no pending charge for reference='{}'", providerTag, ref);
+            return org.springframework.http.ResponseEntity.status(400).body("Unknown reference");
         }
 
         // Never trust the webhook payload's status/amount directly —
@@ -443,15 +705,20 @@ public abstract class AbstractFlutterwaveV4DepositController {
         try {
             verified = getCharge(chargeId.toString());
         } catch (RuntimeException ex) {
+            // 500 asks Flutterwave to retry, and the reconciler will pick this
+            // up regardless — the row is still PENDING.
             log.error("Flutterwave v4 webhook [{}]: re-verification failed for chargeId='{}' — will retry",
                     providerTag, chargeId, ex);
             return org.springframework.http.ResponseEntity.status(500).body("Verification failed, will retry");
         }
 
-        var verifiedData = (Map<String, Object>) verified.get("data");
-        var verifiedStatus = verifiedData != null ? String.valueOf(verifiedData.get("status")) : "unknown";
+        var verifiedData   = dataOf(verified);
+        var verifiedStatus = String.valueOf(verifiedData.getOrDefault("status", "unknown"));
 
-        if (!"succeeded".equalsIgnoreCase(verifiedStatus) && !"successful".equalsIgnoreCase(verifiedStatus)) {
+        if (!isSuccess(verifiedStatus)) {
+            if (isTerminalFailure(verifiedStatus)) {
+                pendingChargeStore().markFailed(ref, verifiedStatus);
+            }
             log.info("Flutterwave v4 webhook [{}]: verified status='{}' for ref='{}' — not crediting yet",
                     providerTag, verifiedStatus, ref);
             return org.springframework.http.ResponseEntity.ok("Ignored — not yet successful");
@@ -467,11 +734,13 @@ public abstract class AbstractFlutterwaveV4DepositController {
         try {
             var amount = new BigDecimal(String.valueOf(verifiedData.get("amount")));
             handleVerifiedDeposit(userId, ref, amount, expectedCurrency, providerTag);
-            clearPendingCharge(ref);
+            pendingChargeStore().markCredited(ref, "webhook");
         } catch (ApiException e) {
             log.error("Flutterwave v4 webhook [{}]: bad request — {}", providerTag, e.getMessage(), e);
             return org.springframework.http.ResponseEntity.status(400).body("Bad request: " + e.getMessage());
         } catch (Exception e) {
+            // Row stays PENDING — Flutterwave retries AND the reconciler will
+            // catch it. Two independent recovery paths.
             log.error("Flutterwave v4 webhook [{}]: unexpected error — will retry", providerTag, e);
             return org.springframework.http.ResponseEntity.status(500).body("Processing error");
         }
@@ -481,6 +750,16 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
     // ─── Shared deposit crediting (identical contract to v3's) ─────────────────
 
+    /**
+     * Idempotent on {@code ref}. This is the single choke point every credit
+     * path (webhook, /verify, reconciler) goes through, which is precisely
+     * what makes it safe to have three of them racing.
+     *
+     * REQUIRES_NEW so a rollback here can't take out the caller's transaction
+     * (and vice versa) — the pending-charge bookkeeping and the wallet credit
+     * are deliberately independent.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
     protected boolean handleVerifiedDeposit(UUID userId, String ref, BigDecimal amount,
                                              String currency, String provider) {
         log.info("handleVerifiedDeposit(v4): userId='{}' amount={} currency='{}' ref='{}' provider='{}'",
