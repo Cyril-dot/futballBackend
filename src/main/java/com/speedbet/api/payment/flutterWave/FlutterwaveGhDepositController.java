@@ -156,15 +156,49 @@ public class FlutterwaveGhDepositController extends AbstractFlutterwaveDepositCo
         body.put("network", network.toString().toUpperCase());
         body.put("fullname", fullName);
         body.put("client_ip", clientIp);
-        body.put("redirect_url", frontendUrlOverride + "/wallet?payment=success");
+        // Points at the dedicated CheckoutCallbackPage rather than a generic
+        // "/wallet?payment=success" path — Flutterwave appends its own
+        // query params (status, tx_ref, transaction_id) to whatever URL is
+        // given here, and the callback page is what reads those and hands
+        // off back into the deposit flow. See CheckoutCallbackPage.tsx.
+        body.put("redirect_url", frontendUrlOverride + "/deposit/callback");
         body.put("meta", Map.of("userId", user.getId().toString()));
 
         var response = charge(CHARGE_TYPE, body);
 
+        // ══════════════════════════════════════════════════════════════════
+        //  FIX (this revision) — inject tx_ref into the response.
+        //
+        //  Confirmed against a real Flutterwave response: it does NOT echo
+        //  back tx_ref, even though we sent one in the request body above.
+        //  A captured response looked like:
+        //    {"status":"success","message":"Charge initiated",
+        //     "meta":{"authorization":{"redirect":"...","mode":"redirect"}}}
+        //  — no tx_ref field anywhere. Since this endpoint previously passed
+        //  Flutterwave's raw response straight through unmodified, the
+        //  frontend had no way to learn the tx_ref it needs for the
+        //  subsequent GET .../gh/status?ref={tx_ref} poll — every deposit
+        //  failed at init with "missing reference" despite Flutterwave
+        //  having genuinely initiated the charge (the customer even received
+        //  a real OTP prompt in the case that surfaced this).
+        //
+        //  Fix: merge our own generated txRef into the "data" object of the
+        //  response before returning it, so the frontend can read
+        //  data.data.tx_ref same as it already expects.
+        // ══════════════════════════════════════════════════════════════════
+        @SuppressWarnings("unchecked")
+        var responseData = response.get("data") instanceof Map
+                ? new HashMap<>((Map<String, Object>) response.get("data"))
+                : new HashMap<String, Object>();
+        responseData.putIfAbsent("tx_ref", txRef);
+
+        var augmentedResponse = new HashMap<>(response);
+        augmentedResponse.put("data", responseData);
+
         log.info("initDeposit(GH): Flutterwave responded status='{}' for userId='{}' txRef='{}'",
                 response.get("status"), user.getId(), txRef);
 
-        return ResponseEntity.ok(ApiResponse.ok(response));
+        return ResponseEntity.ok(ApiResponse.ok(augmentedResponse));
     }
 
     // ─── Status (read-only poll) ────────────────────────────────────────────────
