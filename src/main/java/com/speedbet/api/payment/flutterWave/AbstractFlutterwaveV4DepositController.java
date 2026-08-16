@@ -458,14 +458,77 @@ public abstract class AbstractFlutterwaveV4DepositController {
     // ─── Webhook auth ──────────────────────────────────────────────────────────
 
     /**
-     * Authenticates an inbound webhook against the configured static hash.
+     * ══════════════════════════════════════════════════════════════════════
+     *  FIX 6 (this revision) — v4 webhooks are Svix-signed, not a static
+     *  secret. Every prior "fix" to webhook auth (FIX 1) assumed v4 used the
+     *  same MECHANISM as v3 (a static shared secret you string-compare
+     *  against) and only hunted for the right HEADER NAME. That assumption
+     *  was wrong at a deeper level than FIX 1 realised.
      *
-     * Takes the WHOLE header map rather than a single named header because
-     * v4's signature header name is not v3's and was not documented — see
-     * FIX 1. Matching is case-insensitive: HTTP header names are
-     * case-insensitive per RFC 9110, and Spring's map may not normalise.
+     *  Production logs show these headers on every v4 delivery:
+     *
+     *    svix-id, svix-timestamp, svix-signature
+     *
+     *  Those three together are unambiguous: Flutterwave v4 delivers
+     *  webhooks via Svix (https://www.svix.com), a third-party webhook
+     *  infrastructure provider. Svix does NOT send a static secret in a
+     *  header for you to compare with MessageDigest.isEqual() — it computes
+     *  a per-request HMAC-SHA256 signature over "{svix-id}.{svix-timestamp}.
+     *  {raw body}", keyed with a signing secret (format "whsec_<base64>"),
+     *  and puts one or more "v1,<base64 signature>" entries in
+     *  svix-signature (multiple entries support secret rotation — any match
+     *  is valid).
+     *
+     *  A static string compare can NEVER succeed against this, regardless of
+     *  what value app.flutterwave.webhook-hash holds — svix-signature is a
+     *  computed digest, not a shared secret. That is the actual root cause
+     *  of "signature not verified" on 100% of v4 deliveries: not a wrong
+     *  header name (FIX 1's theory), not a stale config value, but the wrong
+     *  verification ALGORITHM entirely.
+     *
+     *  This revision adds real Svix verification:
+     *    - computeSvixSignature() implements the documented HMAC-SHA256 scheme.
+     *    - verifySvixSignature() checks the computed signature against every
+     *      "v1,..." entry in svix-signature (constant-time per entry), AND
+     *      checks svix-timestamp is within app.flutterwave.v4.webhook-svix-
+     *      tolerance-seconds of now, to reject replayed deliveries.
+     *    - verifyWebhookHash() now tries Svix verification FIRST whenever
+     *      app.flutterwave.v4.webhook-svix-secret is configured. The old
+     *      static-hash candidate-header loop is kept only as a fallback for
+     *      whatever v3 still uses, and is skipped entirely for v4 once a
+     *      Svix secret is present.
+     *
+     *  The Svix signing secret is NOT the same value as
+     *  app.flutterwave.webhook-hash (that's the v3 static secret). It must
+     *  be pulled from wherever Flutterwave/Svix expose it for this specific
+     *  webhook endpoint — typically formatted "whsec_...". Get the real
+     *  value before enabling this in production; there is no way to derive
+     *  it from anything already in this codebase.
+     * ══════════════════════════════════════════════════════════════════════
      */
-    protected boolean verifyWebhookHash(Map<String, String> headers) {
+    @Value("${app.flutterwave.v4.webhook-svix-secret:}")
+    protected String svixSigningSecret;
+
+    /** How far svix-timestamp may drift from now before a delivery is rejected as a possible replay. */
+    @Value("${app.flutterwave.v4.webhook-svix-tolerance-seconds:300}")
+    protected long svixToleranceSeconds;
+
+    /**
+     * Authenticates an inbound webhook.
+     *
+     * Tries real Svix HMAC verification first (see FIX 6) if
+     * app.flutterwave.v4.webhook-svix-secret is configured — this is the
+     * CORRECT path for v4 and should be the only one that ever actually
+     * succeeds in production. Falls back to the legacy static-hash
+     * candidate-header comparison (FIX 1's mechanism) only when no Svix
+     * secret is configured, purely so this method still does something
+     * sane before that config is set.
+     *
+     * Takes the WHOLE header map (and now the raw body, for the HMAC) rather
+     * than a single named header, since v4's signature header name/shape was
+     * not documented up front.
+     */
+    protected boolean verifyWebhookHash(Map<String, String> headers, byte[] rawBody) {
         var lower = new HashMap<String, String>();
         if (headers != null) {
             headers.forEach((k, v) -> {
@@ -474,47 +537,145 @@ public abstract class AbstractFlutterwaveV4DepositController {
         }
 
         if (logWebhookHeaders) {
-            log.warn("Flutterwave v4 webhook: inbound header names = {} — identify the signature " +
-                     "header, add it to SIGNATURE_HEADER_CANDIDATES, then disable " +
-                     "app.flutterwave.v4.webhook-log-headers", lower.keySet());
+            log.warn("Flutterwave v4 webhook: inbound header names = {}", lower.keySet());
         }
 
-        for (var candidate : SIGNATURE_HEADER_CANDIDATES) {
-            var value = lower.get(candidate);
-            if (value == null || value.isBlank()) continue;
-
-            if (MessageDigest.isEqual(
-                    value.getBytes(StandardCharsets.UTF_8),
-                    webhookHash.getBytes(StandardCharsets.UTF_8))) {
+        if (svixSigningSecret != null && !svixSigningSecret.isBlank()) {
+            if (verifySvixSignature(lower, rawBody)) {
                 return true;
             }
+            // Deliberately do NOT fall through to the legacy static-hash
+            // check when a Svix secret IS configured — that check can never
+            // meaningfully validate a Svix delivery (see FIX 6), so falling
+            // through would just be a confusing extra log line, not a real
+            // second chance.
+        } else {
+            log.warn("Flutterwave v4 webhook: app.flutterwave.v4.webhook-svix-secret is not configured — " +
+                     "falling back to legacy static-hash comparison, which CANNOT verify a Svix-signed " +
+                     "delivery (svix-signature is a computed HMAC, not a shared secret). Configure the " +
+                     "real Svix signing secret (format 'whsec_...') to fix this properly.");
+            for (var candidate : SIGNATURE_HEADER_CANDIDATES) {
+                var value = lower.get(candidate);
+                if (value == null || value.isBlank()) continue;
 
-            // Header present but value wrong — distinct from "header absent",
-            // because it usually means the configured hash is stale.
-            log.warn("Flutterwave v4 webhook: header '{}' present but did not match the configured " +
-                     "hash — check app.flutterwave.webhook-hash against the dashboard", candidate);
+                if (MessageDigest.isEqual(
+                        value.getBytes(StandardCharsets.UTF_8),
+                        webhookHash.getBytes(StandardCharsets.UTF_8))) {
+                    return true;
+                }
+            }
         }
 
         if (allowUnsignedWebhooks) {
-            log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — processing " +
+            log.warn("Flutterwave v4 webhook: signature verification failed (saw headers {}) — processing " +
                      "anyway because webhook-allow-unsigned=true.", lower.keySet());
             return true;
         }
 
-        log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — rejecting. " +
-                 "If this is every delivery, the header name is wrong: enable " +
-                 "app.flutterwave.v4.webhook-log-headers to find it.", lower.keySet());
+        log.warn("Flutterwave v4 webhook: signature verification failed (saw headers {}) — rejecting.",
+                lower.keySet());
         return false;
     }
 
     /**
-     * True only if the signature actually matched a configured hash — i.e.
-     * NOT merely waved through by webhook-allow-unsigned. Payload-trust
-     * crediting requires this, so an unsigned delivery can never mint balance
-     * even if both flags are on.
+     * FIX 6. Real Svix HMAC-SHA256 verification per Svix's documented scheme:
+     *
+     *   signed_content = "{svix-id}.{svix-timestamp}.{raw request body}"
+     *   secret_bytes   = base64_decode(svixSigningSecret with "whsec_" prefix stripped)
+     *   expected       = base64_encode(HMAC_SHA256(secret_bytes, signed_content))
+     *
+     * svix-signature can contain multiple space-separated "v{n},<base64>"
+     * entries (secret rotation) — any single match is a valid signature.
+     * svix-timestamp is also checked against a tolerance window so an old,
+     * captured delivery can't be replayed indefinitely.
      */
-    private boolean isGenuinelySigned(Map<String, String> headers) {
+    private boolean verifySvixSignature(Map<String, String> lowerHeaders, byte[] rawBody) {
+        var svixId        = lowerHeaders.get("svix-id");
+        var svixTimestamp = lowerHeaders.get("svix-timestamp");
+        var svixSignature = lowerHeaders.get("svix-signature");
+
+        if (svixId == null || svixTimestamp == null || svixSignature == null
+                || svixId.isBlank() || svixTimestamp.isBlank() || svixSignature.isBlank()) {
+            log.warn("Flutterwave v4 webhook: Svix secret configured but svix-id/svix-timestamp/" +
+                     "svix-signature missing from this delivery — cannot verify.");
+            return false;
+        }
+
+        long timestampEpochSeconds;
+        try {
+            timestampEpochSeconds = Long.parseLong(svixTimestamp.trim());
+        } catch (NumberFormatException ex) {
+            log.warn("Flutterwave v4 webhook: unparseable svix-timestamp='{}'", svixTimestamp);
+            return false;
+        }
+
+        var now  = Instant.now().getEpochSecond();
+        var skew = Math.abs(now - timestampEpochSeconds);
+        if (skew > svixToleranceSeconds) {
+            log.warn("Flutterwave v4 webhook: svix-timestamp is {}s from now (tolerance {}s) — " +
+                     "rejecting as a possible replay or clock issue.", skew, svixToleranceSeconds);
+            return false;
+        }
+
+        byte[] secretBytes;
+        try {
+            var secretRaw = svixSigningSecret.startsWith("whsec_")
+                    ? svixSigningSecret.substring("whsec_".length())
+                    : svixSigningSecret;
+            secretBytes = java.util.Base64.getDecoder().decode(secretRaw);
+        } catch (IllegalArgumentException ex) {
+            log.error("Flutterwave v4 webhook: app.flutterwave.v4.webhook-svix-secret is not valid " +
+                       "base64 after stripping 'whsec_' — check the configured value.", ex);
+            return false;
+        }
+
+        var signedContent = svixId + "." + svixTimestamp + "."
+                + new String(rawBody, StandardCharsets.UTF_8);
+
+        byte[] expectedMac;
+        try {
+            var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(secretBytes, "HmacSHA256"));
+            expectedMac = mac.doFinal(signedContent.getBytes(StandardCharsets.UTF_8));
+        } catch (Exception ex) {
+            log.error("Flutterwave v4 webhook: failed to compute HMAC for signature verification", ex);
+            return false;
+        }
+        var expectedB64 = java.util.Base64.getEncoder().encodeToString(expectedMac);
+
+        // svix-signature: "v1,<sig1> v1,<sig2> ..." — space-separated, check every entry.
+        for (var entry : svixSignature.trim().split("\\s+")) {
+            var parts = entry.split(",", 2);
+            if (parts.length != 2) continue;
+            var candidateB64 = parts[1];
+            if (MessageDigest.isEqual(
+                    candidateB64.getBytes(StandardCharsets.UTF_8),
+                    expectedB64.getBytes(StandardCharsets.UTF_8))) {
+                return true;
+            }
+        }
+
+        log.warn("Flutterwave v4 webhook: computed HMAC did not match any entry in svix-signature — " +
+                 "either the signing secret is wrong, or the body was altered in transit.");
+        return false;
+    }
+
+    /**
+     * True only if the signature actually matched — i.e. NOT merely waved
+     * through by webhook-allow-unsigned. Payload-trust crediting requires
+     * this, so an unsigned delivery can never mint balance even if both
+     * flags are on. Re-checks Svix (or falls back to legacy) independently
+     * of verifyWebhookHash()'s allow-unsigned short-circuit.
+     */
+    private boolean isGenuinelySigned(Map<String, String> headers, byte[] rawBody) {
         if (headers == null) return false;
+        var lower = new HashMap<String, String>();
+        headers.forEach((k, v) -> { if (k != null) lower.put(k.toLowerCase(), v); });
+
+        if (svixSigningSecret != null && !svixSigningSecret.isBlank()) {
+            return verifySvixSignature(lower, rawBody);
+        }
+
         for (var entry : headers.entrySet()) {
             if (entry.getKey() == null || entry.getValue() == null) continue;
             var name = entry.getKey().toLowerCase();
@@ -1005,7 +1166,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
             String expectedCurrency, String providerTag,
             Function<String, UUID> userIdFromReference) {
 
-        if (!verifyWebhookHash(headers)) {
+        if (!verifyWebhookHash(headers, rawBody)) {
             log.warn("Flutterwave v4 webhook [{}]: rejected — signature not verified", providerTag);
             return org.springframework.http.ResponseEntity.status(401).body("Invalid signature");
         }
@@ -1014,7 +1175,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
         // MATCHED, not if it was waved through by webhook-allow-unsigned.
         // Payload-trust crediting requires this, so an unsigned delivery can
         // never mint balance even with both flags on.
-        var genuinelySigned = isGenuinelySigned(headers);
+        var genuinelySigned = isGenuinelySigned(headers, rawBody);
 
         Map<String, Object> event;
         try {
