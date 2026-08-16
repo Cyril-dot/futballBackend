@@ -254,7 +254,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
      */
     protected static final Set<String> TERMINAL_FAILURE_STATUSES =
             Set.of("failed", "cancelled", "canceled", "declined", "expired",
-                    "reversed", "voided", "abandoned", "rejected", "error");
+                   "reversed", "voided", "abandoned", "rejected", "error");
 
     /**
      * Candidate header names that might carry the webhook signature, tried
@@ -419,10 +419,10 @@ public abstract class AbstractFlutterwaveV4DepositController {
      *
      * FIX 5: added pollAttempts() — the poll_attempts column already existed
      * on the underlying row (visible in admin queries), it just wasn't
-     * exposed through this read view before. Required companion change:
-     * FlutterwaveV4PendingChargeStore.find() must populate it (it's already
-     * being incremented somewhere, most likely inside reschedule()/find() —
-     * confirm against the store implementation).
+     * exposed through this read view before. Companion change applied in
+     * FlutterwaveV4PendingChargeStore.toView(), which now passes
+     * c.getPollAttempts() through here — assumes that getter's name matches
+     * the entity; confirm if FlutterwaveV4PendingCharge uses a different one.
      */
     protected record PendingV4Charge(String reference, String chargeId, UUID userId,
                                      BigDecimal amount, String currency, String providerTag,
@@ -475,8 +475,8 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
         if (logWebhookHeaders) {
             log.warn("Flutterwave v4 webhook: inbound header names = {} — identify the signature " +
-                    "header, add it to SIGNATURE_HEADER_CANDIDATES, then disable " +
-                    "app.flutterwave.v4.webhook-log-headers", lower.keySet());
+                     "header, add it to SIGNATURE_HEADER_CANDIDATES, then disable " +
+                     "app.flutterwave.v4.webhook-log-headers", lower.keySet());
         }
 
         for (var candidate : SIGNATURE_HEADER_CANDIDATES) {
@@ -492,18 +492,18 @@ public abstract class AbstractFlutterwaveV4DepositController {
             // Header present but value wrong — distinct from "header absent",
             // because it usually means the configured hash is stale.
             log.warn("Flutterwave v4 webhook: header '{}' present but did not match the configured " +
-                    "hash — check app.flutterwave.webhook-hash against the dashboard", candidate);
+                     "hash — check app.flutterwave.webhook-hash against the dashboard", candidate);
         }
 
         if (allowUnsignedWebhooks) {
             log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — processing " +
-                    "anyway because webhook-allow-unsigned=true.", lower.keySet());
+                     "anyway because webhook-allow-unsigned=true.", lower.keySet());
             return true;
         }
 
         log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — rejecting. " +
-                "If this is every delivery, the header name is wrong: enable " +
-                "app.flutterwave.v4.webhook-log-headers to find it.", lower.keySet());
+                 "If this is every delivery, the header name is wrong: enable " +
+                 "app.flutterwave.v4.webhook-log-headers to find it.", lower.keySet());
         return false;
     }
 

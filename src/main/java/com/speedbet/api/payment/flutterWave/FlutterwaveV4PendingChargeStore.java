@@ -27,6 +27,29 @@ import java.util.UUID;
  * Optimistic-lock collisions are logged and swallowed rather than thrown: they
  * mean another instance (or the webhook racing the reconciler) already updated
  * the row, which is the correct outcome, not an error.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  FIX (this revision) — poll_attempts wasn't reaching the reconciler's
+ *  stuck-charge alert (see AbstractFlutterwaveV4DepositController FIX 5).
+ *
+ *  toView() built PendingV4Charge with the old 7-arg constructor, which
+ *  silently defaulted pollAttempts to 0 via a temporary compatibility
+ *  constructor on that record. That meant reconcileOne()'s consecutive-
+ *  lookup-failure threshold could never actually trip — pending.pollAttempts()
+ *  always read 0 regardless of how many times reschedule() had already run.
+ *  The DB column was correct the whole time (poll_attempts already showed 6
+ *  on a real stuck row); it just wasn't being read back out here.
+ *
+ *  toView() now passes c.getPollAttempts() through, and the deprecated 7-arg
+ *  PendingV4Charge constructor can be deleted from
+ *  AbstractFlutterwaveV4DepositController once this is deployed — it was
+ *  only there to keep this class compiling in the interim.
+ *
+ *  ASSUMPTION: FlutterwaveV4PendingCharge exposes getPollAttempts() (likely
+ *  Lombok @Getter on an int/Integer field backing the poll_attempts column).
+ *  If the entity's actual accessor has a different name, update the call
+ *  below to match — I don't have that entity's source, only the DB schema.
+ * ══════════════════════════════════════════════════════════════════════════
  */
 @Slf4j
 @Service
@@ -134,6 +157,6 @@ public class FlutterwaveV4PendingChargeStore {
             FlutterwaveV4PendingCharge c) {
         return new AbstractFlutterwaveV4DepositController.PendingV4Charge(
                 c.getReference(), c.getChargeId(), c.getUserId(), c.getAmount(),
-                c.getCurrency(), c.getProviderTag(), c.getStatus());
+                c.getCurrency(), c.getProviderTag(), c.getStatus(), c.getPollAttempts());
     }
 }
