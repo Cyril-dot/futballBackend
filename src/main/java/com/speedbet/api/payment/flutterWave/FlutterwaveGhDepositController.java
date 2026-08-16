@@ -12,9 +12,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 
@@ -35,6 +37,13 @@ import java.util.UUID;
  *   2. Customer completes verification at the redirect URL
  *   3. Flutterwave sends a "charge.completed" webhook
  *        -> we re-verify the transaction server-side, then credit the wallet
+ *   4. GET /api/wallet/deposit/flutterwave/gh/status?ref={tx_ref}
+ *        -> read-only poll the frontend can call while waiting on step 3,
+ *           so the UI has something to show between "customer completed the
+ *           redirect" and "webhook actually landed and credited." See the
+ *           FIX note below — this endpoint did not exist before and is why
+ *           this controller couldn't be used as a drop-in replacement for
+ *           the v4 push-notification flow, which had its own /verify.
  *
  * NOTE: Flutterwave only allows one webhook URL per dashboard account.
  * Register FlutterwaveWebhookRouterController's URL
@@ -42,6 +51,42 @@ import java.util.UUID;
  * controller's /api/webhooks/flutterwave/gh directly. The router inspects
  * data.currency and delegates here via webhook(...) below. This endpoint
  * still works standalone too (e.g. for manual curl testing).
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ *  FIX (this revision) — added GET .../gh/status, a read-only poll endpoint.
+ *
+ *  This controller previously had init() and webhook() only. The v4 GH
+ *  controller (FlutterwaveGhV4DepositController) additionally exposed
+ *  POST .../gh/v4/verify for the frontend to poll while waiting on a push
+ *  notification. v3 has no equivalent charge type — the customer instead
+ *  completes an OTP/captcha redirect — but the frontend still needs
+ *  something to poll in between "redirect completed" and "webhook landed
+ *  and credited," the same way the existing NG bank v3 flow
+ *  (FlutterwaveNgBankDepositController, referenced in the base class
+ *  javadoc) already does via statusResponse()/verifyTransactionByReference().
+ *
+ *  This is being adopted now specifically because v4's GH flow (push
+ *  notification, no redirect) has an unresolved, Flutterwave-side webhook
+ *  signature mismatch (their dashboard "Secret hash" does not match what
+ *  actually signs production deliveries) plus persistent 500s on
+ *  GET /charges/{id}, both confirmed via direct testing against Flutterwave's
+ *  own API — see AbstractFlutterwaveV4DepositController's FIX 6 note. v3
+ *  does not share either failure mode: its webhook auth is a simple static
+ *  secret comparison (no HMAC/Svix mismatch possible), and its
+ *  verify_by_reference lookup has not exhibited the same persistent 500s in
+ *  production logs. Until Flutterwave resolves the v4 issues, GH MoMo
+ *  deposits should go through this v3 flow instead.
+ *
+ *  IMPORTANT: this new status() method is READ-ONLY, matching the base
+ *  class's contract for statusResponse() — it never credits a wallet.
+ *  Crediting only ever happens through webhook() -> processWebhook() ->
+ *  verifyTransaction(), which re-verifies server-side before crediting. A
+ *  client polling status() and seeing "successful" slightly before the
+ *  webhook has actually landed and credited is expected and safe — the
+ *  frontend should keep showing a confirming state until the webhook (or a
+ *  follow-up status() poll after it lands) reflects the credit, and
+ *  handleVerifiedDeposit() is idempotent on tx_ref regardless of ordering.
+ * ══════════════════════════════════════════════════════════════════════════
  */
 @Slf4j
 @RestController
@@ -120,6 +165,29 @@ public class FlutterwaveGhDepositController extends AbstractFlutterwaveDepositCo
                 response.get("status"), user.getId(), txRef);
 
         return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    // ─── Status (read-only poll) ────────────────────────────────────────────────
+
+    /**
+     * Read-only poll the frontend calls while waiting on the webhook to land
+     * after the customer completes the OTP/captcha redirect. See the FIX
+     * note in the class javadoc for why this was added and why it's safe:
+     * it delegates straight to the base class's statusResponse(), which
+     * never credits anything — only webhook()/processWebhook() does that.
+     *
+     * @param ref the tx_ref returned from initDeposit()'s response body
+     *            (nested under data.tx_ref in Flutterwave's raw charge
+     *            response — confirm the exact path against a real response
+     *            before wiring the frontend, since this controller currently
+     *            passes Flutterwave's response straight through unmodified)
+     */
+    @GetMapping("/api/wallet/deposit/flutterwave/gh/status")
+    public ResponseEntity<Map<String, Object>> status(
+            @AuthenticationPrincipal User user,
+            @RequestParam String ref) {
+        log.info("status(GH): userId='{}' ref='{}'", user.getId(), ref);
+        return statusResponse(ref);
     }
 
     // ─── Webhook ──────────────────────────────────────────────────────────────
