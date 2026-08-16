@@ -89,7 +89,7 @@ import java.util.function.Function;
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX 2 (this revision) — re-verification is a single point of failure.
+ *  FIX 2 — re-verification is a single point of failure.
  *
  *  All three credit paths (webhook, /verify, reconciler) ultimately ask
  *  {@link #getCharge}. They looked independent but shared one dependency, so
@@ -124,10 +124,18 @@ import java.util.function.Function;
  *
  *  Credits taken this way are tagged credited_via='webhook_unverified' so
  *  they can be audited against the dashboard afterwards.
+ *
+ *  IMPORTANT SCOPE NOTE: this fallback only lives inside the WEBHOOK path
+ *  (processV4Webhook). verifyAndCredit() (the /verify poll endpoint) and
+ *  reconcileOne() (the background reconciler) have no such fallback — they
+ *  only have Flutterwave's live lookup, no signed payload to fall back to.
+ *  If a webhook is ever delayed or never delivered for a charge whose
+ *  lookup is also broken, THIS CLASS HAD NO SAFETY NET AT ALL for that
+ *  charge before FIX 5 below — it would silently ride to EXPIRED.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX 3 (earlier revision) — /verify no longer leaks Flutterwave 500s.
+ *  FIX 3 — /verify no longer leaks Flutterwave 500s.
  *
  *  getCharge() rethrew and nothing in verifyAndCredit() caught it, so a
  *  frontend polling every ~5s got a stack trace every time. A failed lookup
@@ -136,7 +144,7 @@ import java.util.function.Function;
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIX 4 (earlier revision) — durable pending charges + background reconciler.
+ *  FIX 4 — durable pending charges + background reconciler.
  *
  *  `pendingCharges` used to be a ConcurrentHashMap. A restart between charge
  *  init and webhook delivery lost the reference -> (chargeId, userId)
@@ -151,15 +159,62 @@ import java.util.function.Function;
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
+ *  FIX 5 (this revision) — the reconciler had no safety net of its own.
+ *
+ *  Root cause recap: a GHS 1 deposit (ref GHV4-a941aa08...) was approved by
+ *  the customer, but its webhook never resolved it (never arrived, or
+ *  arrived and also failed lookup — indistinguishable from our side), and
+ *  every reconciler pass hit the same GET /charges/{id} 10500 seen in FIX 2.
+ *  Because the pre-FIX-5 reconciler only ever logged a WARN and rescheduled,
+ *  the charge polled silently for the full 45-minute TTL and would have
+ *  become EXPIRED with nobody notified — a paid customer, uncredited,
+ *  discovered only because someone happened to go looking.
+ *
+ *  Two changes:
+ *
+ *  1. reconcileOne() now tracks CONSECUTIVE lookup failures (via
+ *     PendingV4Charge.pollAttempts(), already persisted as poll_attempts —
+ *     it just wasn't exposed to this class before). Once consecutive
+ *     failures cross app.flutterwave.v4.reconcile.lookup-failure-alert-
+ *     threshold, alertStuckCharge() fires — a real ERROR-level, structured
+ *     log line distinguishable from routine "will retry" noise, meant to be
+ *     wired to Slack/PagerDuty/email. This fires ONCE per charge (guarded so
+ *     it doesn't re-alert every 10s poll) and again, unconditionally, the
+ *     moment a charge is marked EXPIRED — per the pre-existing "ALERT-WORTHY"
+ *     comment on that path, which was previously just a log line nobody was
+ *     watching.
+ *
+ *  2. A single boolean flag, app.flutterwave.v4.reconcile.escalate-only
+ *     (default false), lets ops choose escalation-only behaviour: when true,
+ *     a charge that crosses the alert threshold is escalated but NOT
+ *     force-expired at TTL — it stays PENDING and keeps polling indefinitely
+ *     until a human resolves it, since EXPIRED still means "we've given up
+ *     automatically" and a stuck deposit should generally be resolved by a
+ *     person, not by a clock. Default is false to preserve existing
+ *     behaviour (EXPIRE at ttl-minutes) unless you opt in.
+ *
+ *  This does NOT give the reconciler a signed-payload fallback the way the
+ *  webhook has one — there is no inbound payload to fall back to here, only
+ *  Flutterwave's (unreliable) live lookup. The real fix for reconciler-side
+ *  recovery would be a second, independent Flutterwave lookup path (e.g. a
+ *  bulk/list-transactions endpoint, if v4 offers one) — flagged as a
+ *  follow-up, not implemented here since it depends on confirming that
+ *  endpoint exists and its shape against Flutterwave's v4 docs/support.
+ * ══════════════════════════════════════════════════════════════════════════
+ *
+ * ══════════════════════════════════════════════════════════════════════════
  *  OPERATIONAL — charges that never resolve.
  *
  *  A charge whose lookup keeps failing stays PENDING until ttl-minutes, then
- *  becomes EXPIRED and stops being polled. That is a customer who may have
- *  paid and will never be credited automatically. Watch for:
+ *  becomes EXPIRED and stops being polled (unless reconcile.escalate-only=
+ *  true — see FIX 5). That is a customer who may have paid and will now
+ *  never be credited automatically. Watch for:
  *    - status='EXPIRED' rows — reconcile each against the dashboard
  *    - credited_via='webhook_unverified' — credited without re-verification
- *  Alert on the first; audit the second. Neither should be discovered by a
- *  customer complaint.
+ *    - alertStuckCharge() log lines (FIX 5) — should now fire BEFORE a
+ *      charge reaches EXPIRED, not just at the moment it does
+ *  Alert on the first and third; audit the second. None of these should be
+ *  discovered by a customer complaint.
  * ══════════════════════════════════════════════════════════════════════════
  *
  * ══════════════════════════════════════════════════════════════════════════
@@ -199,7 +254,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
      */
     protected static final Set<String> TERMINAL_FAILURE_STATUSES =
             Set.of("failed", "cancelled", "canceled", "declined", "expired",
-                   "reversed", "voided", "abandoned", "rejected", "error");
+                    "reversed", "voided", "abandoned", "rejected", "error");
 
     /**
      * Candidate header names that might carry the webhook signature, tried
@@ -257,6 +312,27 @@ public abstract class AbstractFlutterwaveV4DepositController {
     protected long pendingTtlMinutes;
 
     /**
+     * FIX 5. Consecutive lookup failures (i.e. getCharge() throwing, not a
+     * recognised terminal/pending status) after which a charge is escalated
+     * via alertStuckCharge(), instead of only ever surfacing at EXPIRED.
+     * Chosen so it fires well before ttl-minutes elapses at the default
+     * ~10s reconcile interval (10 failures ≈ under 2 minutes), giving
+     * humans a real head start over the 45-minute TTL clock.
+     */
+    @Value("${app.flutterwave.v4.reconcile.lookup-failure-alert-threshold:10}")
+    protected int lookupFailureAlertThreshold;
+
+    /**
+     * FIX 5. When true, a charge that crosses the alert threshold is
+     * escalated but NOT force-expired at ttl-minutes — it stays PENDING and
+     * keeps polling indefinitely until a human resolves it (matches a
+     * status, or is force-credited/force-failed via an admin action).
+     * Default false preserves the original EXPIRE-at-TTL behaviour.
+     */
+    @Value("${app.flutterwave.v4.reconcile.escalate-only:false}")
+    protected boolean escalateOnlyNoAutoExpire;
+
+    /**
      * Same static secret-hash mechanism as v3 (Settings > Webhooks in the
      * Flutterwave dashboard is account-wide, not per API version) — reuses
      * the identical property key as {@link AbstractFlutterwaveDepositController}.
@@ -286,6 +362,10 @@ public abstract class AbstractFlutterwaveV4DepositController {
      *
      * Does NOT apply when re-verification succeeds and reports a failure —
      * that is information and is always respected.
+     *
+     * Only applies inside processV4Webhook() — see the FIX 2 scope note in
+     * the class javadoc and FIX 5 for why the reconciler needed its own,
+     * different fix rather than reusing this flag.
      */
     @Value("${app.flutterwave.v4.trust-payload-when-lookup-unavailable:false}")
     protected boolean trustPayloadWhenLookupUnavailable;
@@ -295,6 +375,19 @@ public abstract class AbstractFlutterwaveV4DepositController {
     private final ReentrantLock tokenLock = new ReentrantLock();
     private volatile String  cachedAccessToken;
     private volatile Instant cachedTokenExpiry = Instant.EPOCH;
+
+    /**
+     * FIX 5. In-memory guard so alertStuckCharge() fires once per charge per
+     * "episode" of consecutive failures rather than on every reconcile pass
+     * once past the threshold (which at a 10s interval would otherwise spam
+     * an alert channel indefinitely for a single stuck charge). Cleared when
+     * the charge settles (credited/failed/expired) or when a lookup
+     * eventually succeeds again. Deliberately process-local, not persisted:
+     * worst case after a restart is one duplicate alert, which is a far
+     * smaller failure mode than the silent-EXPIRE this replaces.
+     */
+    private final Set<String> alreadyAlertedReferences =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // ─── Startup safety check ──────────────────────────────────────────────────
 
@@ -323,10 +416,17 @@ public abstract class AbstractFlutterwaveV4DepositController {
      * Lightweight read view of a persisted pending charge, so callers don't
      * handle a detached JPA entity. Field names ({@code chargeId()},
      * {@code userId()}, {@code amount()}) match the old in-memory record.
+     *
+     * FIX 5: added pollAttempts() — the poll_attempts column already existed
+     * on the underlying row (visible in admin queries), it just wasn't
+     * exposed through this read view before. Required companion change:
+     * FlutterwaveV4PendingChargeStore.find() must populate it (it's already
+     * being incremented somewhere, most likely inside reschedule()/find() —
+     * confirm against the store implementation).
      */
     protected record PendingV4Charge(String reference, String chargeId, UUID userId,
                                      BigDecimal amount, String currency, String providerTag,
-                                     FlutterwaveV4ChargeStatus status) {
+                                     FlutterwaveV4ChargeStatus status, int pollAttempts) {
 
         public boolean isPending()  { return status == FlutterwaveV4ChargeStatus.PENDING; }
         public boolean isCredited() { return status == FlutterwaveV4ChargeStatus.CREDITED; }
@@ -375,8 +475,8 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
         if (logWebhookHeaders) {
             log.warn("Flutterwave v4 webhook: inbound header names = {} — identify the signature " +
-                     "header, add it to SIGNATURE_HEADER_CANDIDATES, then disable " +
-                     "app.flutterwave.v4.webhook-log-headers", lower.keySet());
+                    "header, add it to SIGNATURE_HEADER_CANDIDATES, then disable " +
+                    "app.flutterwave.v4.webhook-log-headers", lower.keySet());
         }
 
         for (var candidate : SIGNATURE_HEADER_CANDIDATES) {
@@ -392,18 +492,18 @@ public abstract class AbstractFlutterwaveV4DepositController {
             // Header present but value wrong — distinct from "header absent",
             // because it usually means the configured hash is stale.
             log.warn("Flutterwave v4 webhook: header '{}' present but did not match the configured " +
-                     "hash — check app.flutterwave.webhook-hash against the dashboard", candidate);
+                    "hash — check app.flutterwave.webhook-hash against the dashboard", candidate);
         }
 
         if (allowUnsignedWebhooks) {
             log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — processing " +
-                     "anyway because webhook-allow-unsigned=true.", lower.keySet());
+                    "anyway because webhook-allow-unsigned=true.", lower.keySet());
             return true;
         }
 
         log.warn("Flutterwave v4 webhook: no recognised signature header (saw {}) — rejecting. " +
-                 "If this is every delivery, the header name is wrong: enable " +
-                 "app.flutterwave.v4.webhook-log-headers to find it.", lower.keySet());
+                "If this is every delivery, the header name is wrong: enable " +
+                "app.flutterwave.v4.webhook-log-headers to find it.", lower.keySet());
         return false;
     }
 
@@ -559,7 +659,8 @@ public abstract class AbstractFlutterwaveV4DepositController {
      * charges their own dashboard showed as SUCCESSFUL. Callers must treat a
      * throw from here as "unknown", never as "failed": a lookup error says
      * nothing about whether the customer paid. See FIX 2 for how the webhook
-     * degrades when this is down.
+     * degrades when this is down, and FIX 5 for how the reconciler now
+     * escalates instead of silently retrying forever.
      */
     @SuppressWarnings("unchecked")
     protected Map<String, Object> getCharge(String chargeId) {
@@ -677,6 +778,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
         var amount = new BigDecimal(String.valueOf(data.get("amount")));
         var credited = handleVerifiedDeposit(pending.userId(), reference, amount, expectedCurrency, providerTag);
         pendingChargeStore().markCredited(reference, "verify");
+        alreadyAlertedReferences.remove(reference); // FIX 5: settled, clear any alert guard
 
         return Map.of("credited", credited, "status", "succeeded",
                 "message", credited
@@ -722,19 +824,37 @@ public abstract class AbstractFlutterwaveV4DepositController {
     private boolean reconcileOne(String reference, Instant expiryCutoff) {
         var pending = getPendingCharge(reference);
         if (pending == null || !pending.isPending()) {
+            alreadyAlertedReferences.remove(reference); // FIX 5: settled elsewhere, clear guard
             return false; // settled by webhook/verify in the meantime
         }
 
         if (pendingChargeStore().isOlderThan(reference, expiryCutoff)) {
-            // ALERT-WORTHY: this may be a customer who paid and will now never
-            // be credited automatically. See the OPERATIONAL note in the class
-            // javadoc — EXPIRED rows must be reconciled against the dashboard.
+            // FIX 5: always escalate on the way to EXPIRED, regardless of
+            // whether the threshold-based alert already fired — this is the
+            // final, unconditional notification that a possibly-paid
+            // customer is about to stop being polled automatically.
+            alertStuckCharge(pending, reference, "ttl_exceeded",
+                    "PENDING for " + pendingTtlMinutes + "min — check the Flutterwave dashboard for chargeId='"
+                            + pending.chargeId() + "'. If it succeeded, the customer paid and was NOT credited.");
+
+            if (escalateOnlyNoAutoExpire) {
+                // Opted-in behaviour: don't give up automatically. Keep polling,
+                // let a human resolve it (force-credit / force-fail / investigate).
+                log.error("reconcileOne[{}]: ref='{}' PENDING past ttl-minutes but " +
+                                "reconcile.escalate-only=true — NOT auto-expiring, will keep polling. " +
+                                "chargeId='{}' userId='{}' amount={}",
+                        providerTag(), reference, pending.chargeId(), pending.userId(), pending.amount());
+                pendingChargeStore().reschedule(reference, "ttl_exceeded_escalated", null);
+                return false;
+            }
+
             log.error("reconcileOne[{}]: ref='{}' still PENDING after {}min — marking EXPIRED. " +
                             "chargeId='{}' userId='{}' amount={}. CHECK THE FLUTTERWAVE DASHBOARD: " +
                             "if this charge succeeded, the customer paid and was NOT credited.",
                     providerTag(), reference, pendingTtlMinutes, pending.chargeId(),
                     pending.userId(), pending.amount());
             pendingChargeStore().markExpired(reference);
+            alreadyAlertedReferences.remove(reference);
             return true;
         }
 
@@ -746,8 +866,26 @@ public abstract class AbstractFlutterwaveV4DepositController {
             log.warn("reconcileOne[{}]: lookup failed for ref='{}' — will retry. {}",
                     providerTag(), reference, ex.getMessage());
             pendingChargeStore().reschedule(reference, "lookup_failed", safeMessage(ex));
+
+            // FIX 5: escalate once consecutive lookup failures cross the
+            // threshold, instead of only ever surfacing at EXPIRED. Uses the
+            // persisted poll_attempts count so this survives across
+            // reconciler passes (and app restarts) rather than needing its
+            // own counter.
+            if (pending.pollAttempts() + 1 >= lookupFailureAlertThreshold) {
+                alertStuckCharge(pending, reference, "lookup_failed_threshold",
+                        "GET /charges/{id} has failed " + (pending.pollAttempts() + 1) +
+                                " consecutive times for chargeId='" + pending.chargeId() +
+                                "' — Flutterwave's lookup endpoint may be down for this charge specifically. " +
+                                "Verify directly against the Flutterwave dashboard.");
+            }
             return false;
         }
+
+        // Lookup succeeded this pass — any prior escalation for this
+        // reference is no longer "still failing", so allow it to re-alert
+        // if it starts failing again later rather than staying suppressed.
+        alreadyAlertedReferences.remove(reference);
 
         var data   = dataOf(result);
         var status = String.valueOf(data.getOrDefault("status", "unknown"));
@@ -796,6 +934,34 @@ public abstract class AbstractFlutterwaveV4DepositController {
         return true;
     }
 
+    /**
+     * FIX 5. The single escalation point for "this charge may be a paid
+     * customer we are failing to credit." Currently a real ERROR-level,
+     * structured log line — deliberately isolated in its own method so it's
+     * a one-line change to wire into Slack/PagerDuty/email/whatever alerting
+     * this service uses, without touching reconcileOne()'s control flow.
+     *
+     * Guarded to fire at most once per reference while the same failure
+     * episode continues (cleared on settlement or on a successful lookup),
+     * so a charge stuck for the full TTL alerts once loudly rather than once
+     * per ~10s poll for 45 minutes straight.
+     */
+    protected void alertStuckCharge(PendingV4Charge pending, String reference, String reasonCode, String detail) {
+        if (!alreadyAlertedReferences.add(reference)) {
+            return; // already alerted for this episode
+        }
+        log.error("!!! FLUTTERWAVE V4 DEPOSIT NEEDS MANUAL REVIEW !!! " +
+                        "provider='{}' ref='{}' reasonCode='{}' chargeId='{}' userId='{}' amount={} {} — {}",
+                providerTag(), reference, reasonCode, pending.chargeId(), pending.userId(),
+                pending.amount(), expectedCurrency(), detail);
+        // TODO wire to real alerting, e.g.:
+        //   alertingClient.send(AlertSeverity.HIGH, "Stuck Flutterwave v4 deposit",
+        //       Map.of("provider", providerTag(), "reference", reference,
+        //              "reasonCode", reasonCode, "chargeId", pending.chargeId(),
+        //              "userId", pending.userId().toString(),
+        //              "amount", pending.amount().toString(), "detail", detail));
+    }
+
     protected static boolean isSuccess(String status) {
         return status != null && SUCCESS_STATUSES.contains(status.trim().toLowerCase());
     }
@@ -825,7 +991,8 @@ public abstract class AbstractFlutterwaveV4DepositController {
      *      was genuinely signed, credit from the signed payload with the
      *      amount cross-checked against what we requested. See FIX 2.
      *   4. Otherwise 500, so Flutterwave retries and the reconciler keeps the
-     *      row PENDING.
+     *      row PENDING (and now escalates on its own — see FIX 5 — rather
+     *      than staying silent until TTL).
      *
      * @param userIdFromReference resolves the owning userId for a reference,
      *                             from the persisted pending-charge row rather
@@ -959,6 +1126,7 @@ public abstract class AbstractFlutterwaveV4DepositController {
 
             handleVerifiedDeposit(userId, ref, amount, expectedCurrency, providerTag);
             pendingChargeStore().markCredited(ref, reVerified ? "webhook" : "webhook_unverified");
+            alreadyAlertedReferences.remove(ref); // FIX 5: settled, clear any alert guard
         } catch (ApiException e) {
             log.error("Flutterwave v4 webhook [{}]: bad request — {}", providerTag, e.getMessage(), e);
             return org.springframework.http.ResponseEntity.status(400).body("Bad request: " + e.getMessage());
