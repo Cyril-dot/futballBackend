@@ -167,33 +167,27 @@ public class FlutterwaveGhDepositController extends AbstractFlutterwaveDepositCo
         var response = charge(CHARGE_TYPE, body);
 
         // ══════════════════════════════════════════════════════════════════
-        //  FIX (this revision) — inject tx_ref into the response.
+        //  FIX v2 (this revision) — corrected tx_ref injection.
         //
-        //  Confirmed against a real Flutterwave response: it does NOT echo
-        //  back tx_ref, even though we sent one in the request body above.
-        //  A captured response looked like:
+        //  The previous revision assumed Flutterwave's response had a nested
+        //  "data" object to merge tx_ref into (response.get("data")). A real
+        //  captured response proved that's wrong for this charge type —
+        //  Flutterwave's response is FLAT:
         //    {"status":"success","message":"Charge initiated",
         //     "meta":{"authorization":{"redirect":"...","mode":"redirect"}}}
-        //  — no tx_ref field anywhere. Since this endpoint previously passed
-        //  Flutterwave's raw response straight through unmodified, the
-        //  frontend had no way to learn the tx_ref it needs for the
-        //  subsequent GET .../gh/status?ref={tx_ref} poll — every deposit
-        //  failed at init with "missing reference" despite Flutterwave
-        //  having genuinely initiated the charge (the customer even received
-        //  a real OTP prompt in the case that surfaced this).
+        //  — status/message/meta sit at the TOP level, no "data" key at all.
+        //  Because response.get("data") was null, the old code created a
+        //  brand-new, otherwise-empty "data" object containing only tx_ref
+        //  and added it as an extra sibling field — burying tx_ref one level
+        //  deeper than the frontend was looking (flwData.data.tx_ref instead
+        //  of flwData.tx_ref), so every deposit still failed at init with
+        //  "missing reference" despite this "fix."
         //
-        //  Fix: merge our own generated txRef into the "data" object of the
-        //  response before returning it, so the frontend can read
-        //  data.data.tx_ref same as it already expects.
+        //  Corrected: add tx_ref directly as a top-level sibling of
+        //  status/message/meta, matching Flutterwave's actual flat shape.
         // ══════════════════════════════════════════════════════════════════
-        @SuppressWarnings("unchecked")
-        var responseData = response.get("data") instanceof Map
-                ? new HashMap<>((Map<String, Object>) response.get("data"))
-                : new HashMap<String, Object>();
-        responseData.putIfAbsent("tx_ref", txRef);
-
         var augmentedResponse = new HashMap<>(response);
-        augmentedResponse.put("data", responseData);
+        augmentedResponse.putIfAbsent("tx_ref", txRef);
 
         log.info("initDeposit(GH): Flutterwave responded status='{}' for userId='{}' txRef='{}'",
                 response.get("status"), user.getId(), txRef);
