@@ -410,6 +410,40 @@ public abstract class AbstractFlutterwaveV4DepositController {
         }
     }
 
+    /**
+     * TEMPORARY diagnostic — DELETE after confirming the Svix secret loads
+     * correctly. Never logs the secret value itself, only whether it's
+     * present and its exact length, plus whether it has leading/trailing
+     * whitespace (a common source of "looks right, silently doesn't match"
+     * bugs when a value is pasted via a properties file, shell env var, or
+     * dashboard form). This is the fastest way to confirm — without
+     * exposing the secret in logs — whether verifySvixSignature() is
+     * failing because the wrong bytes are configured, vs. a real bug in
+     * the HMAC computation itself.
+     */
+    @jakarta.annotation.PostConstruct
+    void logSvixSecretDiagnostics() {
+        if (svixSigningSecret == null) {
+            log.warn("SVIX SECRET DIAGNOSTIC [{}]: app.flutterwave.v4.webhook-svix-secret is NULL — " +
+                    "property not bound at all. Check the exact property key in your config file/env.",
+                    providerTag());
+            return;
+        }
+        if (svixSigningSecret.isBlank()) {
+            log.warn("SVIX SECRET DIAGNOSTIC [{}]: app.flutterwave.v4.webhook-svix-secret is EMPTY/BLANK " +
+                    "(length={}) — property key resolved but has no usable value.",
+                    providerTag(), svixSigningSecret.length());
+            return;
+        }
+        var hasLeadingOrTrailingWhitespace =
+                !svixSigningSecret.equals(svixSigningSecret.strip());
+        log.warn("SVIX SECRET DIAGNOSTIC [{}]: loaded, length={}, hasLeadingOrTrailingWhitespace={}, " +
+                "firstChar='{}', lastChar='{}' — compare firstChar/lastChar and length against what you " +
+                "typed into the Flutterwave dashboard 'Secret hash' field to spot a mismatch.",
+                providerTag(), svixSigningSecret.length(), hasLeadingOrTrailingWhitespace,
+                svixSigningSecret.charAt(0), svixSigningSecret.charAt(svixSigningSecret.length() - 1));
+    }
+
     // ─── Pending charge persistence (reference -> Flutterwave charge id) ──────
 
     /**
@@ -617,46 +651,63 @@ public abstract class AbstractFlutterwaveV4DepositController {
             return false;
         }
 
-        byte[] secretBytes;
+        // FIX 6 follow-up: Flutterwave's dashboard exposes this as a generic
+        // "Secret hash" field (same naming as v3's static secret), not a
+        // Svix-branded "whsec_..." value you'd normally just copy verbatim.
+        // It's unconfirmed whether Flutterwave hands your entered value to
+        // Svix as-is (standard base64 "whsec_" secret) or uses it some other
+        // way internally before it reaches Svix's signing step. Rather than
+        // guess wrong and silently reject every delivery again, try BOTH
+        // interpretations of the configured secret and accept a match on
+        // either — this only widens what counts as a valid signature toward
+        // the real secret you configured, it doesn't weaken verification
+        // against an attacker who doesn't know that secret at all.
+        var candidateKeys = new java.util.ArrayList<byte[]>(2);
         try {
             var secretRaw = svixSigningSecret.startsWith("whsec_")
                     ? svixSigningSecret.substring("whsec_".length())
                     : svixSigningSecret;
-            secretBytes = java.util.Base64.getDecoder().decode(secretRaw);
+            candidateKeys.add(java.util.Base64.getDecoder().decode(secretRaw));
         } catch (IllegalArgumentException ex) {
-            log.error("Flutterwave v4 webhook: app.flutterwave.v4.webhook-svix-secret is not valid " +
-                       "base64 after stripping 'whsec_' — check the configured value.", ex);
-            return false;
+            log.debug("Flutterwave v4 webhook: configured secret is not valid base64 — " +
+                      "will only try it as a raw string key.");
         }
+        // Always also try the secret as a raw UTF-8 string key (i.e. exactly
+        // what you typed into "Secret hash" on the dashboard, unmodified).
+        candidateKeys.add(svixSigningSecret.getBytes(StandardCharsets.UTF_8));
 
         var signedContent = svixId + "." + svixTimestamp + "."
                 + new String(rawBody, StandardCharsets.UTF_8);
+        var signedContentBytes = signedContent.getBytes(StandardCharsets.UTF_8);
 
-        byte[] expectedMac;
-        try {
-            var mac = javax.crypto.Mac.getInstance("HmacSHA256");
-            mac.init(new javax.crypto.spec.SecretKeySpec(secretBytes, "HmacSHA256"));
-            expectedMac = mac.doFinal(signedContent.getBytes(StandardCharsets.UTF_8));
-        } catch (Exception ex) {
-            log.error("Flutterwave v4 webhook: failed to compute HMAC for signature verification", ex);
-            return false;
-        }
-        var expectedB64 = java.util.Base64.getEncoder().encodeToString(expectedMac);
+        for (var secretBytes : candidateKeys) {
+            byte[] expectedMac;
+            try {
+                var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+                mac.init(new javax.crypto.spec.SecretKeySpec(secretBytes, "HmacSHA256"));
+                expectedMac = mac.doFinal(signedContentBytes);
+            } catch (Exception ex) {
+                log.error("Flutterwave v4 webhook: failed to compute HMAC for signature verification", ex);
+                continue;
+            }
+            var expectedB64 = java.util.Base64.getEncoder().encodeToString(expectedMac);
 
-        // svix-signature: "v1,<sig1> v1,<sig2> ..." — space-separated, check every entry.
-        for (var entry : svixSignature.trim().split("\\s+")) {
-            var parts = entry.split(",", 2);
-            if (parts.length != 2) continue;
-            var candidateB64 = parts[1];
-            if (MessageDigest.isEqual(
-                    candidateB64.getBytes(StandardCharsets.UTF_8),
-                    expectedB64.getBytes(StandardCharsets.UTF_8))) {
-                return true;
+            // svix-signature: "v1,<sig1> v1,<sig2> ..." — space-separated, check every entry.
+            for (var entry : svixSignature.trim().split("\\s+")) {
+                var parts = entry.split(",", 2);
+                if (parts.length != 2) continue;
+                var candidateB64 = parts[1];
+                if (MessageDigest.isEqual(
+                        candidateB64.getBytes(StandardCharsets.UTF_8),
+                        expectedB64.getBytes(StandardCharsets.UTF_8))) {
+                    return true;
+                }
             }
         }
 
-        log.warn("Flutterwave v4 webhook: computed HMAC did not match any entry in svix-signature — " +
-                 "either the signing secret is wrong, or the body was altered in transit.");
+        log.warn("Flutterwave v4 webhook: computed HMAC did not match any entry in svix-signature under " +
+                 "either secret interpretation (base64-decoded or raw string) — either the configured " +
+                 "secret hash is wrong/stale, or the body was altered in transit.");
         return false;
     }
 
