@@ -24,6 +24,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.util.UriComponentsBuilder;
 import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
 
@@ -31,6 +32,7 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
 import java.math.MathContext;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
@@ -154,6 +156,32 @@ import java.util.UUID;
  *    This controller only originates GHS mobile-money deposits, so `method` is
  *    hardcoded in {@link #akwapayCreateIntent}. `network` is resolved with a
  *    two-step fallback in {@link #resolveNetwork}.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * OTP SUBMISSION — HOW IT ACTUALLY WORKS WITH MOOLRE
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * When AkwaPay routes a charge through Moolre and Moolre returns code TP14
+ * ("OTP required"), the create-intent response carries:
+ *
+ *     next_action: { type: "submit_otp", hint: "<json>" }
+ *
+ * The OTP the customer types must be submitted to:
+ *
+ *     POST /v1/checkout/{intentId}/validate?cs={client_secret}
+ *     body: { "otp": "<code>" }
+ *
+ * That is AkwaPay's PUBLIC checkout-validate route (no API secret key needed —
+ * the client_secret in the query string IS the authentication). AkwaPay's
+ * server.ts then calls moolreProvider.validateOtp(), which re-calls Moolre's
+ * POST /open/transact/payment with the original body + otpcode. Moolre
+ * accepts (TR099) and THEN sends the MoMo push prompt to the customer's
+ * handset. Without this step the push prompt is never sent.
+ *
+ * This controller proxies that call at {@link #submitOtp} so the frontend
+ * never needs to know AkwaPay's base URL or manage CORS. The frontend POSTs
+ * { intentId, clientSecret, otp } to /api/wallet/deposit/akwapay/otp and
+ * this method forwards them correctly.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WEBHOOK PAYLOAD — CONFIRMED FROM OFFICIAL AKWAPAY SOURCE
@@ -465,47 +493,123 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
+    // ─── OTP submission ───────────────────────────────────────────────────────
 
-
+    /**
+     * Proxies an OTP submission to AkwaPay's public checkout-validate route.
+     *
+     * ── WHY THIS EXISTS ──
+     *
+     * When AkwaPay routes a charge through Moolre and Moolre returns code TP14
+     * ("OTP required"), the create-intent response carries:
+     *
+     *     next_action: { type: "submit_otp", hint: "<json context>" }
+     *
+     * The customer types the OTP they received by SMS. That OTP must reach
+     * AkwaPay's server.ts at:
+     *
+     *     POST /v1/checkout/{intentId}/validate?cs={client_secret}
+     *     body: { "otp": "<code>" }
+     *
+     * AkwaPay's server.ts then calls moolreProvider.validateOtp(), which
+     * re-calls POST /open/transact/payment on Moolre with the original request
+     * body plus `otpcode`. Moolre accepts (returns TR099) and ONLY THEN sends
+     * the MoMo push prompt to the customer's handset. Without this step the
+     * MoMo prompt is never sent and the payment hangs forever.
+     *
+     * ── WHY WE PROXY RATHER THAN CALL DIRECTLY FROM THE FRONTEND ──
+     *
+     * The frontend already has the client_secret (returned by initDeposit).
+     * It could call AkwaPay directly, but that would expose AKWAPAY_API_BASE
+     * to the client and create a CORS dependency on AkwaPay's infrastructure.
+     * Proxying here keeps the frontend decoupled and lets us log every OTP
+     * attempt consistently alongside the rest of the payment audit trail.
+     *
+     * ── WHAT THIS DOES NOT DO ──
+     *
+     * It does NOT credit the wallet. A 200 back from AkwaPay's validate route
+     * means Moolre accepted the OTP and the MoMo prompt is now in flight —
+     * it does NOT mean the customer approved it. The existing reconciliation
+     * sweep ({@link #reconcilePendingIntents}) handles crediting once AkwaPay
+     * reports status=succeeded. These are two separate events; never conflate
+     * them.
+     *
+     * ── WHAT THE FRONTEND MUST SEND ──
+     *
+     *     POST /api/wallet/deposit/akwapay/otp
+     *     Authorization: Bearer {jwt}
+     *     { "intentId": "pi_...", "clientSecret": "cs_...", "otp": "123456" }
+     *
+     * Both intentId and clientSecret come from the initDeposit response.
+     * The frontend must store clientSecret alongside intentId when it receives
+     * the init response and include it here.
+     */
     @PostMapping("/api/wallet/deposit/akwapay/otp")
     public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
-        var intentId     = String.valueOf(req.get("intentId"));
-        var clientSecret = String.valueOf(req.get("clientSecret"));
-        var otp          = String.valueOf(req.get("otp"));
+        var intentId     = req.get("intentId")     == null ? "" : req.get("intentId").toString().trim();
+        var clientSecret = req.get("clientSecret") == null ? "" : req.get("clientSecret").toString().trim();
+        var otp          = req.get("otp")          == null ? "" : req.get("otp").toString().trim();
 
         if (intentId.isBlank() || clientSecret.isBlank() || otp.isBlank())
             throw ApiException.badRequest("intentId, clientSecret and otp are all required");
 
         log.info("submitOtp: userId='{}' intent='{}'", user.getId(), intentId);
 
-        // Build the URL from AKWAPAY_API_BASE directly, not from baseUrl,
-        // because baseUrl may already contain /v1 and the checkout path is
-        // also under /v1 — using the root avoids double-prefixing.
-        // Adjust the host below if your app.akwapay.base-url points elsewhere.
-        var akwapayRoot = baseUrl.replaceAll("/v1.*$", ""); // strip any /v1 suffix
+        // AkwaPay's public checkout-validate route lives under /v1/checkout/,
+        // NOT under whatever path baseUrl points to (which is the merchant API,
+        // typically /v1/payment_intents etc.). Strip any /v1 suffix from baseUrl
+        // so we can safely re-append /v1/checkout/ without doubling the prefix.
+        //
+        // The client_secret goes in the QUERY STRING — that is what authenticates
+        // this call. There is no Authorization header on this route; it is a
+        // public endpoint authenticated solely by the cs= param.
+        //
+        // The body is { "otp": "<code>" } — nothing else. AkwaPay's server.ts
+        // recovers the Moolre OTP context from the stored next_action.hint and
+        // passes it to the adapter via ctx.meta; the frontend does not need to
+        // send it and the adapter does not expect it from the body.
+        var akwapayRoot = baseUrl.replaceAll("/v1.*$", "");
+
+        URI validateUri = UriComponentsBuilder
+                .fromUriString(akwapayRoot + "/v1/checkout/" + intentId + "/validate")
+                .queryParam("cs", clientSecret)
+                .build()
+                .toUri();
+
+        log.info("submitOtp: forwarding to AkwaPay uri='{}'", validateUri);
 
         @SuppressWarnings("unchecked")
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post()
-                .uri(akwapayRoot + "/v1/checkout/" + intentId + "/validate?cs=" + clientSecret)
+                .uri(validateUri)
                 .header("Content-Type", "application/json")
+                // No Authorization header — client_secret in ?cs= is the auth.
                 .bodyValue(Map.of("otp", otp))
                 .retrieve()
                 .onStatus(
                         s -> s.isError(),
                         r -> r.bodyToMono(String.class).map(body -> {
-                            log.error("submitOtp: AkwaPay error status={} body={}", r.statusCode(), body);
-                            return new RuntimeException("AkwaPay returned " + r.statusCode() + ": " + body);
+                            log.error("submitOtp: AkwaPay error status={} body={} intent='{}'",
+                                    r.statusCode(), body, intentId);
+                            return new RuntimeException(
+                                    "AkwaPay returned " + r.statusCode() + ": " + body);
                         })
                 )
                 .bodyToMono(Map.class)
                 .timeout(akwapayTimeout)
                 .block();
 
-        log.info("submitOtp: intent='{}' result='{}'", intentId, result);
+        if (result == null) throw new RuntimeException("AkwaPay returned an empty response for OTP validation.");
+
+        log.info("submitOtp: intent='{}' akwapay_result='{}' — MoMo prompt now in flight if OTP was accepted",
+                intentId, result);
+
+        // Return AkwaPay's full response so the frontend can read next_action
+        // (which will be await_prompt once the OTP is accepted). The sweep
+        // handles the actual credit — this endpoint never touches the wallet.
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
@@ -534,8 +638,6 @@ public class AkwaPayController {
 
         byte[] rawBody;
         try {
-            // MUST be the raw bytes. Re-serialising parsed JSON changes key
-            // order and whitespace, and the HMAC will never match.
             rawBody = request.getInputStream().readAllBytes();
         } catch (Exception e) {
             log.error("AkwaPay webhook: failed to read request body", e);
@@ -646,18 +748,6 @@ public class AkwaPayController {
      *   - Poll rate decays with age, so an abandoned intent costs ~200 calls
      *     across the full 24h window rather than thousands.
      */
-    //
-    // NOTE: this literal must stay in step with SWEEP_INTERVAL_MS above.
-    //
-    // It cannot reference the constant. @Scheduled needs a compile-time
-    // constant or a property placeholder; a SpEL bean lookup like
-    // "#{@akwaPayController.sweepIntervalMs}" makes this bean depend on
-    // itself while it is still being constructed, and Spring rejects the
-    // whole context with "Expression parsing failed" plus a one-node
-    // dependency cycle. The application will not start at all.
-    //
-    // If you want it configurable, use a property instead:
-    //     @Scheduled(fixedDelayString = "${app.akwapay.sweep-interval-ms:5000}")
     @Scheduled(fixedDelay = 5_000)
     public void reconcilePendingIntents() {
         var cutoff = Instant.now().minus(SWEEP_HEAD_START);
@@ -665,10 +755,6 @@ public class AkwaPayController {
         var stale = pendingIntents.findByCreatedAtBeforeOrderByCreatedAtAsc(cutoff);
         if (stale.isEmpty()) return;
 
-        // Only the rows actually due this tick. Logging the count of DUE rows
-        // rather than of all pending rows keeps the log readable — at a 5s tick
-        // the alternative is the same line twelve times a minute saying nothing
-        // happened.
         var due = stale.stream().filter(i -> isDue(i, Instant.now())).toList();
         if (due.isEmpty()) return;
 
@@ -684,23 +770,12 @@ public class AkwaPayController {
         }
     }
 
-    /**
-     * Whether this intent is due to be polled now, per its age band.
-     *
-     * Never polled before → always due. That is the first check after the head
-     * start elapses, and it is the one that settles the overwhelming majority
-     * of real payments.
-     */
     private boolean isDue(AkwaPayPendingIntent intent, Instant now) {
         var last = intent.getLastCheckedAt();
         if (last == null) return true;
         return last.plus(pollIntervalFor(intent, now)).isBefore(now);
     }
 
-    /**
-     * How often to poll an intent of this age. See the TIER_* constants for the
-     * reasoning behind the shape.
-     */
     private Duration pollIntervalFor(AkwaPayPendingIntent intent, Instant now) {
         var age = Duration.between(intent.getCreatedAt(), now);
         if (age.compareTo(TIER_HOT_UNTIL)  < 0) return POLL_EVERY_HOT;
@@ -709,18 +784,6 @@ public class AkwaPayController {
         return POLL_EVERY_COLD;
     }
 
-    /**
-     * Polls AkwaPay for one pending row and acts on the result.
-     *
-     * Terminal (row deleted):
-     *   succeeded                                → credit the user
-     *   failed / declined / cancelled / expired  → nothing to credit
-     *   older than ABANDON_AFTER                 → customer never completed it
-     *
-     * Non-terminal (row kept, retried next cycle):
-     *   processing / unknown / requires_action   → still in flight
-     *   network error / timeout                  → AkwaPay unreachable
-     */
     private void reconcileOne(AkwaPayPendingIntent intent) {
         var ref = intent.getReference();
 
@@ -731,15 +794,10 @@ public class AkwaPayController {
             return;
         }
 
-        // Mark BEFORE the network call. If the call hangs or the pod dies
-        // mid-flight, the row is already stamped and will not be re-polled on
-        // the very next tick — which at a 5s cadence would otherwise pile up
-        // duplicate in-flight requests against AkwaPay for the same intent.
         try {
             intent.markChecked(Instant.now());
             pendingIntents.save(intent);
         } catch (Exception e) {
-            // Diagnostics only — never let a bookkeeping write stop a settlement.
             log.warn("reconcile: could not stamp lastCheckedAt for ref='{}': {}", ref, e.getMessage());
         }
 
@@ -765,10 +823,7 @@ public class AkwaPayController {
                 })
                 .block();
 
-        if (result == null) {
-            // Network error or timeout — already logged. Leave the row alone.
-            return;
-        }
+        if (result == null) return;
 
         var akwapayStatus = String.valueOf(result.get("status")).toLowerCase();
         log.info("reconcile: ref='{}' intent='{}' akwapayStatus='{}' attempt={}",
@@ -776,9 +831,6 @@ public class AkwaPayController {
 
         switch (akwapayStatus) {
             case "succeeded" -> {
-                // Same code path the webhook uses. credit() dedupes on
-                // reference, so this stays safe even if a webhook lands
-                // seconds later.
                 log.info("reconcile: ref='{}' succeeded on sweep — applying credit now", ref);
                 if (intent.isAdminUpgrade()) {
                     handleAdminUpgrade(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
@@ -795,22 +847,11 @@ public class AkwaPayController {
             }
 
             default ->
-                // processing / unknown / requires_action / anything unfamiliar.
-                // Still in flight; the safe direction is always "keep waiting",
-                // never "tell them it failed".
                     log.info("reconcile: ref='{}' status='{}' — still in flight, next check in {}s",
                             ref, akwapayStatus, pollIntervalFor(intent, Instant.now()).toSeconds());
         }
     }
 
-    /**
-     * Removes a settled or abandoned row.
-     *
-     * Failures are logged, not thrown. By the time this is called the credit has
-     * already been applied; a stuck row only causes a redundant status poll next
-     * cycle, and that poll finds a duplicate reference and skips. Throwing here
-     * would roll back a successful credit, which is far worse.
-     */
     private void deletePending(String reference, String why) {
         try {
             if (pendingIntents.existsById(reference)) {
@@ -825,14 +866,6 @@ public class AkwaPayController {
 
     // ─── Private handlers ─────────────────────────────────────────────────────
 
-    /**
-     * Credits the depositing user's wallet, then attributes commission to their
-     * referrer (if they were referred).
-     *
-     * Called by BOTH the webhook handler AND the sweep. Safe concurrently —
-     * WalletService.credit() returns 409 on a duplicate reference; we catch it
-     * and skip, so no double-credit is possible whichever wins the race.
-     */
     private void handleDeposit(UUID userId, String ref, BigDecimal amount, String intentId) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}' intent='{}'",
                 userId, amount, ref, intentId);
@@ -848,23 +881,16 @@ public class AkwaPayController {
             throw ex;
         }
 
-        // ── Attribute commission to the referring admin ──
         try {
             referralService.attributeCommission(userId, amount);
             log.info("handleDeposit: commission attributed for userId='{}' deposit={} adminRate={}",
                     userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {
-            // Never block a deposit because of a commission failure.
             log.error("handleDeposit: commission attribution failed for userId='{}' — investigate",
                     userId, ex);
         }
     }
 
-    /**
-     * Handles an admin upgrade payment. Called by BOTH the webhook handler and
-     * the sweep; upgradeToAdmin() returns 409 on a duplicate reference, which
-     * we catch and skip.
-     */
     private void handleAdminUpgrade(UUID userId, String ref, BigDecimal amount, String intentId) {
         log.info("handleAdminUpgrade: userId='{}' amount={} ref='{}' intent='{}'",
                 userId, amount, ref, intentId);
@@ -900,15 +926,6 @@ public class AkwaPayController {
 
     // ─── Network resolution ────────────────────────────────────────────────────
 
-    /**
-     * Decides which network string ("MTN" | "TELECEL" | "AIRTELTIGO") to send,
-     * since it is mandatory whenever method=mobile_money.
-     *
-     *   1. Whatever the client sent — the user picked it, trust it.
-     *   2. A best-effort guess from the phone number's prefix.
-     *   3. Neither → 400, ask the user to pick one. Better than letting AkwaPay
-     *      reject it and surfacing a generic 500.
-     */
     private String resolveNetwork(String requested, String phone) {
         if (requested != null && !requested.isBlank()) {
             var normalized = requested.trim().toUpperCase();
@@ -928,11 +945,6 @@ public class AkwaPayController {
                 "We couldn't tell which network that number is on. Please choose MTN, Telecel, or AirtelTigo.");
     }
 
-    /**
-     * Best-effort guess of a Ghana MoMo number's network from its prefix.
-     * Empty when the number doesn't normalise to a recognisable Ghana mobile
-     * shape, or its prefix isn't in {@link #GH_NETWORK_PREFIXES}.
-     */
     private Optional<String> detectNetworkFromPhone(String phone) {
         if (phone == null || phone.isBlank()) return Optional.empty();
 
@@ -952,13 +964,6 @@ public class AkwaPayController {
 
     // ─── AkwaPay API helper ───────────────────────────────────────────────────
 
-    /**
-     * Calls POST /v1/payment_intents and returns the FULL response map,
-     * unmodified. The frontend decides between `checkout_url` (handles every
-     * branch) and reading `next_action.type` itself. Do not flatten it here —
-     * AkwaPay adds next_action variants without warning and a flattening layer
-     * silently drops the ones it does not know about.
-     */
     @SuppressWarnings("unchecked")
     private Map<String, Object> akwapayCreateIntent(int amountPesewas,
                                                     String reference,
@@ -973,11 +978,11 @@ public class AkwaPayController {
         if (phone != null && !phone.isBlank()) customer.put("phone", phone);
 
         var body = new HashMap<String, Object>();
-        body.put("amount",     amountPesewas);   // integer pesewas — never a decimal
+        body.put("amount",     amountPesewas);
         body.put("currency",   "GHS");
         body.put("reference",  reference);
         body.put("return_url", returnUrl);
-        body.put("metadata",   metadata);        // stored, but NOT echoed on the webhook
+        body.put("metadata",   metadata);
         if (!customer.isEmpty()) body.put("customer", customer);
 
         body.put("method",  "mobile_money");
@@ -1044,13 +1049,6 @@ public class AkwaPayController {
 
     // ─── Reference encoding / decoding ────────────────────────────────────────
 
-    /**
-     * Builds a reference encoding the userId and intent type, so the webhook
-     * handler can recover both with no other context.
-     *
-     * NEVER change the prefixes or the layout — the parser depends on fixed
-     * offsets, and a format change makes every in-flight intent unroutable.
-     */
     private String buildReference(String prefix, UUID userId) {
         var nonce = Long.toHexString(System.nanoTime() & 0xFFFFFFFFL);
         return prefix
@@ -1059,18 +1057,13 @@ public class AkwaPayController {
                 + String.format("%8s", nonce).replace(' ', '0');
     }
 
-    /**
-     * Parses a reference back into userId + intent type. Null when the
-     * reference was not minted by this controller, which means the webhook
-     * cannot be routed and should be acknowledged without action.
-     */
     private ParsedRef parseReference(String reference) {
         boolean adminUpgrade;
         if (reference.startsWith(REF_PREFIX_DEPOSIT))      adminUpgrade = false;
         else if (reference.startsWith(REF_PREFIX_ADMIN))   adminUpgrade = true;
         else return null;
 
-        var rest = reference.substring(REF_PREFIX_DEPOSIT.length()); // both prefixes are 6 chars
+        var rest = reference.substring(REF_PREFIX_DEPOSIT.length());
         if (rest.length() < 32) return null;
 
         var hex = rest.substring(0, 32);
@@ -1092,17 +1085,6 @@ public class AkwaPayController {
 
     // ─── Signature verification ───────────────────────────────────────────────
 
-    /**
-     * Header format:  X-AkwaPay-Signature: t=1754049600,v1=5f3c9a...
-     * Signed value:   HMAC-SHA256( "{timestamp}.{rawBody}", whsec )  hex-encoded
-     *
-     * Three things that are easy to get wrong, all handled here:
-     *   1. HMAC over the RAW bytes, before any parse/re-serialise.
-     *   2. Reject timestamps outside ±5 min — this is what stops someone
-     *      replaying a captured `succeeded` event.
-     *   3. Constant-time compare. equals() on a signature leaks it a byte at a
-     *      time.
-     */
     private boolean verifySignature(byte[] rawBody, String header) {
         try {
             String t = null, v1 = null;
