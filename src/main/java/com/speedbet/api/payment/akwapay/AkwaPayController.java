@@ -465,6 +465,41 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
+
+
+    @PostMapping("/api/wallet/deposit/akwapay/otp")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var intentId     = String.valueOf(req.get("intentId"));
+        var clientSecret = String.valueOf(req.get("clientSecret"));
+        var otp          = String.valueOf(req.get("otp"));
+
+        log.info("submitOtp: userId='{}' intent='{}'", user.getId(), intentId);
+
+        @SuppressWarnings("unchecked")
+        var result = (Map<String, Object>) webClientBuilder.build()
+                .post()
+                .uri(baseUrl + "/v1/checkout/" + intentId + "/validate?cs=" + clientSecret)
+                .header("Content-Type", "application/json")
+                .bodyValue(Map.of("otp", otp))
+                .retrieve()
+                .onStatus(
+                        s -> s.isError(),
+                        r -> r.bodyToMono(String.class).map(body -> {
+                            log.error("submitOtp: AkwaPay error status={} body={}", r.statusCode(), body);
+                            return new RuntimeException("AkwaPay returned " + r.statusCode() + ": " + body);
+                        })
+                )
+                .bodyToMono(Map.class)
+                .timeout(akwapayTimeout)
+                .block();
+
+        log.info("submitOtp: intent='{}' result='{}'", intentId, result);
+        return ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
     // ─── Webhook ──────────────────────────────────────────────────────────────
 
     /**
