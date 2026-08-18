@@ -476,12 +476,21 @@ public class AkwaPayController {
         var clientSecret = String.valueOf(req.get("clientSecret"));
         var otp          = String.valueOf(req.get("otp"));
 
+        if (intentId.isBlank() || clientSecret.isBlank() || otp.isBlank())
+            throw ApiException.badRequest("intentId, clientSecret and otp are all required");
+
         log.info("submitOtp: userId='{}' intent='{}'", user.getId(), intentId);
+
+        // Build the URL from AKWAPAY_API_BASE directly, not from baseUrl,
+        // because baseUrl may already contain /v1 and the checkout path is
+        // also under /v1 — using the root avoids double-prefixing.
+        // Adjust the host below if your app.akwapay.base-url points elsewhere.
+        var akwapayRoot = baseUrl.replaceAll("/v1.*$", ""); // strip any /v1 suffix
 
         @SuppressWarnings("unchecked")
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post()
-                .uri(baseUrl + "/v1/checkout/" + intentId + "/validate?cs=" + clientSecret)
+                .uri(akwapayRoot + "/v1/checkout/" + intentId + "/validate?cs=" + clientSecret)
                 .header("Content-Type", "application/json")
                 .bodyValue(Map.of("otp", otp))
                 .retrieve()
