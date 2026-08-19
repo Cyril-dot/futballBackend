@@ -400,7 +400,8 @@ public class SecurityConfig {
                 "https://eaglebet-subadmin.vercel.app",
                 "https://eaglebet-superadmin.vercel.app",
                 "https://nexbetbg-qua5xs9p.manus.space",
-                "https://royalbet-nine.vercel.app"
+                "https://royalbet-nine.vercel.app",
+                "https://www.royallbett.com"
 
         ));
 
