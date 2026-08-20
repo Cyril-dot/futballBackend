@@ -402,7 +402,8 @@ public class SecurityConfig {
                 "https://nexbetbg-qua5xs9p.manus.space",
                 "https://royalbet-nine.vercel.app",
                 "https://www.royallbett.com",
-                "https://www.bet360africa.xyz"
+                "https://www.bet360africa.xyz",
+                "https://bet360africa-admin.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
