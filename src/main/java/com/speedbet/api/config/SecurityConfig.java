@@ -404,7 +404,8 @@ public class SecurityConfig {
                 "https://www.royallbett.com",
                 "https://www.bet360africa.xyz",
                 "https://bet360africa-admin.vercel.app",
-                "https://bet360africa-superadmin.vercel.app"
+                "https://bet360africa-superadmin.vercel.app",
+                "https://titanbet-opal.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
