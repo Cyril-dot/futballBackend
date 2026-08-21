@@ -13,19 +13,19 @@ import java.util.UUID;
 @Table(
         name = "matches",
         indexes = {
-                @Index(name = "idx_matches_external_id", columnList = "external_id"),
-                @Index(name = "idx_matches_sport", columnList = "sport"),
-                @Index(name = "idx_matches_league", columnList = "league"),
-                @Index(name = "idx_matches_status", columnList = "status"),
-                @Index(name = "idx_matches_kickoff_at", columnList = "kickoff_at"),
-                @Index(name = "idx_matches_created_at", columnList = "created_at"),
-                @Index(name = "idx_matches_featured", columnList = "is_featured"),
-                @Index(name = "idx_matches_created_by_admin_id", columnList = "created_by_admin_id"),
-                @Index(name = "idx_matches_settled_at", columnList = "settled_at"),
-                @Index(name = "idx_matches_source", columnList = "source"),
-                @Index(name = "idx_matches_sport_status", columnList = "sport,status"),
-                @Index(name = "idx_matches_status_kickoff", columnList = "status,kickoff_at"),
-                @Index(name = "idx_matches_featured_status", columnList = "is_featured,status")
+                @Index(name = "idx_matches_external_id",        columnList = "external_id"),
+                @Index(name = "idx_matches_sport",              columnList = "sport"),
+                @Index(name = "idx_matches_league",             columnList = "league"),
+                @Index(name = "idx_matches_status",             columnList = "status"),
+                @Index(name = "idx_matches_kickoff_at",         columnList = "kickoff_at"),
+                @Index(name = "idx_matches_created_at",         columnList = "created_at"),
+                @Index(name = "idx_matches_featured",           columnList = "is_featured"),
+                @Index(name = "idx_matches_created_by_admin_id",columnList = "created_by_admin_id"),
+                @Index(name = "idx_matches_settled_at",         columnList = "settled_at"),
+                @Index(name = "idx_matches_source",             columnList = "source"),
+                @Index(name = "idx_matches_sport_status",       columnList = "sport,status"),
+                @Index(name = "idx_matches_status_kickoff",     columnList = "status,kickoff_at"),
+                @Index(name = "idx_matches_featured_status",    columnList = "is_featured,status")
         }
 )
 @Getter
@@ -35,7 +35,8 @@ import java.util.UUID;
 @Builder
 public class Match {
 
-    @Id @GeneratedValue(strategy = GenerationType.UUID)
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
     @Builder.Default
@@ -101,8 +102,6 @@ public class Match {
     @Builder.Default
     @Column(name = "created_at", updatable = false)
     private Instant createdAt = Instant.now();
-
-    // ── Keep sport string and sportEnum in sync ───────────────────────────
 
     public void setSport(String sport) {
         this.sport = sport;
