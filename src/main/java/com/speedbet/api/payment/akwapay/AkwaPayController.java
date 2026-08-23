@@ -48,6 +48,47 @@ import java.util.UUID;
  * AkwaPay payment integration.
  *
  * ─────────────────────────────────────────────────────────────────────────────
+ * GATEWAY CHANGE (2026-08-23) — READ THIS IF YOU ARE DEBUGGING A REGRESSION
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * AkwaPay switched their default gateway from Moolre to Flutterwave v4. This
+ * changes NOTHING about the API contract this controller talks to — the same
+ * /v1/payment_intents endpoint, same auth, same webhook shape. But two
+ * concrete behavioural differences matter here:
+ *
+ *   1. THE OTP FLOW ({@link #submitOtp}) MAY NO LONGER FIRE FOR MOMO.
+ *      The comment block on submitOtp below describes the Moolre TP14 flow in
+ *      detail — that flow was Moolre-specific. Flutterwave v4's mobile money
+ *      charges use next_action.type = "payment_instruction" (a push prompt),
+ *      NOT "submit_otp", for the mobile money charges this controller
+ *      originates. In practice this means submitOtp should now see zero
+ *      traffic for ordinary GHS mobile-money deposits. It is left in place
+ *      unchanged because:
+ *        a) AkwaPay's OTP-validate route is provider-agnostic — if AkwaPay's
+ *           routing ever fails over to a gateway that DOES return
+ *           submit_otp for mobile money, this path still works.
+ *        b) As of this writing, AkwaPay's Flutterwave v4 adapter does NOT
+ *           implement validateOtp() at all. If next_action.type ever comes
+ *           back as "submit_otp" while Flutterwave is the active gateway,
+ *           AkwaPay's server returns 501 "OTP validation is not implemented
+ *           for provider 'flutterwave'". This has not been observed for
+ *           mobile-money charges and is not expected to be, but if you see
+ *           a 501 here, that is why — it is an AkwaPay-side gap, not a bug
+ *           in this controller.
+ *
+ *   2. next_action.type MAY VARY MORE THAN BEFORE.
+ *      This was already true (see point 5 in the original notes below), but
+ *      it is worth restating now that a second gateway with a different
+ *      push-prompt message is in the mix. Nothing to change here — the
+ *      frontend already branches on next_action.type and does not assume
+ *      gateway-specific wording. Just don't add new logic that inspects the
+ *      `hint` or `ussd_fallback` string content; treat those as opaque
+ *      display text.
+ *
+ * Everything else below this notice is unchanged from before the gateway
+ * switch and remains accurate.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  * RELIABILITY GUARANTEE — READ THIS FIRST
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -158,25 +199,30 @@ import java.util.UUID;
  *    two-step fallback in {@link #resolveNetwork}.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * OTP SUBMISSION — HOW IT ACTUALLY WORKS WITH MOOLRE
+ * OTP SUBMISSION — HOW IT WORKED WITH MOOLRE (LEGACY GATEWAY, KEPT FOR REFERENCE)
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * When AkwaPay routes a charge through Moolre and Moolre returns code TP14
- * ("OTP required"), the create-intent response carries:
+ * When AkwaPay routed a charge through Moolre and Moolre returned code TP14
+ * ("OTP required"), the create-intent response carried:
  *
  *     next_action: { type: "submit_otp", hint: "<json>" }
  *
- * The OTP the customer types must be submitted to:
+ * The OTP the customer typed had to be submitted to:
  *
  *     POST /v1/checkout/{intentId}/validate?cs={client_secret}
  *     body: { "otp": "<code>" }
  *
  * That is AkwaPay's PUBLIC checkout-validate route (no API secret key needed —
  * the client_secret in the query string IS the authentication). AkwaPay's
- * server.ts then calls moolreProvider.validateOtp(), which re-calls Moolre's
+ * server.ts then called moolreProvider.validateOtp(), which re-called Moolre's
  * POST /open/transact/payment with the original body + otpcode. Moolre
- * accepts (TR099) and THEN sends the MoMo push prompt to the customer's
- * handset. Without this step the push prompt is never sent.
+ * accepted (TR099) and THEN sent the MoMo push prompt to the customer's
+ * handset. Without this step the push prompt was never sent.
+ *
+ * As of the Flutterwave v4 switch, this path is not expected to be exercised
+ * for ordinary mobile-money deposits — see the gateway-change notice at the
+ * top of this class. The code is left in place, unchanged, in case AkwaPay's
+ * routing ever falls back to a gateway that still uses this flow.
  *
  * This controller proxies that call at {@link #submitOtp} so the frontend
  * never needs to know AkwaPay's base URL or manage CORS. The frontend POSTs
@@ -498,10 +544,15 @@ public class AkwaPayController {
     /**
      * Proxies an OTP submission to AkwaPay's public checkout-validate route.
      *
+     * See the "OTP SUBMISSION" notice at the top of this class for what
+     * changed after the Flutterwave v4 switch. Kept unchanged below because
+     * the route itself is unaffected — only how often it fires.
+     *
      * ── WHY THIS EXISTS ──
      *
-     * When AkwaPay routes a charge through Moolre and Moolre returns code TP14
-     * ("OTP required"), the create-intent response carries:
+     * When AkwaPay routes a charge through a gateway that requires OTP
+     * confirmation (historically Moolre with code TP14), the create-intent
+     * response carries:
      *
      *     next_action: { type: "submit_otp", hint: "<json context>" }
      *
@@ -511,11 +562,10 @@ public class AkwaPayController {
      *     POST /v1/checkout/{intentId}/validate?cs={client_secret}
      *     body: { "otp": "<code>" }
      *
-     * AkwaPay's server.ts then calls moolreProvider.validateOtp(), which
-     * re-calls POST /open/transact/payment on Moolre with the original request
-     * body plus `otpcode`. Moolre accepts (returns TR099) and ONLY THEN sends
-     * the MoMo push prompt to the customer's handset. Without this step the
-     * MoMo prompt is never sent and the payment hangs forever.
+     * AkwaPay's server.ts then calls the active provider's validateOtp(),
+     * which re-submits the OTP to the gateway. On success the gateway sends
+     * the push prompt to the customer's handset. Without this step the
+     * push prompt is never sent.
      *
      * ── WHY WE PROXY RATHER THAN CALL DIRECTLY FROM THE FRONTEND ──
      *
@@ -528,7 +578,7 @@ public class AkwaPayController {
      * ── WHAT THIS DOES NOT DO ──
      *
      * It does NOT credit the wallet. A 200 back from AkwaPay's validate route
-     * means Moolre accepted the OTP and the MoMo prompt is now in flight —
+     * means the gateway accepted the OTP and the push prompt is now in flight —
      * it does NOT mean the customer approved it. The existing reconciliation
      * sweep ({@link #reconcilePendingIntents}) handles crediting once AkwaPay
      * reports status=succeeded. These are two separate events; never conflate
@@ -568,9 +618,16 @@ public class AkwaPayController {
         // public endpoint authenticated solely by the cs= param.
         //
         // The body is { "otp": "<code>" } — nothing else. AkwaPay's server.ts
-        // recovers the Moolre OTP context from the stored next_action.hint and
+        // recovers the OTP context from the stored next_action.hint and
         // passes it to the adapter via ctx.meta; the frontend does not need to
         // send it and the adapter does not expect it from the body.
+        //
+        // NOTE: if the active gateway for this charge is Flutterwave v4, this
+        // call will return 501 "OTP validation is not implemented for provider
+        // 'flutterwave'" — that adapter has no validateOtp() method as of this
+        // writing. Not expected to trigger for mobile-money charges (see class
+        // header), but if you see a 501 here in production logs, that is the
+        // cause, and it is on AkwaPay's side to fix, not this controller's.
         var akwapayRoot = baseUrl.replaceAll("/v1.*$", "");
 
         URI validateUri = UriComponentsBuilder
@@ -604,7 +661,7 @@ public class AkwaPayController {
 
         if (result == null) throw new RuntimeException("AkwaPay returned an empty response for OTP validation.");
 
-        log.info("submitOtp: intent='{}' akwapay_result='{}' — MoMo prompt now in flight if OTP was accepted",
+        log.info("submitOtp: intent='{}' akwapay_result='{}' — push prompt now in flight if OTP was accepted",
                 intentId, result);
 
         // Return AkwaPay's full response so the frontend can read next_action
