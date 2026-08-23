@@ -261,109 +261,29 @@ public class AkwaPayController {
     private static final int    ADMIN_UPGRADE_FEE_PESEWAS = 20_000; // GHS 200 × 100
     private static final String UPGRADE_INTENT_ADMIN      = "admin";
 
-    /**
-     * Commission rate applied to every deposit for affiliate attribution.
-     * The actual per-admin rate lives on the Referral entity and is resolved
-     * inside ReferralService.attributeCommission(). This constant is for
-     * logging only — do not branch on it.
-     */
     private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
-
-    // ─── Reference encoding ───────────────────────────────────────────────────
-    //
-    //     sbdep_<32-hex userId>_<8-hex nonce>     wallet deposit
-    //     sbadm_<32-hex userId>_<8-hex nonce>     admin upgrade
-    //
-    // The nonce makes the reference unique per attempt (AkwaPay requires
-    // account-wide uniqueness and returns 409 duplicate_reference otherwise),
-    // while the userId sits at a fixed offset so parsing never depends on
-    // splitting a UUID that contains dashes.
-    //
-    // References created outside this controller (e.g. dashboard test charges)
-    // match neither prefix. parseReference() returns null for those and the
-    // webhook handler returns 200 "Ignored: foreign reference", so AkwaPay
-    // stops retrying something we can never route.
 
     private static final String REF_PREFIX_DEPOSIT = "sbdep_";
     private static final String REF_PREFIX_ADMIN   = "sbadm_";
 
-    /** How long to wait for AkwaPay to respond before timing out. */
     private final Duration akwapayTimeout = Duration.ofSeconds(15);
-
-    /**
-     * Retries on transient network failures only. AkwaPay 4xx/5xx are mapped to
-     * RuntimeException by the onStatus handler and excluded from the retry
-     * predicate — retrying a 400 burns time, retrying a 402 would be wrong.
-     */
     private final long akwapayRetryAttempts = 2;
 
-    /** Replay window for webhook signatures, per AkwaPay docs (5 minutes). */
     private static final long SIGNATURE_TOLERANCE_SECONDS = 300;
-
-    /**
-     * How long the webhook gets to settle an intent before the sweep touches it.
-     *
-     * Five seconds. Short enough that a customer who approves quickly is
-     * credited almost immediately; long enough that we are not polling an
-     * intent that AkwaPay only just created.
-     */
     private static final Duration SWEEP_HEAD_START = Duration.ofSeconds(5);
-
-    /**
-     * How often the sweep ticks. This is NOT how often any one intent is
-     * polled — see {@link #pollIntervalFor}.
-     *
-     * Documentation only: the @Scheduled annotation below needs a literal and
-     * cannot read this. Change both together.
-     *
-     * An idle tick is one indexed query returning nothing and no network calls
-     * at all, so a fast tick costs essentially nothing when there are no
-     * payments in flight.
-     */
     private static final long SWEEP_INTERVAL_MS = 5_000;
 
-    /**
-     * TIERED POLLING — the reason a deposit settles in seconds rather than
-     * minutes.
-     *
-     * A flat interval forces a bad trade: fast enough for a good checkout
-     * experience means hammering AkwaPay for hours on intents the customer
-     * abandoned. So the poll rate decays with the intent's age instead.
-     *
-     * The shape follows how people actually pay. Almost every real payment
-     * resolves in the first two minutes — that is someone with the prompt in
-     * front of them. Past ten minutes they have walked away, and the only
-     * reason to keep asking is the small chance a stuck gateway resolves late.
-     *
-     *     age < 2 min    poll every tick (5s)    → the common case, near-instant
-     *     2–10 min       every 30s               → slow approvals, gateway lag
-     *     10–60 min      every 2 min             → probably abandoned
-     *     > 60 min       every 10 min            → long-tail gateway recovery
-     *
-     * Cost for one abandoned intent over the full 24h window is ~24 + 16 + 25 +
-     * 138 ≈ 200 calls, against ~2,880 at a flat 30s. Twelve times cheaper AND
-     * six times faster in the case that actually matters.
-     */
-    private static final Duration TIER_HOT_UNTIL    = Duration.ofMinutes(2);
-    private static final Duration TIER_WARM_UNTIL   = Duration.ofMinutes(10);
-    private static final Duration TIER_COOL_UNTIL   = Duration.ofMinutes(60);
+    private static final Duration TIER_HOT_UNTIL  = Duration.ofMinutes(2);
+    private static final Duration TIER_WARM_UNTIL = Duration.ofMinutes(10);
+    private static final Duration TIER_COOL_UNTIL = Duration.ofMinutes(60);
 
-    private static final Duration POLL_EVERY_HOT    = Duration.ofSeconds(5);
-    private static final Duration POLL_EVERY_WARM   = Duration.ofSeconds(30);
-    private static final Duration POLL_EVERY_COOL   = Duration.ofMinutes(2);
-    private static final Duration POLL_EVERY_COLD   = Duration.ofMinutes(10);
+    private static final Duration POLL_EVERY_HOT  = Duration.ofSeconds(5);
+    private static final Duration POLL_EVERY_WARM = Duration.ofSeconds(30);
+    private static final Duration POLL_EVERY_COOL = Duration.ofMinutes(2);
+    private static final Duration POLL_EVERY_COLD = Duration.ofMinutes(10);
 
-    /** After this long with no resolution, stop polling and give up on a row. */
     private static final Duration ABANDON_AFTER = Duration.ofHours(24);
 
-    /**
-     * Ghana MoMo number → network, by leading digits after normalising to the
-     * local 0XXXXXXXXX shape. Best-effort fallback ONLY — the NCA reassigns and
-     * ports ranges, so this drifts. It exists to skip a tap in the common case;
-     * it is never the only way through (see {@link #resolveNetwork}), and it is
-     * a flat prefix table rather than a "smart" parser so fixing a stale range
-     * is a one-line diff.
-     */
     private static final Map<String, String> GH_NETWORK_PREFIXES = new LinkedHashMap<>();
     static {
         for (var p : new String[]{"024", "025", "053", "054", "055", "059"}) GH_NETWORK_PREFIXES.put(p, "MTN");
@@ -447,8 +367,6 @@ public class AkwaPayController {
         log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}' requestedNetwork='{}' resolvedNetwork='{}'",
                 user.getId(), user.getEmail(), reference, requestedNet, network);
 
-        // GHS, not pesewas — the sweep credits this value directly, and
-        // handleAdminUpgrade takes GHS the same way the webhook path does.
         var upgradeAmountGhs = BigDecimal.valueOf(ADMIN_UPGRADE_FEE_PESEWAS)
                 .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
@@ -474,20 +392,9 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-    /**
-     * Writes the pending row.
-     *
-     * Deliberately swallows persistence failures. The intent already exists at
-     * AkwaPay by the time we get here — throwing now would return an error to a
-     * customer whose payment is genuinely in flight, and they would try again
-     * and pay twice. A failure here degrades us to webhook-only for this one
-     * payment, which is logged at ERROR so it can be credited by hand.
-     */
     private void recordPending(String reference, String intentId, UUID userId,
                                BigDecimal amountGhs, boolean adminUpgrade) {
         try {
-            // lastCheckedAt starts null — "never polled", which the sweep treats
-            // as due the moment the head start elapses.
             pendingIntents.save(new AkwaPayPendingIntent(
                     reference, intentId, userId, amountGhs, adminUpgrade, Instant.now(), 0, null));
             log.info("recordPending: ref='{}' intent='{}' persisted — sweep will reconcile if the webhook is lost",
@@ -501,15 +408,6 @@ public class AkwaPayController {
 
     // ─── Status probe (read only) ─────────────────────────────────────────────
 
-    /**
-     * Lets the frontend poll while it waits, purely so the UI can say something
-     * better than a spinner.
-     *
-     * THIS MUST NOT CREDIT ANYTHING. A user arriving at return_url proves their
-     * browser finished a redirect and nothing more, and anyone reading the JS
-     * can call this endpoint directly. Money moves in the webhook handler and
-     * the sweep, both of which verify against AkwaPay first.
-     */
     @GetMapping("/api/wallet/deposit/akwapay/status/{intentId}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> status(
             @AuthenticationPrincipal User user,
@@ -541,59 +439,6 @@ public class AkwaPayController {
 
     // ─── OTP submission ───────────────────────────────────────────────────────
 
-    /**
-     * Proxies an OTP submission to AkwaPay's public checkout-validate route.
-     *
-     * See the "OTP SUBMISSION" notice at the top of this class for what
-     * changed after the Flutterwave v4 switch. Kept unchanged below because
-     * the route itself is unaffected — only how often it fires.
-     *
-     * ── WHY THIS EXISTS ──
-     *
-     * When AkwaPay routes a charge through a gateway that requires OTP
-     * confirmation (historically Moolre with code TP14), the create-intent
-     * response carries:
-     *
-     *     next_action: { type: "submit_otp", hint: "<json context>" }
-     *
-     * The customer types the OTP they received by SMS. That OTP must reach
-     * AkwaPay's server.ts at:
-     *
-     *     POST /v1/checkout/{intentId}/validate?cs={client_secret}
-     *     body: { "otp": "<code>" }
-     *
-     * AkwaPay's server.ts then calls the active provider's validateOtp(),
-     * which re-submits the OTP to the gateway. On success the gateway sends
-     * the push prompt to the customer's handset. Without this step the
-     * push prompt is never sent.
-     *
-     * ── WHY WE PROXY RATHER THAN CALL DIRECTLY FROM THE FRONTEND ──
-     *
-     * The frontend already has the client_secret (returned by initDeposit).
-     * It could call AkwaPay directly, but that would expose AKWAPAY_API_BASE
-     * to the client and create a CORS dependency on AkwaPay's infrastructure.
-     * Proxying here keeps the frontend decoupled and lets us log every OTP
-     * attempt consistently alongside the rest of the payment audit trail.
-     *
-     * ── WHAT THIS DOES NOT DO ──
-     *
-     * It does NOT credit the wallet. A 200 back from AkwaPay's validate route
-     * means the gateway accepted the OTP and the push prompt is now in flight —
-     * it does NOT mean the customer approved it. The existing reconciliation
-     * sweep ({@link #reconcilePendingIntents}) handles crediting once AkwaPay
-     * reports status=succeeded. These are two separate events; never conflate
-     * them.
-     *
-     * ── WHAT THE FRONTEND MUST SEND ──
-     *
-     *     POST /api/wallet/deposit/akwapay/otp
-     *     Authorization: Bearer {jwt}
-     *     { "intentId": "pi_...", "clientSecret": "cs_...", "otp": "123456" }
-     *
-     * Both intentId and clientSecret come from the initDeposit response.
-     * The frontend must store clientSecret alongside intentId when it receives
-     * the init response and include it here.
-     */
     @PostMapping("/api/wallet/deposit/akwapay/otp")
     public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
             @AuthenticationPrincipal User user,
@@ -608,26 +453,6 @@ public class AkwaPayController {
 
         log.info("submitOtp: userId='{}' intent='{}'", user.getId(), intentId);
 
-        // AkwaPay's public checkout-validate route lives under /v1/checkout/,
-        // NOT under whatever path baseUrl points to (which is the merchant API,
-        // typically /v1/payment_intents etc.). Strip any /v1 suffix from baseUrl
-        // so we can safely re-append /v1/checkout/ without doubling the prefix.
-        //
-        // The client_secret goes in the QUERY STRING — that is what authenticates
-        // this call. There is no Authorization header on this route; it is a
-        // public endpoint authenticated solely by the cs= param.
-        //
-        // The body is { "otp": "<code>" } — nothing else. AkwaPay's server.ts
-        // recovers the OTP context from the stored next_action.hint and
-        // passes it to the adapter via ctx.meta; the frontend does not need to
-        // send it and the adapter does not expect it from the body.
-        //
-        // NOTE: if the active gateway for this charge is Flutterwave v4, this
-        // call will return 501 "OTP validation is not implemented for provider
-        // 'flutterwave'" — that adapter has no validateOtp() method as of this
-        // writing. Not expected to trigger for mobile-money charges (see class
-        // header), but if you see a 501 here in production logs, that is the
-        // cause, and it is on AkwaPay's side to fix, not this controller's.
         var akwapayRoot = baseUrl.replaceAll("/v1.*$", "");
 
         URI validateUri = UriComponentsBuilder
@@ -643,7 +468,6 @@ public class AkwaPayController {
                 .post()
                 .uri(validateUri)
                 .header("Content-Type", "application/json")
-                // No Authorization header — client_secret in ?cs= is the auth.
                 .bodyValue(Map.of("otp", otp))
                 .retrieve()
                 .onStatus(
@@ -664,28 +488,11 @@ public class AkwaPayController {
         log.info("submitOtp: intent='{}' akwapay_result='{}' — push prompt now in flight if OTP was accepted",
                 intentId, result);
 
-        // Return AkwaPay's full response so the frontend can read next_action
-        // (which will be await_prompt once the OTP is accepted). The sweep
-        // handles the actual credit — this endpoint never touches the wallet.
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
     // ─── Webhook ──────────────────────────────────────────────────────────────
 
-    /**
-     * Receives AkwaPay merchant events.
-     *
-     * NOTE: as of this writing no delivery has ever been observed in
-     * production. If you are debugging a missing credit, check the sweep logs
-     * first — that is where settlement actually happens today. If you never see
-     * a line starting "AkwaPay webhook: event=", the endpoint is not registered
-     * (POST /v1/webhook_endpoints) or AKWAPAY_WEBHOOK_SECRET is wrong.
-     *
-     * We return 200 on every path that is not a hard error, so AkwaPay stops
-     * retrying. Foreign references get 200 "Ignored" rather than 400 — a 400
-     * would put them back in the retry queue forever for something we will
-     * never handle.
-     */
     @PostMapping("/api/webhooks/akwapay")
     public ResponseEntity<String> webhook(
             @RequestHeader(value = "X-AkwaPay-Signature",   required = false) String signature,
@@ -764,8 +571,6 @@ public class AkwaPayController {
                 handleDeposit(parsed.userId(), reference, amount, intentId);
             }
 
-            // Webhook beat the sweep. Drop the row so the sweep doesn't re-poll
-            // AkwaPay for something already settled.
             deletePending(reference, "settled by webhook");
 
         } catch (ApiException e) {
@@ -781,30 +586,6 @@ public class AkwaPayController {
 
     // ─── Reconciliation sweep ─────────────────────────────────────────────────
 
-    /**
-     * Ticks every {@link #SWEEP_INTERVAL_MS}ms. Each pending row is polled only
-     * when it is due for its age band ({@link #pollIntervalFor}), so a
-     * just-created intent is checked every 5 seconds while an hour-old one is
-     * checked every 10 minutes.
-     *
-     * Worst case from the customer approving to being credited is one tick plus
-     * the status call — around 5 seconds.
-     *
-     * This is what actually settles payments in this deployment. Because the
-     * rows are in Postgres rather than a field on this bean, a restart mid-sweep
-     * loses nothing: the next cycle on any instance picks the same rows up.
-     *
-     * Safety:
-     *   - Both paths call the SAME handleDeposit / handleAdminUpgrade, which
-     *     delegate to WalletService.credit(), which returns 409 on a duplicate
-     *     reference. No double-credit is possible.
-     *   - `processing` / `unknown` / `requires_action` rows are left in place
-     *     and re-checked next cycle. `unknown` in particular is NOT a failure.
-     *   - Rows older than {@link #ABANDON_AFTER} are deleted; those are intents
-     *     the customer never completed.
-     *   - Poll rate decays with age, so an abandoned intent costs ~200 calls
-     *     across the full 24h window rather than thousands.
-     */
     @Scheduled(fixedDelay = 5_000)
     public void reconcilePendingIntents() {
         var cutoff = Instant.now().minus(SWEEP_HEAD_START);
@@ -981,7 +762,7 @@ public class AkwaPayController {
         log.info("handleAdminUpgrade: upgrade chat created for userId='{}'", userId);
     }
 
-    // ─── Network resolution ────────────────────────────────────────────────────
+    // ─── Network resolution ───────────────────────────────────────────────────
 
     private String resolveNetwork(String requested, String phone) {
         if (requested != null && !requested.isBlank()) {
@@ -1060,6 +841,29 @@ public class AkwaPayController {
                                 .map(errBody -> {
                                     log.error("AkwaPay API error: status={} ref='{}' body={}",
                                             clientResponse.statusCode(), reference, errBody);
+
+                                    // Map 4xx errors to ApiException so the real AkwaPay
+                                    // message reaches the caller as a 400 rather than
+                                    // becoming a RuntimeException that Spring maps to 500.
+                                    int code = clientResponse.statusCode().value();
+                                    if (code >= 400 && code < 500) {
+                                        String userMessage;
+                                        try {
+                                            @SuppressWarnings("unchecked")
+                                            var parsed = (Map<String, Object>)
+                                                    objectMapper.readValue(errBody, Map.class);
+                                            @SuppressWarnings("unchecked")
+                                            var error = (Map<String, Object>) parsed.get("error");
+                                            var msg = error != null ? (String) error.get("message") : null;
+                                            userMessage = (msg != null && !msg.isBlank())
+                                                    ? msg
+                                                    : "Payment was rejected. Please check your details and try again.";
+                                        } catch (Exception parseEx) {
+                                            userMessage = "Payment was rejected. Please check your details and try again.";
+                                        }
+                                        return (Throwable) ApiException.badRequest(userMessage);
+                                    }
+
                                     return new RuntimeException(
                                             "AkwaPay returned " + clientResponse.statusCode() + ": " + errBody);
                                 })
