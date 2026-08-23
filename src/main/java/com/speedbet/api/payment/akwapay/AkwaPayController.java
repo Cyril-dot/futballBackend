@@ -830,14 +830,15 @@ public class AkwaPayController {
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
-        // Use a per-attempt synthetic email so Flutterwave's POST /customers
-        // never sees the same email twice across retries or repeat deposits.
-        // Flutterwave deduplicates customers by email — passing the real user
-        // email causes "Customer already exists" on any second attempt while
-        // a prior intent is still unresolved. The reference is unique per
-        // attempt so this email is always fresh. The real email is in metadata.
-        // See the class-level comment "WHY customer.email IS SYNTHETIC" above.
-        var syntheticEmail = reference + "@customers.akwapay.com";
+        // Synthetic per-attempt email for Flutterwave's POST /customers.
+        // Flutterwave deduplicates customers by email — using the real user email
+        // causes "Customer already exists" on any second attempt while a prior
+        // intent is still unresolved. The reference is unique per attempt so this
+        // email is always fresh. We strip non-alphanumeric characters because
+        // Flutterwave's customer endpoint rejects email local-parts containing
+        // underscores or other special characters ("Request is not valid").
+        // The real user email is preserved in metadata for audit.
+        var syntheticEmail = reference.replaceAll("[^a-zA-Z0-9]", "") + "@customers.akwapay.com";
 
         var customer = new HashMap<String, Object>();
         customer.put("email", syntheticEmail);
