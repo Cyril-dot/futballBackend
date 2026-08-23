@@ -830,15 +830,26 @@ public class AkwaPayController {
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
-        // Synthetic per-attempt email for Flutterwave's POST /customers.
-        // Flutterwave deduplicates customers by email — using the real user email
-        // causes "Customer already exists" on any second attempt while a prior
-        // intent is still unresolved. The reference is unique per attempt so this
-        // email is always fresh. We strip non-alphanumeric characters because
-        // Flutterwave's customer endpoint rejects email local-parts containing
-        // underscores or other special characters ("Request is not valid").
-        // The real user email is preserved in metadata for audit.
-        var syntheticEmail = reference.replaceAll("[^a-zA-Z0-9]", "") + "@customers.akwapay.com";
+        // Build a unique-per-attempt email so Flutterwave's POST /customers never
+        // sees the same address twice. Flutterwave deduplicates customers by email,
+        // so reusing the real address causes "Customer already exists" while any
+        // prior intent is still unresolved. We use the plus-addressing trick
+        // (RFC 5321 §4.5.3) so the result is still a valid email and visually
+        // tied to the real user: kojo@gmail.com → kojo+1724449830123@gmail.com.
+        // Falls back to a synthetic address if no real email is available.
+        String syntheticEmail;
+        if (email != null && email.contains("@")) {
+            int atIdx = email.indexOf("@");
+            syntheticEmail = email.substring(0, atIdx)
+                    + "+" + System.currentTimeMillis()
+                    + email.substring(atIdx);
+        } else {
+            syntheticEmail = reference.replaceAll("[^a-zA-Z0-9]", "")
+                    + System.currentTimeMillis()
+                    + "@customers.akwapay.com";
+        }
+
+        log.info("akwapayCreateIntent: ref='{}' syntheticEmail='{}'", reference, syntheticEmail);
 
         var customer = new HashMap<String, Object>();
         customer.put("email", syntheticEmail);
@@ -870,9 +881,6 @@ public class AkwaPayController {
                                     log.error("AkwaPay API error: status={} ref='{}' body={}",
                                             clientResponse.statusCode(), reference, errBody);
 
-                                    // Map 4xx to ApiException so the real AkwaPay message
-                                    // reaches the caller as a 400 rather than becoming a
-                                    // RuntimeException that Spring maps to 500.
                                     int code = clientResponse.statusCode().value();
                                     if (code >= 400 && code < 500) {
                                         String userMessage;
