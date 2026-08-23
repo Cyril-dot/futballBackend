@@ -57,207 +57,52 @@ import java.util.UUID;
  * concrete behavioural differences matter here:
  *
  *   1. THE OTP FLOW ({@link #submitOtp}) MAY NO LONGER FIRE FOR MOMO.
- *      The comment block on submitOtp below describes the Moolre TP14 flow in
- *      detail — that flow was Moolre-specific. Flutterwave v4's mobile money
- *      charges use next_action.type = "payment_instruction" (a push prompt),
- *      NOT "submit_otp", for the mobile money charges this controller
- *      originates. In practice this means submitOtp should now see zero
- *      traffic for ordinary GHS mobile-money deposits. It is left in place
- *      unchanged because:
- *        a) AkwaPay's OTP-validate route is provider-agnostic — if AkwaPay's
- *           routing ever fails over to a gateway that DOES return
- *           submit_otp for mobile money, this path still works.
- *        b) As of this writing, AkwaPay's Flutterwave v4 adapter does NOT
- *           implement validateOtp() at all. If next_action.type ever comes
- *           back as "submit_otp" while Flutterwave is the active gateway,
- *           AkwaPay's server returns 501 "OTP validation is not implemented
- *           for provider 'flutterwave'". This has not been observed for
- *           mobile-money charges and is not expected to be, but if you see
- *           a 501 here, that is why — it is an AkwaPay-side gap, not a bug
- *           in this controller.
+ *      Flutterwave v4 mobile money uses next_action.type = "payment_instruction"
+ *      (a push prompt), NOT "submit_otp". submitOtp is kept in place in case
+ *      routing ever falls back to a gateway that still uses it.
  *
  *   2. next_action.type MAY VARY MORE THAN BEFORE.
- *      This was already true (see point 5 in the original notes below), but
- *      it is worth restating now that a second gateway with a different
- *      push-prompt message is in the mix. Nothing to change here — the
- *      frontend already branches on next_action.type and does not assume
- *      gateway-specific wording. Just don't add new logic that inspects the
- *      `hint` or `ussd_fallback` string content; treat those as opaque
- *      display text.
- *
- * Everything else below this notice is unchanged from before the gateway
- * switch and remains accurate.
+ *      The frontend already branches on next_action.type. Don't add logic that
+ *      inspects hint or ussd_fallback string content; treat those as opaque.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * RELIABILITY GUARANTEE — READ THIS FIRST
+ * REFERENCE FORMAT — HYPHENS NOT UNDERSCORES
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Webhooks are the fast path but are NOT the only path, and in this deployment
- * they have never once fired. Every credit applied in production so far has
- * come from the sweep below. Treat the sweep as the primary mechanism and the
- * webhook as an optimisation, not the other way round.
+ * Flutterwave uses our reference as tx_ref. Flutterwave's tx_ref validation
+ * rejects underscores — only alphanumeric characters and hyphens are accepted.
+ * References use hyphens as separators:
  *
- * Every intent this controller creates is written to the
- * `akwapay_pending_intents` table. A scheduled sweep
- * ({@link #reconcilePendingIntents}) polls AkwaPay directly every 2 minutes for
- * any row older than 3 minutes and applies the credit if AkwaPay says
- * `succeeded`. So as long as AkwaPay collected the money, the user WILL be
- * credited — even if:
- *   - the webhook never arrives at all (the current reality)
- *   - the webhook secret is wrong and we reject every delivery
- *   - this pod restarts mid-payment (the table survives; a map did not)
- *   - AkwaPay's own webhook worker is down
- *
- * The two paths are safe to run concurrently:
- *   - {@link WalletService#credit} dedupes on `reference` and returns 409 on a
- *     duplicate. Both the webhook handler and the sweep catch that 409 and skip
- *     silently. No double-credit is possible, whichever wins the race.
- *   - Whichever settles first deletes the row; the other's delete is a no-op.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WHY THE PENDING LEDGER IS A TABLE
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * It was a ConcurrentHashMap. That is fine until the process restarts, which on
- * a PaaS is constantly — the 2026-08-12 deploy log shows three restarts inside
- * ninety seconds. Two facts make an in-memory ledger unsafe here:
- *
- *   1. AkwaPay has NO endpoint that lists your payment intents. You can only
- *      GET one by id. An intent whose id we forget can never be asked about
- *      again — there is no way to rediscover it.
- *   2. The webhook does not fire. The fallback that justified holding this in
- *      memory is not operating.
- *
- * Together: intent created → deploy 30s later → map empties → no webhook ever
- * comes → AkwaPay collected the customer's money and this service holds no
- * record that it owes them anything. Silent and permanent.
- *
- * See {@link AkwaPayPendingIntent}.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * HOW THIS DIFFERS FROM {@code PaystackController} — READ BEFORE EDITING
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * 1. NO METADATA ON THE WEBHOOK.
- *    Paystack echoes back whatever metadata you sent at init, which is how the
- *    Paystack controller recovers the userId. AkwaPay does NOT. Its merchant
- *    event payload is exactly:
- *
- *        { id, type, sequence, created_at,
- *          data: { intent_id, amount, currency, reference, status } }
- *
- *    You may send `metadata` when creating the intent and it is stored, but it
- *    never comes back on the webhook. So the userId is encoded INTO the
- *    `reference` and parsed back out here. See {@link #buildReference} and
- *    {@link #parseReference}. Do not "simplify" the reference format — the
- *    webhook becomes unroutable if you do.
- *
- * 2. TWO SEPARATE SECRETS.
- *    Paystack signs webhooks with the same secret key you call the API with.
- *    AkwaPay does not:
- *
- *        sk_live_...   calls the API          (app.akwapay.secret-key)
- *        whsec_...     signs webhooks to you  (app.akwapay.webhook-secret)
- *
- *    The whsec is minted by POST /v1/webhook_endpoints and shown ONCE.
- *
- * 3. SIGNATURE SCHEME IS HMAC-SHA256 OVER "{timestamp}.{rawBody}", NOT SHA512
- *    OVER THE BODY ALONE, and it carries a replay window:
- *
- *        X-AkwaPay-Signature: t=1754049600,v1=5f3c9a...
- *
- *    Timestamps older than 5 minutes are rejected. See {@link #verifySignature}.
- *
- * 4. EVERY MUTATING CALL NEEDS AN Idempotency-Key HEADER.
- *    Same key + same body replays the stored response. Same key + DIFFERENT
- *    body returns 409. We send a fresh UUID per attempt and let the unique
- *    `reference` provide the real dedupe.
- *
- * 5. next_action IS NOT ALWAYS A PUSH PROMPT.
- *    Observed live on a mobile_money/MTN charge:
- *
- *        "next_action": { "type": "redirect",
- *                         "url": "https://checkout.flutterwave.com/captcha/..." }
- *
- *    AkwaPay routes across gateways and fails over, so two identical requests
- *    can return different next_action types. The frontend MUST branch on
- *    `next_action.type` (await_prompt | redirect | submit_otp | none) or just
- *    send the user to `checkout_url`, which handles all four.
- *
- * 6. AMOUNTS ARE INTEGER PESEWAS. GHS 50.00 is 5000. Sending 50.00 is a 400.
- *
- * 7. `unknown` IS A REAL STATUS AND IS NOT A FAILURE.
- *    It means AkwaPay asked a gateway to move money and got no clear answer.
- *    They poll until it resolves and then fire the webhook. Never re-charge on
- *    it, never fail the deposit on it — you will double-debit real people.
- *
- * 8. `method` AND `network` ARE BOTH REQUIRED WHEN THE METHOD IS mobile_money.
- *      a) omitting `method` → 400 invalid_method
- *      b) method=mobile_money with no `network` → 400 invalid_network
- *    This controller only originates GHS mobile-money deposits, so `method` is
- *    hardcoded in {@link #akwapayCreateIntent}. `network` is resolved with a
- *    two-step fallback in {@link #resolveNetwork}.
+ *     sbdep-<32-hex userId>-<8-hex nonce>     wallet deposit
+ *     sbadm-<32-hex userId>-<8-hex nonce>     admin upgrade
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Flutterwave v4's collection flow calls POST /customers before POST /charges.
- * Flutterwave deduplicates customers by email — if the same email appears on a
- * second POST /customers call while the first customer record still exists in
- * Flutterwave's system (i.e. a previous intent is still in an unresolved state),
- * Flutterwave returns "Customer already exists" which AkwaPay surfaces as a 402.
- *
- * Passing the real user email means every deposit attempt for the same user
- * hits this conflict. The fix is to pass a synthetic email derived from the
- * reference, which is unique per attempt:
- *
- *     {reference}@customers.akwapay.com
- *
- * This is exactly the fallback email AkwaPay's own Flutterwave v4 adapter uses
- * when no customer email is supplied (see flutterwave/v4/index.ts →
- * ensureCustomer: `${req.chargeId}@customers.akwapay.com`). We use the
- * reference instead of the chargeId because we don't have the chargeId at this
- * point, and the reference is equally unique per attempt.
- *
- * The real user email is still passed in metadata for audit purposes.
+ * Flutterwave v4 deduplicates customers by email. Reusing the real user email
+ * causes "Customer already exists" on any second attempt while a prior intent
+ * is still unresolved. We use plus-addressing to make the email unique per
+ * attempt: kojo@gmail.com → kojo+1724449830123@gmail.com. The real email is
+ * preserved in metadata for audit.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * OTP SUBMISSION — HOW IT WORKED WITH MOOLRE (LEGACY GATEWAY, KEPT FOR REFERENCE)
+ * RELIABILITY GUARANTEE
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * When AkwaPay routed a charge through Moolre and Moolre returned code TP14
- * ("OTP required"), the create-intent response carried:
- *
- *     next_action: { type: "submit_otp", hint: "<json>" }
- *
- * The OTP the customer typed had to be submitted to:
- *
- *     POST /v1/checkout/{intentId}/validate?cs={client_secret}
- *     body: { "otp": "<code>" }
- *
- * That is AkwaPay's PUBLIC checkout-validate route (no API secret key needed —
- * the client_secret in the query string IS the authentication). AkwaPay's
- * server.ts then called moolreProvider.validateOtp(), which re-called Moolre's
- * POST /open/transact/payment with the original body + otpcode. Moolre
- * accepted (TR099) and THEN sent the MoMo push prompt to the customer's
- * handset. Without this step the push prompt was never sent.
- *
- * As of the Flutterwave v4 switch, this path is not expected to be exercised
- * for ordinary mobile-money deposits — see the gateway-change notice at the
- * top of this class. The code is left in place, unchanged, in case AkwaPay's
- * routing ever falls back to a gateway that still uses this flow.
+ * Webhooks have never fired in production. Every credit has come from the
+ * reconciliation sweep ({@link #reconcilePendingIntents}). Treat the sweep as
+ * the primary mechanism. Both paths dedupe via WalletService.credit() (409 on
+ * duplicate reference) so no double-credit is possible whichever wins the race.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WEBHOOK PAYLOAD — CONFIRMED FROM OFFICIAL AKWAPAY SOURCE
+ * WEBHOOK PAYLOAD
  * ─────────────────────────────────────────────────────────────────────────────
- *
- * From packages/worker/src/webhook-sender.ts → paymentIntentEvent():
  *
  *   {
  *     "id":         "evt_<chargePublicId>",
  *     "type":       "payment_intent.succeeded",
- *     "sequence":   <int — increases per intent; discard lower than seen>,
+ *     "sequence":   <int>,
  *     "created_at": "<ISO-8601>",
  *     "data": {
  *       "intent_id": "<pi_...>",
@@ -268,8 +113,8 @@ import java.util.UUID;
  *     }
  *   }
  *
- * IDEMPOTENCY — delivery is at-least-once. The same event WILL arrive twice.
- * Deduped inside WalletService.credit() via the reference (409 → skip).
+ * Delivery is at-least-once. Deduped inside WalletService.credit() via the
+ * reference (409 → skip).
  */
 @Slf4j
 @EnableScheduling
@@ -282,11 +127,12 @@ public class AkwaPayController {
 
     private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
 
-    private static final String REF_PREFIX_DEPOSIT = "sbdep_";
-    private static final String REF_PREFIX_ADMIN   = "sbadm_";
+    // Hyphens only — Flutterwave rejects underscores in tx_ref.
+    private static final String REF_PREFIX_DEPOSIT = "sbdep-";
+    private static final String REF_PREFIX_ADMIN   = "sbadm-";
 
-    private final Duration akwapayTimeout       = Duration.ofSeconds(15);
-    private final long     akwapayRetryAttempts  = 2;
+    private final Duration akwapayTimeout      = Duration.ofSeconds(15);
+    private final long     akwapayRetryAttempts = 2;
 
     private static final long     SIGNATURE_TOLERANCE_SECONDS = 300;
     private static final Duration SWEEP_HEAD_START            = Duration.ofSeconds(5);
@@ -830,13 +676,11 @@ public class AkwaPayController {
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
-        // Build a unique-per-attempt email so Flutterwave's POST /customers never
-        // sees the same address twice. Flutterwave deduplicates customers by email,
-        // so reusing the real address causes "Customer already exists" while any
-        // prior intent is still unresolved. We use the plus-addressing trick
-        // (RFC 5321 §4.5.3) so the result is still a valid email and visually
-        // tied to the real user: kojo@gmail.com → kojo+1724449830123@gmail.com.
-        // Falls back to a synthetic address if no real email is available.
+        // Unique-per-attempt email using plus-addressing so Flutterwave's
+        // POST /customers never sees the same address twice. Flutterwave
+        // deduplicates customers by email — reusing the real address causes
+        // "Customer already exists" while any prior intent is still unresolved.
+        // kojo@gmail.com → kojo+1724449830123@gmail.com
         String syntheticEmail;
         if (email != null && email.contains("@")) {
             int atIdx = email.indexOf("@");
@@ -948,9 +792,10 @@ public class AkwaPayController {
 
     private String buildReference(String prefix, UUID userId) {
         var nonce = Long.toHexString(System.nanoTime() & 0xFFFFFFFFL);
+        // Hyphens only — Flutterwave rejects underscores in tx_ref.
         return prefix
                 + userId.toString().replace("-", "")
-                + "_"
+                + "-"
                 + String.format("%8s", nonce).replace(' ', '0');
     }
 
