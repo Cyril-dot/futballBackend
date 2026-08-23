@@ -199,6 +199,30 @@ import java.util.UUID;
  *    two-step fallback in {@link #resolveNetwork}.
  *
  * ─────────────────────────────────────────────────────────────────────────────
+ * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Flutterwave v4's collection flow calls POST /customers before POST /charges.
+ * Flutterwave deduplicates customers by email — if the same email appears on a
+ * second POST /customers call while the first customer record still exists in
+ * Flutterwave's system (i.e. a previous intent is still in an unresolved state),
+ * Flutterwave returns "Customer already exists" which AkwaPay surfaces as a 402.
+ *
+ * Passing the real user email means every deposit attempt for the same user
+ * hits this conflict. The fix is to pass a synthetic email derived from the
+ * reference, which is unique per attempt:
+ *
+ *     {reference}@customers.akwapay.com
+ *
+ * This is exactly the fallback email AkwaPay's own Flutterwave v4 adapter uses
+ * when no customer email is supplied (see flutterwave/v4/index.ts →
+ * ensureCustomer: `${req.chargeId}@customers.akwapay.com`). We use the
+ * reference instead of the chargeId because we don't have the chargeId at this
+ * point, and the reference is equally unique per attempt.
+ *
+ * The real user email is still passed in metadata for audit purposes.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  * OTP SUBMISSION — HOW IT WORKED WITH MOOLRE (LEGACY GATEWAY, KEPT FOR REFERENCE)
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -223,11 +247,6 @@ import java.util.UUID;
  * for ordinary mobile-money deposits — see the gateway-change notice at the
  * top of this class. The code is left in place, unchanged, in case AkwaPay's
  * routing ever falls back to a gateway that still uses this flow.
- *
- * This controller proxies that call at {@link #submitOtp} so the frontend
- * never needs to know AkwaPay's base URL or manage CORS. The frontend POSTs
- * { intentId, clientSecret, otp } to /api/wallet/deposit/akwapay/otp and
- * this method forwards them correctly.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WEBHOOK PAYLOAD — CONFIRMED FROM OFFICIAL AKWAPAY SOURCE
@@ -266,12 +285,12 @@ public class AkwaPayController {
     private static final String REF_PREFIX_DEPOSIT = "sbdep_";
     private static final String REF_PREFIX_ADMIN   = "sbadm_";
 
-    private final Duration akwapayTimeout = Duration.ofSeconds(15);
-    private final long akwapayRetryAttempts = 2;
+    private final Duration akwapayTimeout       = Duration.ofSeconds(15);
+    private final long     akwapayRetryAttempts  = 2;
 
-    private static final long SIGNATURE_TOLERANCE_SECONDS = 300;
-    private static final Duration SWEEP_HEAD_START = Duration.ofSeconds(5);
-    private static final long SWEEP_INTERVAL_MS = 5_000;
+    private static final long     SIGNATURE_TOLERANCE_SECONDS = 300;
+    private static final Duration SWEEP_HEAD_START            = Duration.ofSeconds(5);
+    private static final long     SWEEP_INTERVAL_MS           = 5_000;
 
     private static final Duration TIER_HOT_UNTIL  = Duration.ofMinutes(2);
     private static final Duration TIER_WARM_UNTIL = Duration.ofMinutes(10);
@@ -291,13 +310,13 @@ public class AkwaPayController {
         for (var p : new String[]{"026", "027", "056", "057"})               GH_NETWORK_PREFIXES.put(p, "AIRTELTIGO");
     }
 
-    private final WalletService                    walletService;
-    private final UserService                      userService;
-    private final AdminUpgradeChatService          adminUpgradeChatService;
-    private final ReferralService                  referralService;
-    private final AkwaPayPendingIntentRepository   pendingIntents;
-    private final WebClient.Builder                webClientBuilder;
-    private final ObjectMapper                     objectMapper;
+    private final WalletService                  walletService;
+    private final UserService                    userService;
+    private final AdminUpgradeChatService        adminUpgradeChatService;
+    private final ReferralService                referralService;
+    private final AkwaPayPendingIntentRepository pendingIntents;
+    private final WebClient.Builder              webClientBuilder;
+    private final ObjectMapper                   objectMapper;
 
     @Value("${app.akwapay.secret-key}")              private String     secretKey;
     @Value("${app.akwapay.webhook-secret}")          private String     webhookSecret;
@@ -811,12 +830,17 @@ public class AkwaPayController {
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
+        // Use a per-attempt synthetic email so Flutterwave's POST /customers
+        // never sees the same email twice across retries or repeat deposits.
+        // Flutterwave deduplicates customers by email — passing the real user
+        // email causes "Customer already exists" on any second attempt while
+        // a prior intent is still unresolved. The reference is unique per
+        // attempt so this email is always fresh. The real email is in metadata.
+        // See the class-level comment "WHY customer.email IS SYNTHETIC" above.
+        var syntheticEmail = reference + "@customers.akwapay.com";
+
         var customer = new HashMap<String, Object>();
-        // Use reference as the customer id — it is unique per attempt, so
-        // Flutterwave never sees two attempts as the same customer and never
-        // returns "Customer already exists".
-        customer.put("id", reference);
-        if (email != null && !email.isBlank()) customer.put("email", email);
+        customer.put("email", syntheticEmail);
         if (phone != null && !phone.isBlank()) customer.put("phone", phone);
 
         var body = new HashMap<String, Object>();
@@ -825,10 +849,9 @@ public class AkwaPayController {
         body.put("reference",  reference);
         body.put("return_url", returnUrl);
         body.put("metadata",   metadata);
-        if (!customer.isEmpty()) body.put("customer", customer);
-
-        body.put("method",  "mobile_money");
-        body.put("network", network.toUpperCase());
+        body.put("customer",   customer);
+        body.put("method",     "mobile_money");
+        body.put("network",    network.toUpperCase());
 
         var idempotencyKey = UUID.randomUUID().toString();
 
