@@ -812,6 +812,10 @@ public class AkwaPayController {
                                                     Map<String, Object> metadata) {
 
         var customer = new HashMap<String, Object>();
+        // Use reference as the customer id — it is unique per attempt, so
+        // Flutterwave never sees two attempts as the same customer and never
+        // returns "Customer already exists".
+        customer.put("id", reference);
         if (email != null && !email.isBlank()) customer.put("email", email);
         if (phone != null && !phone.isBlank()) customer.put("phone", phone);
 
@@ -842,9 +846,9 @@ public class AkwaPayController {
                                     log.error("AkwaPay API error: status={} ref='{}' body={}",
                                             clientResponse.statusCode(), reference, errBody);
 
-                                    // Map 4xx errors to ApiException so the real AkwaPay
-                                    // message reaches the caller as a 400 rather than
-                                    // becoming a RuntimeException that Spring maps to 500.
+                                    // Map 4xx to ApiException so the real AkwaPay message
+                                    // reaches the caller as a 400 rather than becoming a
+                                    // RuntimeException that Spring maps to 500.
                                     int code = clientResponse.statusCode().value();
                                     if (code >= 400 && code < 500) {
                                         String userMessage;
