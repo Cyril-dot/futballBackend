@@ -115,6 +115,16 @@ import java.util.UUID;
  *
  * Delivery is at-least-once. Deduped inside WalletService.credit() via the
  * reference (409 → skip).
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * COMMISSION CREDITING — ALIGNED WITH PAYSTACK PATTERN (2026-08-25)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Same rule as PaystackMobileMoneyController.handleDeposit: as soon as the
+ * depositing user's wallet is successfully credited, referral commission is
+ * attributed unconditionally in the same call — no separate flag, no extra
+ * gating condition beyond "the deposit credit succeeded". Commission failure
+ * is caught and logged but never rolls back the deposit, matching Paystack.
  */
 @Slf4j
 @EnableScheduling
@@ -569,6 +579,13 @@ public class AkwaPayController {
 
     // ─── Private handlers ─────────────────────────────────────────────────────
 
+    /**
+     * Matches PaystackMobileMoneyController.handleDeposit exactly:
+     * 1. Credit the wallet.
+     * 2. Immediately, unconditionally attribute referral commission on the
+     *    same successful credit — no separate gate, no missing call path.
+     * 3. Commission failures are caught/logged but never roll back the credit.
+     */
     private void handleDeposit(UUID userId, String ref, BigDecimal amount, String intentId) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}' intent='{}'",
                 userId, amount, ref, intentId);
@@ -589,6 +606,7 @@ public class AkwaPayController {
             log.info("handleDeposit: commission attributed for userId='{}' deposit={} adminRate={}",
                     userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {
+            // Commission failure must NEVER roll back the deposit — matches Paystack.
             log.error("handleDeposit: commission attribution failed for userId='{}' — investigate",
                     userId, ex);
         }

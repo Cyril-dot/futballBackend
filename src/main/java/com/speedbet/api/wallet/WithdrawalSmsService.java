@@ -1,8 +1,9 @@
 package com.speedbet.api.wallet;
 
+import com.speedbet.api.wallet.jetsms.JestSmsService;
+import com.speedbet.api.wallet.jetsms.SmsAccessConfig;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -20,19 +21,20 @@ import java.time.LocalDateTime;
  *   REJECTED  (admin rejects)         → notifyWithdrawalRejected(...)
  *   FAILED    (super admin marks failed) → notifyWithdrawalFailed(...)
  *
- * No method sends more than one SMS. The old "probe" message that was fired
- * before every confirmation/rejection has been removed — it was telling
- * rejected users that their money was on its way.
+ * No method sends more than one SMS.
+ *
+ * Now dispatches through JestSmsService instead of ArkeselSmsService.
+ * Site name is pulled from SmsAccessConfig.getAllowedSiteName() (bound to
+ * the SMS_ALLOWED_SITE_NAME env var) rather than app.site.name, so it stays
+ * consistent with the value used in JestSmsService's own templates.
  */
 @Service
 @RequiredArgsConstructor
 @Slf4j
 public class WithdrawalSmsService {
 
-    private final ArkeselSmsService arkeselSmsService;
-
-    @Value("${app.site.name:HootBet}")
-    private String siteName;
+    private final JestSmsService jestSmsService;
+    private final SmsAccessConfig accessConfig;
 
     // ─────────────────────────────────────────────────────────────────────────
     // Helpers
@@ -58,6 +60,10 @@ public class WithdrawalSmsService {
             return firstName;
         }
         return "Customer";
+    }
+
+    private String siteName() {
+        return accessConfig.getAllowedSiteName();
     }
 
     /**
@@ -86,7 +92,7 @@ public class WithdrawalSmsService {
         log.info("{}: sending SMS — phone='{}' messageLength={}", stage, phoneNumber, message.length());
         log.debug("{}: message body → {}", stage, message);
         try {
-            arkeselSmsService.sendSms(phoneNumber, message);
+            jestSmsService.sendSms(phoneNumber, message);
             log.info("{}: SMS dispatched — phone='{}'", stage, phoneNumber);
         } catch (Exception e) {
             log.error("{}: FAILED to send SMS — phone='{}' error='{}'",
@@ -123,7 +129,7 @@ public class WithdrawalSmsService {
                         "Thank you for using %s.",
                 resolveDisplayName(accountName, firstName),
                 formatAmount(amount),
-                siteName
+                siteName()
         );
 
         dispatch(stage, phoneNumber, message);
@@ -171,7 +177,7 @@ public class WithdrawalSmsService {
                         "Thank you for using %s.",
                 resolveDisplayName(accountName, firstName),
                 formatAmount(amount),
-                siteName
+                siteName()
         );
 
         dispatch(stage, phoneNumber, message);
@@ -235,7 +241,7 @@ public class WithdrawalSmsService {
                 "GHS %s has been sent to you!%nHi %s, %s has just paid out GHS %s to your wallet.",
                 formattedAmount,
                 resolveDisplayName(accountName, firstName),
-                siteName,
+                siteName(),
                 formattedAmount
         );
 
@@ -319,7 +325,7 @@ public class WithdrawalSmsService {
                         "returned to your %s wallet. Please contact support if you need assistance.",
                 resolveDisplayName(accountName, firstName),
                 formatAmount(amount),
-                siteName
+                siteName()
         );
 
         dispatch(stage, phoneNumber, message);
@@ -385,7 +391,7 @@ public class WithdrawalSmsService {
                 resolveDisplayName(accountName, firstName),
                 formattedAmount,
                 formattedAmount,
-                siteName
+                siteName()
         );
 
         dispatch(stage, phoneNumber, message);
