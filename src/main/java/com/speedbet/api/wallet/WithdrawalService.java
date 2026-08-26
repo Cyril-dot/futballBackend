@@ -8,6 +8,7 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -35,7 +36,8 @@ public class WithdrawalService {
     private final AuditService                auditService;
     private final EntityManager               em;
     private final WithdrawalEmailService      withdrawalEmailService;
-    private final WithdrawalSmsService        withdrawalSmsService;
+    @Autowired(required = false)
+    private WithdrawalSmsService withdrawalSmsService;
 
     @Value("${app.withdrawal.min-amount:5}")
     private BigDecimal minWithdrawalAmount;
