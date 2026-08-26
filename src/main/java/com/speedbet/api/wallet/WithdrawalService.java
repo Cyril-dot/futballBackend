@@ -8,7 +8,6 @@ import jakarta.persistence.EntityManager;
 import jakarta.persistence.LockModeType;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -36,14 +35,12 @@ public class WithdrawalService {
     private final AuditService                auditService;
     private final EntityManager               em;
     private final WithdrawalEmailService      withdrawalEmailService;
-    @Autowired(required = false)
-    private WithdrawalSmsService withdrawalSmsService;
 
     @Value("${app.withdrawal.min-amount:5}")
     private BigDecimal minWithdrawalAmount;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Submit  ← user gets "request received / pending" SMS
+    // Submit
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto submitRequest(UUID userId, WithdrawalRequestDto req) {
@@ -107,25 +104,11 @@ public class WithdrawalService {
         log.info("Withdrawal request {} created for user {} — amount {} {}",
                 savedRequest.getId(), userId, req.getAmount(), savedRequest.getCurrency());
 
-        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        // The greeting name is the account name entered on the withdrawal form,
-        // falling back to the profile first name only when it is blank.
-        notifySafely("withdrawal-pending", savedRequest.getId(), () ->
-                withdrawalSmsService.notifyWithdrawalPending(
-                        resolvePhoneForSms(savedRequest.getAccountNumber(), user.getPhone()),
-                        resolveDisplayName(savedRequest.getAccountName(), user.getFirstName()),
-                        savedRequest.getAccountName(),
-                        savedRequest.getAmount(),
-                        newBalance,
-                        null,                            // reference — not included in SMS
-                        LocalDateTime.now()
-                ));
-
         return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Approve  ← admins get email, user gets "on its way" SMS
+    // Approve
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalDto approve(UUID requestId, UUID adminId, String note) {
@@ -167,33 +150,11 @@ public class WithdrawalService {
             ));
         });
 
-        // ── Resolve wallet balance after the hold deduction ───────────────────
-        BigDecimal walletBalance = walletRepo.findByUserId(u.getId())
-                .map(Wallet::getBalance)
-                .orElse(null);
-
-        // ── Fee is GHS 0.00 for MoMo withdrawals (no platform fee deducted) ──
-        BigDecimal fee = BigDecimal.ZERO;
-
-        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        notifySafely("withdrawal-approved", requestId, () ->
-                withdrawalSmsService.notifyWithdrawalApproved(
-                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
-                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
-                        savedRequest.getAccountName(),
-                        savedRequest.getAmount(),
-                        fee,
-                        walletBalance,
-                        null,   // transactionId — not included in SMS
-                        null,   // reference — not included in SMS
-                        now
-                ));
-
         return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Reject  ← admins get email, user gets rejection SMS
+    // Reject
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto reject(UUID requestId, UUID adminId, String note) {
@@ -215,7 +176,6 @@ public class WithdrawalService {
                 walletRepo.findByUserId(savedRequest.getUser().getId()).orElseThrow().getId(),
                 LockModeType.PESSIMISTIC_WRITE);
 
-        // ── Restore the held amount back to the wallet ────────────────────────
         BigDecimal restoredBalance = wallet.getBalance().add(savedRequest.getAmount(), MathContext.DECIMAL64);
         wallet.setBalance(restoredBalance);
         walletRepo.save(wallet);
@@ -256,25 +216,11 @@ public class WithdrawalService {
             ));
         });
 
-        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        notifySafely("withdrawal-rejected", requestId, () ->
-                withdrawalSmsService.notifyWithdrawalRejected(
-                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
-                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
-                        savedRequest.getAccountName(),
-                        savedRequest.getAmount(),
-                        note,
-                        restoredBalance,
-                        null,   // transactionId — not included in SMS
-                        null,   // reference — not included in SMS
-                        now
-                ));
-
         return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Settle  ← user gets the "money has been sent to you" SMS
+    // Settle
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional
     public WithdrawalDto settle(UUID requestId, UUID superAdminId, String note) {
@@ -303,36 +249,11 @@ public class WithdrawalService {
                         "userId", savedRequest.getUser().getId().toString()),
                 null);
 
-        final var u = savedRequest.getUser();
-        final LocalDateTime now = LocalDateTime.now();
-
-        // ── Balance is unchanged at settle time (the hold already deducted it) ─
-        BigDecimal walletBalance = walletRepo.findByUserId(u.getId())
-                .map(Wallet::getBalance)
-                .orElse(null);
-
-        // ── Fee is GHS 0.00 for MoMo withdrawals (no platform fee deducted) ──
-        BigDecimal fee = BigDecimal.ZERO;
-
-        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        notifySafely("withdrawal-settled", requestId, () ->
-                withdrawalSmsService.notifyWithdrawalSettled(
-                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
-                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
-                        savedRequest.getAccountName(),
-                        savedRequest.getAmount(),
-                        fee,
-                        walletBalance,
-                        null,   // transactionId — not included in SMS
-                        null,   // reference — not included in SMS
-                        now
-                ));
-
         return WithdrawalDto.from(savedRequest);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Mark failed  ← user gets "could not be completed, funds returned" SMS
+    // Mark failed
     // ─────────────────────────────────────────────────────────────────────────
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public WithdrawalDto markFailed(UUID requestId, UUID superAdminId, String note) {
@@ -374,21 +295,6 @@ public class WithdrawalService {
                         "note",   note != null ? note : "",
                         "userId", savedRequest.getUser().getId().toString()),
                 null);
-
-        final var u = savedRequest.getUser();
-
-        // ── SMS → user's MoMo number (falls back to profile phone) ───────────
-        notifySafely("withdrawal-failed", requestId, () ->
-                withdrawalSmsService.notifyWithdrawalFailed(
-                        resolvePhoneForSms(savedRequest.getAccountNumber(), u.getPhone()),
-                        resolveDisplayName(savedRequest.getAccountName(), u.getFirstName()),
-                        savedRequest.getAccountName(),
-                        savedRequest.getAmount(),
-                        note,
-                        restoredBalance,
-                        null,   // reference — not included in SMS
-                        LocalDateTime.now()
-                ));
 
         return WithdrawalDto.from(savedRequest);
     }
@@ -461,43 +367,6 @@ public class WithdrawalService {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * For mobile-money withdrawals the accountNumber IS the MoMo number, so
-     * that's the right place to send the confirmation SMS. Falls back to the
-     * user's profile phone if accountNumber is blank.
-     */
-    private String resolvePhoneForSms(String accountNumber, String profilePhone) {
-        if (accountNumber != null && !accountNumber.isBlank()) {
-            return accountNumber;
-        }
-        return profilePhone;
-    }
-
-    /**
-     * The name shown in withdrawal notifications is the account name the user
-     * typed on the withdrawal form — that's the name the money is actually
-     * going to, and the one they expect to see confirmed back to them. The
-     * profile first name is only a fallback for older requests that were saved
-     * without an account name.
-     */
-    private String resolveDisplayName(String accountName, String profileFirstName) {
-        if (accountName != null && !accountName.isBlank()) {
-            return accountName.trim();
-        }
-        return profileFirstName;
-    }
-
-    /**
-     * Sends a notification without letting a messaging failure take the
-     * surrounding transaction down with it.
-     *
-     * Previously an SMS or email exception propagated out of these
-     * @Transactional methods, which rolled back the withdrawal row, the balance
-     * change and the ledger entry — the user got a 500 and nothing was saved
-     * even though the money movement itself had succeeded. A notification is
-     * not worth reversing a financial operation over; if it fails we log it and
-     * carry on.
-     */
     private void notifySafely(String label, UUID requestId, Runnable action) {
         try {
             action.run();
