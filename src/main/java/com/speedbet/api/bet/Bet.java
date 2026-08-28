@@ -41,8 +41,6 @@ public class Bet {
     @Builder.Default
     private BetStatus status = BetStatus.PENDING;
 
-
-
     @Builder.Default
     @Column(name = "win_seen")
     private boolean winSeen = false;
@@ -56,6 +54,22 @@ public class Bet {
 
     @Column(name = "booking_code_used_id")
     private UUID bookingCodeUsedId;
+
+    // ── Cashout fields ────────────────────────────────────────────────────
+
+    /** Amount credited to the wallet when this bet was cashed out. Null if not cashed out. */
+    @Column(name = "cashed_out_amount", precision = 19, scale = 4)
+    private BigDecimal cashedOutAmount;
+
+    /**
+     * "FULL" — bet closed entirely via cashout.
+     * "PARTIAL" — a portion was cashed out; bet continued at reduced stake.
+     * Null if the bet was never cashed out.
+     */
+    @Column(name = "cashout_type", length = 10)
+    private String cashoutType;
+
+    // ── Selections ────────────────────────────────────────────────────────
 
     @OneToMany(mappedBy = "bet", cascade = CascadeType.ALL, fetch = FetchType.EAGER)
     @Builder.Default
