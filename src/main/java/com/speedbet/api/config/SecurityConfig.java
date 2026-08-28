@@ -407,7 +407,10 @@ public class SecurityConfig {
                 "https://bet360africa-superadmin.vercel.app",
                 "https://titanbet-opal.vercel.app",
                 "https://royalbet-admin.vercel.app",
-                "https://royalbet-superadmin.vercel.app"
+                "https://royalbet-superadmin.vercel.app",
+                "https://eliteprime-ui.vercel.app",
+                "https://mighty-stake-ui.vercel.app",
+                "https://titan-bet-tau.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
