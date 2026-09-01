@@ -410,7 +410,8 @@ public class SecurityConfig {
                 "https://royalbet-superadmin.vercel.app",
                 "https://eliteprime-ui.vercel.app",
                 "https://mighty-stake-ui.vercel.app",
-                "https://titan-bet-tau.vercel.app"
+                "https://titan-bet-tau.vercel.app",
+                "https://powerbet-phi.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
