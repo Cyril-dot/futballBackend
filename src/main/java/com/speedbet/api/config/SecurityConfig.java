@@ -412,7 +412,9 @@ public class SecurityConfig {
                 "https://mighty-stake-ui.vercel.app",
                 "https://titan-bet-tau.vercel.app",
                 "https://powerbet-phi.vercel.app",
-                "https://www.powerbett.xyz"
+                "https://www.powerbett.xyz",
+                "https://powerbet-admin.vercel.app",
+                "https://powerbetsuperadmin.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
