@@ -207,7 +207,12 @@ public class RushPayController {
             // user isn't left with a dangling pending reference they can't reuse.
             pendingRefs.remove(ref);
             log.error("initMobileMoneyDeposit: initiate-mobile-money failed ref='{}' — {}", ref, ex.getMessage());
-            throw ex;
+            // Re-thrown as ApiException so the real RushPay error reaches the
+            // frontend instead of being flattened into a generic 500 by the
+            // global handler. This is a payment-gateway response, not a bug
+            // in our own code, so a 400 with RushPay's message is more honest
+            // than a 500 anyway.
+            throw ApiException.badRequest("RushPay could not start the mobile money charge: " + ex.getMessage());
         }
 
         @SuppressWarnings("unchecked")
