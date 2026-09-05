@@ -173,7 +173,9 @@ public class RushPayController {
         if (provider.isBlank())
             throw ApiException.badRequest("provider (network) is required.");
 
-        var phone = normalizeGhMsisdn(phoneRaw);
+        var phone = normalizeGhLocalPhone(phoneRaw);
+        if (phone == null)
+            throw ApiException.badRequest("Enter a valid 10-digit Ghanaian Mobile Money phone number.");
 
         log.info("initMobileMoneyDeposit: userId='{}' amount={} provider='{}'", user.getId(), amount, provider);
 
@@ -665,16 +667,24 @@ public class RushPayController {
     }
 
     /**
-     * Normalizes a Ghanaian mobile number to the local MSISDN form RushPay's
-     * examples use elsewhere in the docs (no leading '+', includes country
-     * code): "0244123456" -> "233244123456", "+233244123456" -> "233244123456",
-     * "233244123456" -> unchanged.
+     * Normalizes a Ghanaian mobile number to the plain local 10-digit form
+     * RushPay's initiate-mobile-money validator actually wants: "0244123456".
+     * (An earlier version of this normalized to E.164 with the 233 country
+     * code — RushPay rejected that with "Enter a valid 10-digit Ghanaian
+     * Mobile Money phone number." This accepts local, +233, and 233-prefixed
+     * input and always outputs the 0-prefixed 10-digit local form.)
+     * Returns null if the result isn't a valid-looking 10-digit local number.
      */
-    private String normalizeGhMsisdn(String raw) {
+    private String normalizeGhLocalPhone(String raw) {
         var digits = raw.replaceAll("[^0-9]", "");
-        if (digits.startsWith("233")) return digits;
-        if (digits.startsWith("0"))   return "233" + digits.substring(1);
-        return "233" + digits;
+        if (digits.startsWith("233") && digits.length() == 12) {
+            digits = "0" + digits.substring(3);
+        } else if (digits.length() == 9 && !digits.startsWith("0")) {
+            // e.g. "244123456" with the leading 0 dropped
+            digits = "0" + digits;
+        }
+        if (digits.length() != 10 || !digits.startsWith("0")) return null;
+        return digits;
     }
 
     // ─── Signature verification ───────────────────────────────────────────────
