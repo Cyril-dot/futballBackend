@@ -37,36 +37,35 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * RushPay Core v2 payment gateway controller.
  *
- * ARCHITECTURE FIX (was: server-side widget-session proxy; now: browser-direct widget calls)
+ * ARCHITECTURE — full backend integration
  * ─────────────────────────────────────────────────────────────────────────────────────────
- * The previous version tried to proxy widget-session-authenticated calls (initiate-mobile-money,
- * submit-momo-otp, charge-status, etc.) through this backend by holding the widget_session_token
- * server-side. RushPay rejected every proxied call with "Invalid or expired access token" (HTTP 400)
- * because widget sessions are scoped to the browser context that requested them — they are NOT
- * server-to-server credentials. This controller was the wrong place for those calls.
+ * Per RushPay's published API docs (https://rushpay.cash/api-docs), the endpoints used to
+ * fund a mobile money charge — initiate-mobile-money, submit-momo-otp, charge-status — are
+ * documented as "Auth: Widget", i.e. they only require the X-RushPay-Widget-Session header.
+ * Nothing in the docs restricts that header to browser-origin requests, so this controller
+ * mints the widget session AND calls initiate-mobile-money itself, server-to-server. The
+ * browser never talks to RushPay Core directly and never sees the widget session token.
  *
- * CORRECT FLOW:
- *   1. Browser calls POST /api/wallet/deposit/rushpay/init  →  backend mints checkout via
- *      X-API-Key, then mints a widget session, returns BOTH to the browser.
+ * FLOW:
+ *   1. Browser calls POST /api/wallet/deposit/rushpay/init-momo with { amount, phone, provider }.
+ *   2. Backend (X-API-Key) creates a checkout, mints a widget session, then (X-RushPay-Widget-Session)
+ *      calls initiate-mobile-money itself. Returns { payment_reference, status } to the browser.
+ *   3. Browser polls GET /api/wallet/deposit/rushpay/status?ref=... (X-API-Key, server-to-server)
+ *      to check payment status and credit the wallet.
+ *   4. RushPay webhook POST /api/webhooks/rushpay → verify signature → credit wallet / upgrade admin.
  *
- *   2. Browser holds widget_session_token in memory (never persisted to localStorage) and
- *      calls RushPay Core directly:
- *        POST core.rushpay.cash/api/v1/merchant/payments/initiate-mobile-money  (X-RushPay-Widget-Session)
- *        POST core.rushpay.cash/api/v1/merchant/payments/submit-momo-otp        (X-RushPay-Widget-Session)
- *        GET  core.rushpay.cash/api/v1/merchant/payments/charge-status          (X-RushPay-Widget-Session)
- *        ... and any other widget-session endpoints
+ * NOTE: an earlier version of this integration tried the same server-side proxy and got
+ * "Invalid or expired access token" (HTTP 400) from RushPay on the widget-session-authenticated
+ * calls. That failure was never conclusively diagnosed — it may have been a stale/reused
+ * session, a header issue, or a real browser-binding restriction RushPay doesn't document.
+ * If /init-momo starts failing again with an auth/session error specifically (as opposed to a
+ * plain validation error like "phone and provider are required"), that's real evidence the
+ * session is browser-bound, and the initiate-mobile-money call should move back to the browser
+ * (X-RushPay-Widget-Session called directly from client JS) while this endpoint just returns
+ * payment_reference + widget_session_token as it did before.
  *
- *   3. Browser polls our backend GET /api/wallet/deposit/rushpay/status?ref=... which uses
- *      X-API-Key (server-to-server) to check payment status and credit the wallet.
- *
- *   4. RushPay webhook POST /api/webhooks/rushpay  →  verify signature → credit wallet / upgrade admin.
- *
- * SECURITY NOTE on returning widget_session_token to the browser:
- *   The widget session token is intentionally short-lived and scoped to one payment reference.
- *   It cannot be used to access merchant-level data (that requires X-API-Key). Returning it
- *   to the browser is the documented RushPay pattern — the hosted widget JS does exactly this.
- *   It is equivalent in sensitivity to a Stripe client_secret: safe to send to the browser,
- *   not safe to log or store long-term.
+ * The legacy deposit-init endpoint below (/init) is kept as-is for that fallback path and for
+ * the admin-upgrade flow, which still hands the widget session to the browser.
  */
 @Slf4j
 @RestController
@@ -107,14 +106,13 @@ public class RushPayController {
     @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minDeposit;
     @Value("${app.platform.frontend-url}")           private String     frontendUrl;
 
-    // ─── Deposit Init ─────────────────────────────────────────────────────────
+    // ─── Deposit Init (legacy / fallback — browser calls RushPay Core directly) ─
 
     /**
      * Creates a RushPay checkout and a widget session, returns both to the browser.
-     *
-     * The browser will use payment_reference to poll our /status endpoint,
-     * and widget_session_token to call RushPay Core directly for the funding
-     * steps (initiate-mobile-money, submit-momo-otp, charge-status, etc.).
+     * Kept as a fallback: if /init-momo below turns out to be blocked by a real
+     * browser-binding restriction on widget sessions, the frontend can go back to
+     * calling RushPay Core directly with this payment_reference + widget_session_token.
      *
      * Response: { payment_reference: "API...", widget_session_token: "..." }
      */
@@ -139,15 +137,92 @@ public class RushPayController {
         var ref = session.get("payment_reference").toString();
         log.info("initDeposit: checkout created ref='{}' userId='{}'", ref, user.getId());
 
-        // Track ref → userId for the status-poll ownership check.
         pendingRefs.put(ref, user.getId());
 
-        // Return both tokens to the browser. The browser uses widget_session_token
-        // to call RushPay directly; it uses payment_reference to poll our /status.
         return ResponseEntity.ok(ApiResponse.ok(session));
     }
 
-    // ─── Admin Upgrade Init ───────────────────────────────────────────────────
+    // ─── Mobile Money Deposit — full backend integration ───────────────────────
+
+    /**
+     * Does create → widget-session → initiate-mobile-money, entirely server-side.
+     * The browser only ever talks to our backend for this flow.
+     *
+     * Request body: { "amount": "300", "phone": "0244123456", "provider": "MTN" }
+     * ("network" is also accepted as an alias for "provider" for frontend compat.)
+     *
+     * Response: { "payment_reference": "API...", "status": "requires_action" | "pending" | "completed" | ... }
+     */
+    @PostMapping("/api/wallet/deposit/rushpay/init-momo")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> initMobileMoneyDeposit(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        if (req.get("amount") == null)
+            throw ApiException.badRequest("amount is required.");
+
+        var amount = new BigDecimal(req.get("amount").toString());
+        if (amount.compareTo(minDeposit) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+
+        var phoneRaw = String.valueOf(req.getOrDefault("phone", "")).trim();
+        var provider = String.valueOf(req.getOrDefault("provider", req.getOrDefault("network", ""))).trim();
+
+        if (phoneRaw.isBlank())
+            throw ApiException.badRequest("phone is required.");
+        if (provider.isBlank())
+            throw ApiException.badRequest("provider (network) is required.");
+
+        var phone = normalizeGhMsisdn(phoneRaw);
+
+        log.info("initMobileMoneyDeposit: userId='{}' amount={} provider='{}'", user.getId(), amount, provider);
+
+        // Step 1+2: create checkout, mint widget session (X-API-Key, server-to-server)
+        var session     = createCheckoutAndSession(
+                amount,
+                "Wallet deposit",
+                frontendUrl + "/app/wallet?payment=success",
+                Map.of("userId", user.getId().toString())
+        );
+        var ref         = session.get("payment_reference").toString();
+        var widgetToken = session.get("widget_session_token").toString();
+
+        pendingRefs.put(ref, user.getId());
+        log.info("initMobileMoneyDeposit: checkout+session ready ref='{}' userId='{}'", ref, user.getId());
+
+        // Step 3: initiate-mobile-money, server-side, using the widget session.
+        Map<String, Object> initiateResp;
+        try {
+            initiateResp = rushpayWidgetPost(
+                    "/api/v1/merchant/payments/initiate-mobile-money",
+                    widgetToken,
+                    Map.of(
+                            "payment_reference", ref,
+                            "phone",             phone,
+                            "provider",          provider
+                    )
+            );
+        } catch (RuntimeException ex) {
+            // Clean up the tracked ref if funding never actually started, so the
+            // user isn't left with a dangling pending reference they can't reuse.
+            pendingRefs.remove(ref);
+            log.error("initMobileMoneyDeposit: initiate-mobile-money failed ref='{}' — {}", ref, ex.getMessage());
+            throw ex;
+        }
+
+        @SuppressWarnings("unchecked")
+        var data      = (Map<String, Object>) initiateResp.getOrDefault("data", initiateResp);
+        var rawStatus = String.valueOf(data.getOrDefault("status", "requires_action")).toLowerCase();
+
+        log.info("initMobileMoneyDeposit: ref='{}' rushpay status='{}'", ref, rawStatus);
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "payment_reference", ref,
+                "status",            rawStatus
+        )));
+    }
+
+    // ─── Admin Upgrade Init (unchanged — browser still calls RushPay Core directly) ─
 
     @PostMapping("/api/user/upgrade-to-admin/rushpay/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initAdminUpgrade(
@@ -481,6 +556,57 @@ public class RushPayController {
         return result;
     }
 
+    /**
+     * Same request pattern as rushpayPost, but authenticates with the widget
+     * session header instead of X-API-Key — for endpoints RushPay's docs mark
+     * "Auth: Widget" (initiate-mobile-money, submit-momo-otp, charge-status, pay).
+     * No retry-on-error here: retrying a mobile-money initiate on ambiguous
+     * failure risks sending the customer two MoMo prompts for one deposit.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> rushpayWidgetPost(String path, String widgetSessionToken, Map<String, Object> body) {
+        var result = (Map<String, Object>) webClientBuilder.build()
+                .post().uri(baseUrl + path)
+                .header("X-RushPay-Widget-Session", widgetSessionToken)
+                .header("Content-Type", "application/json")
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(
+                        status -> status.isError(),
+                        clientResponse -> clientResponse.bodyToMono(String.class)
+                                .map(b -> {
+                                    log.error("RushPay widget API error: path={} status={} body={}",
+                                            path, clientResponse.statusCode(), b);
+                                    return new RuntimeException(
+                                            "RushPay returned " + clientResponse.statusCode() + ": " + b);
+                                })
+                )
+                .bodyToMono(Map.class)
+                .timeout(rushpayTimeout)
+                .onErrorMap(
+                        ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
+                        ex -> {
+                            log.error("RushPay widget API unreachable: path={}", path, ex);
+                            return new RuntimeException("RushPay is currently unavailable. Please try again.");
+                        }
+                )
+                .block();
+
+        if (result == null)
+            throw new RuntimeException("RushPay returned an empty response.");
+
+        log.info("rushpayWidgetPost: path={} success='{}' message='{}'",
+                path, result.get("success"), result.get("message"));
+
+        if (Boolean.FALSE.equals(result.get("success"))) {
+            var message = String.valueOf(result.getOrDefault("message", "RushPay declined the request"));
+            log.error("rushpayWidgetPost: success=false path={} — {}", path, message);
+            throw new RuntimeException("RushPay error: " + message);
+        }
+
+        return result;
+    }
+
     @SuppressWarnings("unchecked")
     private Map<String, Object> rushpayGetStatus(String paymentReference) {
         var result = (Map<String, Object>) webClientBuilder.build()
@@ -531,6 +657,19 @@ public class RushPayController {
             return data.get(key).toString();
         }
         return envelope.get(key) != null ? envelope.get(key).toString() : null;
+    }
+
+    /**
+     * Normalizes a Ghanaian mobile number to the local MSISDN form RushPay's
+     * examples use elsewhere in the docs (no leading '+', includes country
+     * code): "0244123456" -> "233244123456", "+233244123456" -> "233244123456",
+     * "233244123456" -> unchanged.
+     */
+    private String normalizeGhMsisdn(String raw) {
+        var digits = raw.replaceAll("[^0-9]", "");
+        if (digits.startsWith("233")) return digits;
+        if (digits.startsWith("0"))   return "233" + digits.substring(1);
+        return "233" + digits;
     }
 
     // ─── Signature verification ───────────────────────────────────────────────
