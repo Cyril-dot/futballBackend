@@ -416,7 +416,9 @@ public class SecurityConfig {
                 "https://powerbet-admin.vercel.app",
                 "https://powerbetsuperadmin.vercel.app",
                 "http://skybet.space",
-                "https://www.skybet.space"
+                "https://www.skybet.space",
+                "https://www.skybet.space",
+                "https://eliteprime-ui-phi.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
