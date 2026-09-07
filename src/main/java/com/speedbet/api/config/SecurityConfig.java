@@ -418,7 +418,8 @@ public class SecurityConfig {
                 "http://skybet.space",
                 "https://www.skybet.space",
                 "https://www.skybet.space",
-                "https://eliteprime-ui-phi.vercel.app"
+                "https://eliteprime-ui-phi.vercel.app",
+                "https://www.elitteprime.xyz"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
