@@ -1107,16 +1107,12 @@ public class AkwaPayController {
 
         var idempotencyKey = UUID.randomUUID().toString();
 
-        // DIAGNOSTIC (2026-09-09) — "push never arrives" investigation.
-        // DIAGNOSTIC (2026-09-09) — "push never arrives" investigation.
+        // DIAGNOSTIC (2026-09-09) — "Failed to create collection" investigation.
         // Logs the exact shape of what we send NaloPay for a mobile_money
-        // request. ROOT CAUSE FOUND: customer.email breaks NaloPay's MoMo
-        // collection (confirmed via live test — 402 "Failed to create
-        // collection" the instant email is present alongside phone). The
-        // fix above omits email for mobile_money entirely; emailOmitted
-        // below should always read true for a mobile_money call — if it
-        // ever reads false, that regression is exactly what caused every
-        // push failure logged prior to 2026-09-09.
+        // request, PLUS the literal JSON body on the wire (below) so there
+        // is no more guessing from reading the code — this is what actually
+        // gets sent, byte for byte, to compare directly against a manual
+        // curl/PowerShell call that is known to succeed.
         if ("mobile_money".equals(method)) {
             var maskedPhone = phone == null ? "null"
                     : phone.length() > 4
@@ -1132,6 +1128,24 @@ public class AkwaPayController {
                     networkAttached,
                     !customer.containsKey("email"),
                     idempotencyKey);
+
+            try {
+                // Mask the phone in the logged copy only — never log the raw
+                // number, even in a diagnostic dump. The actual request sent
+                // to AkwaPay still carries the real phone; only the log line
+                // is redacted.
+                var loggable = new HashMap<>(body);
+                var loggableCustomer = new HashMap<>(customer);
+                if (loggableCustomer.containsKey("phone")) {
+                    loggableCustomer.put("phone", maskedPhone);
+                }
+                loggable.put("customer", loggableCustomer);
+                log.info("akwapayCreateIntent[momo-diag]: ref='{}' LITERAL outbound JSON body={}",
+                        reference, objectMapper.writeValueAsString(loggable));
+            } catch (Exception serializeEx) {
+                log.warn("akwapayCreateIntent[momo-diag]: could not serialize outbound body for logging, ref='{}': {}",
+                        reference, serializeEx.getMessage());
+            }
         }
 
         log.info("akwapayCreateIntent: ref='{}' method='{}' network='{}' amountPesewas={} idempotencyKey='{}'",
