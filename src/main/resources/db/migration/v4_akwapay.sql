@@ -1,0 +1,1 @@
+ALTER TABLE akwapay_pending_intents ALTER COLUMN intent_id DROP NOT NULL;
