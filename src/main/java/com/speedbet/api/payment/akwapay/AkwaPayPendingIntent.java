@@ -51,6 +51,32 @@ import java.util.UUID;
  * WalletService.credit() dedupes on `reference` and returns 409, which both
  * callers catch and skip. The row is then deleted by whichever finishes first;
  * the second delete is a no-op.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * REFERENCE FORMAT — UPDATED 2026-09-09
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Format is now sbdep-<16-char random token> / sbadm-<16-char random token>,
+ * hyphens only, 22 characters total. See AkwaPayController.buildReference().
+ *
+ * The reference NO LONGER encodes the userId. The old scheme embedded the
+ * full 32-hex UUID directly in the string (sbdep_<32hex>_<8hex>, 47 chars)
+ * and NaloPay rejected it with "Invalid reference" — MoMo references get
+ * forwarded to the telco side, which has a much shorter limit than 47 chars.
+ * userId/amount/adminUpgrade now live only in this row, keyed by reference.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY intentId IS NULLABLE
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * The row is now persisted BEFORE the AkwaPay create-intent call, not after,
+ * so that (userId, amount, adminUpgrade) survive a crash between "we decided
+ * to charge this user" and "AkwaPay confirmed the intent id". intentId is
+ * filled in immediately afterward via attachIntentId(). A row with a null
+ * intentId means the AkwaPay call itself never completed — the sweep skips
+ * these (nothing to poll yet); if one lingers, it means create-intent failed
+ * or the process died mid-call, which is visible in logs as
+ * "attachIntentId: no pending row" or a create-intent error for that ref.
  */
 @Entity
 @Table(name = "akwapay_pending_intents")
@@ -68,15 +94,21 @@ public class AkwaPayPendingIntent {
      * it the key means the same string identifies this payment in all three
      * places with no join and no possibility of drift.
      *
-     * Format is sbdep_<32-hex-userId>_<8-hex-nonce>; see
-     * AkwaPayController.buildReference().
+     * Format: sbdep-<16-char random token> or sbadm-<16-char random token>;
+     * see AkwaPayController.buildReference(). Opaque — carries no userId.
      */
     @Id
     @Column(name = "reference", length = 64, nullable = false, updatable = false)
     private String reference;
 
-    /** The pi_... public id. The ONLY handle AkwaPay accepts for a status read. */
-    @Column(name = "intent_id", length = 64, nullable = false)
+    /**
+     * The pi_... public id. The ONLY handle AkwaPay accepts for a status read.
+     *
+     * Nullable: null between the row being recorded and the AkwaPay
+     * create-intent call returning. See class javadoc "WHY intentId IS
+     * NULLABLE" above.
+     */
+    @Column(name = "intent_id", length = 64)
     private String intentId;
 
     @Column(name = "user_id", nullable = false)
@@ -112,7 +144,8 @@ public class AkwaPayPendingIntent {
      * passed for ITS age band. Without this column the choice is one flat
      * interval for everything — either fast and wasteful, or cheap and slow.
      *
-     * Null means never polled, which is treated as "due now".
+     * Null means never polled, which is treated as "due now" (but only once
+     * intentId is set — see AkwaPayController.isDue()).
      */
     @Column(name = "last_checked_at")
     private Instant lastCheckedAt;
