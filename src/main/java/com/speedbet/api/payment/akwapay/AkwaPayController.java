@@ -45,33 +45,42 @@ import java.util.Optional;
 import java.util.UUID;
 
 /**
- * AkwaPay payment integration.
+ * AkwaPay payment integration — updated for NaloPay gateway (September 2026).
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * GATEWAY CHANGE (2026-08-23) — READ THIS IF YOU ARE DEBUGGING A REGRESSION
+ * GATEWAY CHANGE (2026-09-09) — NALOPAY INTEGRATION
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * AkwaPay switched their default gateway from Moolre to Flutterwave v4. This
- * changes NOTHING about the API contract this controller talks to — the same
- * /v1/payment_intents endpoint, same auth, same webhook shape. But two
- * concrete behavioural differences matter here:
+ * AkwaPay now routes through NaloPay as the primary gateway (priority 1).
+ * The API contract this controller talks to is unchanged — same
+ * /v1/payment_intents endpoint, same auth, same webhook shape. But the
+ * underlying gateway behaviour changes:
  *
- *   1. THE OTP FLOW ({@link #submitOtp}) MAY NO LONGER FIRE FOR MOMO.
- *      Flutterwave v4 mobile money uses next_action.type = "payment_instruction"
- *      (a push prompt), NOT "submit_otp". submitOtp is kept in place in case
- *      routing ever falls back to a gateway that still uses it.
+ *   1. PRIMARY FLOW: method="mobile_money" + customer.phone + network
+ *      → NaloPay sends a MoMo push prompt directly to the customer's phone.
+ *      next_action.type = "await_prompt"
+ *      next_action.ussdFallback = USSD code (e.g. "*920*1*486#") — show this
+ *      if the push doesn't arrive within ~30 seconds.
  *
- *   2. next_action.type MAY VARY MORE THAN BEFORE.
- *      The frontend already branches on next_action.type. Don't add logic that
- *      inspects hint or ussd_fallback string content; treat those as opaque.
+ *   2. FALLBACK FLOW: method="card" (no phone required)
+ *      → NaloPay creates a hosted checkout session.
+ *      next_action.type = "redirect"
+ *      next_action.url = AkwaPay checkout page URL (NOT Nalo's page directly)
+ *      The AkwaPay checkout page handles MoMo form + USSD + card.
+ *
+ *   3. THE OTP FLOW ({@link #submitOtp}) IS KEPT for legacy compatibility
+ *      but NaloPay does not use it. NaloPay uses USSD for fallback.
+ *
+ *   4. USSD FALLBACK: Always surface next_action.ussdFallback to the
+ *      frontend. NaloPay push prompts may not arrive (account activation
+ *      pending). The USSD code always works.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * REFERENCE FORMAT — HYPHENS NOT UNDERSCORES
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Flutterwave uses our reference as tx_ref. Flutterwave's tx_ref validation
- * rejects underscores — only alphanumeric characters and hyphens are accepted.
- * References use hyphens as separators:
+ * NaloPay (via AkwaPay) uses our reference as the transaction reference.
+ * Only alphanumeric characters and hyphens are accepted — no underscores:
  *
  *     sbdep-<32-hex userId>-<8-hex nonce>     wallet deposit
  *     sbadm-<32-hex userId>-<8-hex nonce>     admin upgrade
@@ -80,20 +89,19 @@ import java.util.UUID;
  * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Flutterwave v4 deduplicates customers by email. Reusing the real user email
- * causes "Customer already exists" on any second attempt while a prior intent
- * is still unresolved. We use plus-addressing to make the email unique per
- * attempt: kojo@gmail.com → kojo+1724449830123@gmail.com. The real email is
- * preserved in metadata for audit.
+ * AkwaPay deduplicates customers by email on some gateway paths. We use
+ * plus-addressing to make the email unique per attempt:
+ * kojo@gmail.com → kojo+1724449830123@gmail.com
+ * The real email is preserved in metadata for audit.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * RELIABILITY GUARANTEE
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Webhooks have never fired in production. Every credit has come from the
- * reconciliation sweep ({@link #reconcilePendingIntents}). Treat the sweep as
- * the primary mechanism. Both paths dedupe via WalletService.credit() (409 on
- * duplicate reference) so no double-credit is possible whichever wins the race.
+ * Webhooks may not always fire. The reconciliation sweep
+ * ({@link #reconcilePendingIntents}) is the primary credit mechanism.
+ * Both paths dedupe via WalletService.credit() (409 on duplicate reference)
+ * so no double-credit is possible whichever wins the race.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WEBHOOK PAYLOAD
@@ -113,18 +121,8 @@ import java.util.UUID;
  *     }
  *   }
  *
- * Delivery is at-least-once. Deduped inside WalletService.credit() via the
- * reference (409 → skip).
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * COMMISSION CREDITING — ALIGNED WITH PAYSTACK PATTERN (2026-08-25)
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Same rule as PaystackMobileMoneyController.handleDeposit: as soon as the
- * depositing user's wallet is successfully credited, referral commission is
- * attributed unconditionally in the same call — no separate flag, no extra
- * gating condition beyond "the deposit credit succeeded". Commission failure
- * is caught and logged but never rolls back the deposit, matching Paystack.
+ * Delivery is at-least-once. Deduped inside WalletService.credit() via
+ * the reference (409 → skip).
  */
 @Slf4j
 @EnableScheduling
@@ -137,7 +135,7 @@ public class AkwaPayController {
 
     private static final BigDecimal ADMIN_COMMISSION_RATE = new BigDecimal("0.70");
 
-    // Hyphens only — Flutterwave rejects underscores in tx_ref.
+    // Hyphens only — NaloPay/AkwaPay reject underscores in references.
     private static final String REF_PREFIX_DEPOSIT = "sbdep-";
     private static final String REF_PREFIX_ADMIN   = "sbadm-";
 
@@ -159,6 +157,7 @@ public class AkwaPayController {
 
     private static final Duration ABANDON_AFTER = Duration.ofHours(24);
 
+    // Ghana MNO prefix → AkwaPay network code
     private static final Map<String, String> GH_NETWORK_PREFIXES = new LinkedHashMap<>();
     static {
         for (var p : new String[]{"024", "025", "053", "054", "055", "059"}) GH_NETWORK_PREFIXES.put(p, "MTN");
@@ -182,6 +181,26 @@ public class AkwaPayController {
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
+    /**
+     * Initiates a deposit via AkwaPay/NaloPay.
+     *
+     * PRIMARY PATH (phone provided):
+     *   method="mobile_money" → NaloPay sends MoMo push to customer's phone.
+     *   Response includes next_action.type="await_prompt" and
+     *   next_action.ussdFallback for when the push doesn't arrive.
+     *
+     * FALLBACK PATH (no phone):
+     *   method="card" → AkwaPay creates a hosted checkout session.
+     *   Response includes checkout_url — redirect the customer there.
+     *   The AkwaPay checkout page handles MoMo form + USSD + card.
+     *
+     * Frontend should:
+     *   1. If next_action.type == "await_prompt": show "Check your phone"
+     *      spinner + ussdFallback USSD code as tap-to-dial.
+     *   2. If next_action.type == "redirect": redirect to checkout_url.
+     *   3. Poll GET /api/wallet/deposit/akwapay/status/{intentId} or listen
+     *      for the webhook to confirm success.
+     */
     @PostMapping("/api/wallet/deposit/akwapay/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
             @AuthenticationPrincipal User user,
@@ -199,10 +218,16 @@ public class AkwaPayController {
 
         var phone        = req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req.get("network") == null ? null : req.get("network").toString();
-        var network      = resolveNetwork(requestedNet, phone);
 
-        log.info("initDeposit: userId='{}' amount={} pesewas={} ref='{}' requestedNetwork='{}' resolvedNetwork='{}'",
-                user.getId(), amount, amountPesewas, reference, requestedNet, network);
+        // Determine payment method:
+        // - phone provided → direct MoMo push (primary, NaloPay)
+        // - no phone       → hosted checkout fallback
+        boolean useMomoPush = phone != null && !phone.isBlank();
+        String  network     = useMomoPush ? resolveNetwork(requestedNet, phone) : null;
+        String  method      = useMomoPush ? "mobile_money" : "card";
+
+        log.info("initDeposit: userId='{}' amount={} pesewas={} ref='{}' method='{}' network='{}'",
+                user.getId(), amount, amountPesewas, reference, method, network);
 
         var response = akwapayCreateIntent(
                 amountPesewas,
@@ -210,15 +235,22 @@ public class AkwaPayController {
                 user.getEmail(),
                 phone,
                 network,
+                method,
                 frontendUrl + "/wallet?payment=success",
                 Map.of("userId", user.getId().toString(), "purpose", "deposit")
         );
 
-        var intentId = String.valueOf(response.get("id"));
+        var intentId       = String.valueOf(response.get("id"));
+        var nextActionType = nextActionType(response);
+
         recordPending(reference, intentId, user.getId(), amount, false);
 
-        log.info("initDeposit: intent='{}' status='{}' next_action='{}' for userId='{}'",
-                intentId, response.get("status"), nextActionType(response), user.getId());
+        log.info("initDeposit: intent='{}' status='{}' next_action='{}' ussdFallback='{}' for userId='{}'",
+                intentId,
+                response.get("status"),
+                nextActionType,
+                nextActionUssd(response),
+                user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
@@ -237,10 +269,13 @@ public class AkwaPayController {
 
         var phone        = req == null || req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req == null || req.get("network") == null ? null : req.get("network").toString();
-        var network      = resolveNetwork(requestedNet, phone);
 
-        log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}' requestedNetwork='{}' resolvedNetwork='{}'",
-                user.getId(), user.getEmail(), reference, requestedNet, network);
+        boolean useMomoPush = phone != null && !phone.isBlank();
+        String  network     = useMomoPush ? resolveNetwork(requestedNet, phone) : null;
+        String  method      = useMomoPush ? "mobile_money" : "card";
+
+        log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}' method='{}' network='{}'",
+                user.getId(), user.getEmail(), reference, method, network);
 
         var upgradeAmountGhs = BigDecimal.valueOf(ADMIN_UPGRADE_FEE_PESEWAS)
                 .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
@@ -251,6 +286,7 @@ public class AkwaPayController {
                 user.getEmail(),
                 phone,
                 network,
+                method,
                 frontendUrl + "/app/upgrade?payment=success",
                 Map.of(
                         "userId",        user.getId().toString(),
@@ -261,8 +297,8 @@ public class AkwaPayController {
         var intentId = String.valueOf(response.get("id"));
         recordPending(reference, intentId, user.getId(), upgradeAmountGhs, true);
 
-        log.info("initAdminUpgrade: intent='{}' status='{}' for userId='{}'",
-                intentId, response.get("status"), user.getId());
+        log.info("initAdminUpgrade: intent='{}' status='{}' next_action='{}' for userId='{}'",
+                intentId, response.get("status"), nextActionType(response), user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
@@ -272,13 +308,64 @@ public class AkwaPayController {
         try {
             pendingIntents.save(new AkwaPayPendingIntent(
                     reference, intentId, userId, amountGhs, adminUpgrade, Instant.now(), 0, null));
-            log.info("recordPending: ref='{}' intent='{}' persisted — sweep will reconcile if the webhook is lost",
+            log.info("recordPending: ref='{}' intent='{}' persisted — sweep will reconcile if webhook is lost",
                     reference, intentId);
         } catch (Exception e) {
             log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
-                            "this payment can now only be credited by webhook or by hand. Investigate.",
+                            "this payment can only be credited by webhook or by hand. Investigate.",
                     reference, intentId, userId, amountGhs, e);
         }
+    }
+
+    // ─── Hosted Checkout Init (explicit fallback) ─────────────────────────────
+
+    /**
+     * Explicitly creates a hosted checkout session when the frontend has no
+     * phone number (e.g. the customer skips the phone form).
+     *
+     * Returns checkout_url — redirect the customer to it.
+     * The AkwaPay checkout page collects the phone, sends the MoMo push,
+     * and shows the USSD fallback if push doesn't arrive.
+     */
+    @PostMapping("/api/wallet/deposit/akwapay/checkout")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> initCheckout(
+            @AuthenticationPrincipal User user,
+            @RequestBody(required = false) Map<String, Object> req) {
+
+        var amount = req == null || req.get("amount") == null
+                ? minDeposit
+                : new BigDecimal(req.get("amount").toString());
+
+        if (amount.compareTo(minDeposit) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+
+        var amountPesewas = amount
+                .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
+                .intValue();
+
+        var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
+
+        log.info("initCheckout: userId='{}' amount={} ref='{}' — hosted checkout fallback",
+                user.getId(), amount, reference);
+
+        var response = akwapayCreateIntent(
+                amountPesewas,
+                reference,
+                user.getEmail(),
+                null,     // no phone — checkout page collects it
+                null,     // no network
+                "card",   // triggers hosted checkout
+                frontendUrl + "/wallet?payment=success",
+                Map.of("userId", user.getId().toString(), "purpose", "deposit")
+        );
+
+        var intentId = String.valueOf(response.get("id"));
+        recordPending(reference, intentId, user.getId(), amount, false);
+
+        log.info("initCheckout: intent='{}' checkoutUrl='{}' for userId='{}'",
+                intentId, response.get("checkout_url"), user.getId());
+
+        return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     // ─── Status probe (read only) ─────────────────────────────────────────────
@@ -306,14 +393,21 @@ public class AkwaPayController {
 
         if (result == null) throw new RuntimeException("AkwaPay returned an empty response.");
 
-        log.info("status: userId='{}' intent='{}' status='{}'",
-                user.getId(), intentId, result.get("status"));
+        log.info("status: userId='{}' intent='{}' status='{}' next_action='{}'",
+                user.getId(), intentId, result.get("status"), nextActionType(result));
 
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    // ─── OTP submission ───────────────────────────────────────────────────────
+    // ─── OTP submission (legacy — kept for non-NaloPay gateway fallback) ──────
 
+    /**
+     * NaloPay does not use OTP — it uses USSD fallback instead.
+     * This endpoint is kept for backward compatibility if AkwaPay routes
+     * to a different gateway that still uses the submit_otp flow.
+     *
+     * For NaloPay: surface next_action.ussdFallback to the user instead.
+     */
     @PostMapping("/api/wallet/deposit/akwapay/otp")
     public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
             @AuthenticationPrincipal User user,
@@ -326,7 +420,8 @@ public class AkwaPayController {
         if (intentId.isBlank() || clientSecret.isBlank() || otp.isBlank())
             throw ApiException.badRequest("intentId, clientSecret and otp are all required");
 
-        log.info("submitOtp: userId='{}' intent='{}'", user.getId(), intentId);
+        log.info("submitOtp: userId='{}' intent='{}' (NaloPay uses USSD not OTP — kept for legacy)",
+                user.getId(), intentId);
 
         var akwapayRoot = baseUrl.replaceAll("/v1.*$", "");
 
@@ -335,8 +430,6 @@ public class AkwaPayController {
                 .queryParam("cs", clientSecret)
                 .build()
                 .toUri();
-
-        log.info("submitOtp: forwarding to AkwaPay uri='{}'", validateUri);
 
         @SuppressWarnings("unchecked")
         var result = (Map<String, Object>) webClientBuilder.build()
@@ -360,9 +453,7 @@ public class AkwaPayController {
 
         if (result == null) throw new RuntimeException("AkwaPay returned an empty response for OTP validation.");
 
-        log.info("submitOtp: intent='{}' akwapay_result='{}' — push prompt now in flight if OTP was accepted",
-                intentId, result);
-
+        log.info("submitOtp: intent='{}' result='{}'", intentId, result);
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
@@ -434,7 +525,7 @@ public class AkwaPayController {
             var parsed = parseReference(reference);
             if (parsed == null) {
                 log.warn("AkwaPay webhook: unrecognised reference '{}' on event='{}' intent='{}' " +
-                                "amount={} — returning 200 so AkwaPay stops retrying an unroutable event. " +
+                                "amount={} — returning 200 so AkwaPay stops retrying. " +
                                 "If this is a real customer payment, credit it manually.",
                         reference, eventId, intentId, amount);
                 return ResponseEntity.ok("Ignored: foreign reference");
@@ -464,8 +555,7 @@ public class AkwaPayController {
     @Scheduled(fixedDelay = 5_000)
     public void reconcilePendingIntents() {
         var cutoff = Instant.now().minus(SWEEP_HEAD_START);
-
-        var stale = pendingIntents.findByCreatedAtBeforeOrderByCreatedAtAsc(cutoff);
+        var stale  = pendingIntents.findByCreatedAtBeforeOrderByCreatedAtAsc(cutoff);
         if (stale.isEmpty()) return;
 
         var due = stale.stream().filter(i -> isDue(i, Instant.now())).toList();
@@ -522,7 +612,7 @@ public class AkwaPayController {
                 .onStatus(
                         s -> s.isError(),
                         r -> r.bodyToMono(String.class).map(body -> {
-                            log.error("reconcile: AkwaPay status check error for ref='{}' status={} body={}",
+                            log.error("reconcile: AkwaPay status error for ref='{}' status={} body={}",
                                     ref, r.statusCode(), body);
                             return new RuntimeException("AkwaPay returned " + r.statusCode());
                         })
@@ -530,7 +620,7 @@ public class AkwaPayController {
                 .bodyToMono(Map.class)
                 .timeout(akwapayTimeout)
                 .onErrorResume(e -> {
-                    log.warn("reconcile: status check failed for ref='{}' intent='{}' — will retry next sweep: {}",
+                    log.warn("reconcile: status check failed for ref='{}' intent='{}' — retry next sweep: {}",
                             ref, intent.getIntentId(), e.getMessage());
                     return Mono.empty();
                 })
@@ -544,7 +634,7 @@ public class AkwaPayController {
 
         switch (akwapayStatus) {
             case "succeeded" -> {
-                log.info("reconcile: ref='{}' succeeded on sweep — applying credit now", ref);
+                log.info("reconcile: ref='{}' succeeded on sweep — applying credit", ref);
                 if (intent.isAdminUpgrade()) {
                     handleAdminUpgrade(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
                 } else {
@@ -572,26 +662,19 @@ public class AkwaPayController {
                 log.info("deletePending: ref='{}' removed from pending ledger ({})", reference, why);
             }
         } catch (Exception e) {
-            log.warn("deletePending: could not remove ref='{}' ({}) — harmless, sweep will re-check and skip: {}",
+            log.warn("deletePending: could not remove ref='{}' ({}) — sweep will re-check and skip: {}",
                     reference, why, e.getMessage());
         }
     }
 
     // ─── Private handlers ─────────────────────────────────────────────────────
 
-    /**
-     * Matches PaystackMobileMoneyController.handleDeposit exactly:
-     * 1. Credit the wallet.
-     * 2. Immediately, unconditionally attribute referral commission on the
-     *    same successful credit — no separate gate, no missing call path.
-     * 3. Commission failures are caught/logged but never roll back the credit.
-     */
     private void handleDeposit(UUID userId, String ref, BigDecimal amount, String intentId) {
         log.info("handleDeposit: userId='{}' amount={} ref='{}' intent='{}'",
                 userId, amount, ref, intentId);
         try {
             walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
-                    Map.of("provider", "akwapay", "reference", ref, "intentId", intentId));
+                    Map.of("provider", "akwapay/nalopay", "reference", ref, "intentId", intentId));
             log.info("handleDeposit: GHS {} credited to userId='{}' ref='{}'", amount, userId, ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
@@ -603,12 +686,9 @@ public class AkwaPayController {
 
         try {
             referralService.attributeCommission(userId, amount);
-            log.info("handleDeposit: commission attributed for userId='{}' deposit={} adminRate={}",
-                    userId, amount, ADMIN_COMMISSION_RATE);
+            log.info("handleDeposit: commission attributed for userId='{}' deposit={}", userId, amount);
         } catch (Exception ex) {
-            // Commission failure must NEVER roll back the deposit — matches Paystack.
-            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate",
-                    userId, ex);
+            log.error("handleDeposit: commission attribution failed for userId='{}' — investigate", userId, ex);
         }
     }
 
@@ -625,10 +705,7 @@ public class AkwaPayController {
 
         try {
             userService.upgradeToAdmin(userId, ref);
-            log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN with {}% commission ref='{}'",
-                    userId,
-                    ADMIN_COMMISSION_RATE.multiply(BigDecimal.valueOf(100)).toPlainString(),
-                    ref);
+            log.info("handleAdminUpgrade: userId='{}' promoted to ADMIN ref='{}'", userId, ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("handleAdminUpgrade: duplicate ref='{}' — skipping", ref);
@@ -638,7 +715,7 @@ public class AkwaPayController {
         }
 
         walletService.recordExternalDebit(userId, amount, TxKind.ADMIN_UPGRADE_FEE, ref,
-                Map.of("provider", "akwapay", "reference", ref, "intentId", intentId));
+                Map.of("provider", "akwapay/nalopay", "reference", ref, "intentId", intentId));
         log.info("handleAdminUpgrade: audit tx recorded for userId='{}' ref='{}'", userId, ref);
 
         adminUpgradeChatService.createUpgradeChat(userId);
@@ -660,10 +737,10 @@ public class AkwaPayController {
             return detected.get();
         }
 
-        log.warn("resolveNetwork: could not resolve a network from phone='{}' and no network was selected",
+        log.warn("resolveNetwork: could not resolve network from phone='{}' and no network was selected",
                 phone == null ? "null" : "<redacted>");
         throw ApiException.badRequest(
-                "We couldn't tell which network that number is on. Please choose MTN, Telecel, or AirtelTigo.");
+                "We couldn't detect which network that number is on. Please select MTN, Telecel, or AirtelTigo.");
     }
 
     private Optional<String> detectNetworkFromPhone(String phone) {
@@ -685,20 +762,26 @@ public class AkwaPayController {
 
     // ─── AkwaPay API helper ───────────────────────────────────────────────────
 
+    /**
+     * Creates a payment intent on AkwaPay.
+     *
+     * For NaloPay (primary gateway):
+     *   - method="mobile_money" + phone + network → direct MoMo push
+     *     Response: next_action.type="await_prompt", next_action.ussdFallback="*920*1*xxx#"
+     *   - method="card" (no phone) → hosted checkout session
+     *     Response: next_action.type="redirect", checkout_url="https://akwapay.vercel.app/checkout/..."
+     */
     @SuppressWarnings("unchecked")
     private Map<String, Object> akwapayCreateIntent(int amountPesewas,
                                                     String reference,
                                                     String email,
                                                     String phone,
                                                     String network,
+                                                    String method,
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
-        // Unique-per-attempt email using plus-addressing so Flutterwave's
-        // POST /customers never sees the same address twice. Flutterwave
-        // deduplicates customers by email — reusing the real address causes
-        // "Customer already exists" while any prior intent is still unresolved.
-        // kojo@gmail.com → kojo+1724449830123@gmail.com
+        // Synthetic email per-attempt to avoid customer deduplication issues
         String syntheticEmail;
         if (email != null && email.contains("@")) {
             int atIdx = email.indexOf("@");
@@ -711,8 +794,6 @@ public class AkwaPayController {
                     + "@customers.akwapay.com";
         }
 
-        log.info("akwapayCreateIntent: ref='{}' syntheticEmail='{}'", reference, syntheticEmail);
-
         var customer = new HashMap<String, Object>();
         customer.put("email", syntheticEmail);
         if (phone != null && !phone.isBlank()) customer.put("phone", phone);
@@ -724,10 +805,17 @@ public class AkwaPayController {
         body.put("return_url", returnUrl);
         body.put("metadata",   metadata);
         body.put("customer",   customer);
-        body.put("method",     "mobile_money");
-        body.put("network",    network.toUpperCase());
+        body.put("method",     method);
+
+        // Only set network for mobile_money — card doesn't need it
+        if ("mobile_money".equals(method) && network != null) {
+            body.put("network", network.toUpperCase());
+        }
 
         var idempotencyKey = UUID.randomUUID().toString();
+
+        log.info("akwapayCreateIntent: ref='{}' method='{}' network='{}' amountPesewas={} idempotencyKey='{}'",
+                reference, method, network, amountPesewas, idempotencyKey);
 
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + "/payment_intents")
@@ -779,13 +867,11 @@ public class AkwaPayController {
                 )
                 .block();
 
-        if (result == null) {
-            throw new RuntimeException("AkwaPay returned an empty response.");
-        }
+        if (result == null) throw new RuntimeException("AkwaPay returned an empty response.");
 
         var status = String.valueOf(result.get("status"));
-        log.info("akwapayCreateIntent: intent='{}' status='{}' ref='{}'",
-                result.get("id"), status, reference);
+        log.info("akwapayCreateIntent: intent='{}' status='{}' next_action='{}' ussdFallback='{}' ref='{}'",
+                result.get("id"), status, nextActionType(result), nextActionUssd(result), reference);
 
         if (result.get("error") != null) {
             log.error("akwapayCreateIntent: error on ref='{}' — {}", reference, result.get("error"));
@@ -806,11 +892,22 @@ public class AkwaPayController {
         return String.valueOf(m.get("type"));
     }
 
+    /**
+     * Extracts the USSD fallback code from next_action.
+     * NaloPay returns this as ussdFallback (e.g. "*920*1*486#").
+     * Surface this to the frontend — always show it, always.
+     */
+    private String nextActionUssd(Map<String, Object> response) {
+        var na = response.get("next_action");
+        if (!(na instanceof Map<?, ?> m)) return null;
+        var ussd = m.get("ussdFallback");
+        return ussd == null ? null : String.valueOf(ussd);
+    }
+
     // ─── Reference encoding / decoding ────────────────────────────────────────
 
     private String buildReference(String prefix, UUID userId) {
         var nonce = Long.toHexString(System.nanoTime() & 0xFFFFFFFFL);
-        // Hyphens only — Flutterwave rejects underscores in tx_ref.
         return prefix
                 + userId.toString().replace("-", "")
                 + "-"
