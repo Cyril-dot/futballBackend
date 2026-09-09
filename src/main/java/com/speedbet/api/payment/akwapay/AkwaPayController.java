@@ -125,13 +125,24 @@ import java.util.UUID;
  * to describe itself to be looked up.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
+ * WHY customer.email IS SYNTHETIC (PER-ATTEMPT) — CARD/CHECKOUT ONLY
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * AkwaPay deduplicates customers by email on some gateway paths. We use
- * plus-addressing to make the email unique per attempt:
- * kojo@gmail.com → kojo+1724449830123@gmail.com
- * The real email is preserved in metadata for audit.
+ * AkwaPay deduplicates customers by email on some gateway paths. For the
+ * card/hosted-checkout path we use plus-addressing to make the email
+ * unique per attempt: kojo@gmail.com → kojo+1724449830123@gmail.com. The
+ * real email is preserved in metadata for audit.
+ *
+ * FIX (2026-09-09): customer.email is NEVER sent for method="mobile_money".
+ * Confirmed via a controlled live test against AkwaPay's API directly —
+ * the identical request that succeeds with customer={"phone":"..."} only
+ * fails with 402 "NALOPAY collection rejected: Failed to create
+ * collection" the moment an email field is added alongside the phone. This
+ * was the root cause of every production MoMo-push failure up to
+ * 2026-09-09: the synthetic email was being attached unconditionally on
+ * every call, so every real mobile_money attempt was silently rejected by
+ * NaloPay and fell back to hosted checkout without ever reaching a phone.
+ * See {@link #akwapayCreateIntent} for where this is now suppressed.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * RELIABILITY GUARANTEE
@@ -1046,7 +1057,20 @@ public class AkwaPayController {
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
-        // Synthetic email per-attempt to avoid customer deduplication issues
+        // ROOT CAUSE FIX (2026-09-09): customer.email BREAKS NaloPay's MoMo
+        // collection path. Confirmed via a controlled live test — the exact
+        // same request that succeeds with only {"phone": "..."} in customer
+        // fails with 402 "NALOPAY collection rejected: Failed to create
+        // collection" the moment an email field is added. This matches every
+        // production mobile_money failure logged so far: the synthetic email
+        // below was being attached unconditionally, on every call, including
+        // mobile_money — so every real MoMo push attempt failed at NaloPay
+        // and silently fell back to checkout.
+        //
+        // customer.email is still useful for the card/checkout path (it's
+        // shown in AkwaPay's own docs example alongside phone), so only
+        // suppress it for mobile_money specifically rather than dropping it
+        // everywhere.
         String syntheticEmail;
         if (email != null && email.contains("@")) {
             int atIdx = email.indexOf("@");
@@ -1060,7 +1084,9 @@ public class AkwaPayController {
         }
 
         var customer = new HashMap<String, Object>();
-        customer.put("email", syntheticEmail);
+        if (!"mobile_money".equals(method)) {
+            customer.put("email", syntheticEmail);
+        }
         if (phone != null && !phone.isBlank()) customer.put("phone", phone);
 
         var body = new HashMap<String, Object>();
@@ -1082,25 +1108,29 @@ public class AkwaPayController {
         var idempotencyKey = UUID.randomUUID().toString();
 
         // DIAGNOSTIC (2026-09-09) — "push never arrives" investigation.
+        // DIAGNOSTIC (2026-09-09) — "push never arrives" investigation.
         // Logs the exact shape of what we send NaloPay for a mobile_money
-        // request: phone presence/length/format (masked, never the raw
-        // number) and whether `network` actually made it into the body —
-        // if networkAttached is false for a mobile_money call, NaloPay is
-        // getting a request with no network hint, which is one likely
-        // reason a push never reaches the handset.
+        // request. ROOT CAUSE FOUND: customer.email breaks NaloPay's MoMo
+        // collection (confirmed via live test — 402 "Failed to create
+        // collection" the instant email is present alongside phone). The
+        // fix above omits email for mobile_money entirely; emailOmitted
+        // below should always read true for a mobile_money call — if it
+        // ever reads false, that regression is exactly what caused every
+        // push failure logged prior to 2026-09-09.
         if ("mobile_money".equals(method)) {
             var maskedPhone = phone == null ? "null"
                     : phone.length() > 4
                       ? phone.substring(0, 3) + "***" + phone.substring(phone.length() - 2)
                       : "<short>";
             log.info("akwapayCreateIntent[momo-diag]: ref='{}' phoneMasked='{}' phoneLength={} phoneStartsWithPlus={} " +
-                            "network='{}' networkAttachedToBody={} idempotencyKey='{}'",
+                            "network='{}' networkAttachedToBody={} emailOmittedFromBody={} idempotencyKey='{}'",
                     reference,
                     maskedPhone,
                     phone == null ? 0 : phone.length(),
                     phone != null && phone.startsWith("+"),
                     network,
                     networkAttached,
+                    !customer.containsKey("email"),
                     idempotencyKey);
         }
 
