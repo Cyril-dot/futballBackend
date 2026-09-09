@@ -99,6 +99,32 @@ import java.util.UUID;
  * {@link #initDeposit} and {@link #initAdminUpgrade}.
  *
  * ─────────────────────────────────────────────────────────────────────────────
+ * FIX (2026-09-09) — REFERENCE FORMAT: SHORT AND OPAQUE, NO EMBEDDED userId
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * NaloPay rejected our previous reference shape outright — every attempt,
+ * not just retries — with "Invalid value for reference". That shape was
+ * "sbdep-<32-hex userId><hyphen><12-hex nonce>": 51 characters, 2 hyphens.
+ * AkwaPay's own docs and test suite only ever use short, single-segment,
+ * single-hyphen references such as "order-4471" or "REF123" — nothing
+ * close to what we were sending survives Nalo's validation.
+ *
+ * The reference is now a short opaque token — prefix + 16 random
+ * alphanumeric characters, ONE hyphen total — and no longer encodes the
+ * userId. Encoding structured data into a merchant reference was never
+ * something AkwaPay's contract promised to preserve; it's meant to be
+ * opaque, matching their own examples.
+ *
+ * Because the userId is no longer recoverable from the string, the
+ * webhook handler and the reconciliation sweep resolve userId (and
+ * whether the charge was an admin upgrade) by looking up the
+ * AkwaPayPendingIntent row keyed on the reference — see
+ * {@link #resolvePending} — rather than decoding it. This is strictly
+ * more robust: we already persist that row on every successful intent
+ * creation, so there is no new failure mode, and a reference doesn't need
+ * to describe itself to be looked up.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -234,7 +260,7 @@ public class AkwaPayController {
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
                 .intValue();
 
-        var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
+        var reference = buildReference(REF_PREFIX_DEPOSIT);
 
         var phone        = req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req.get("network") == null ? null : req.get("network").toString();
@@ -263,7 +289,13 @@ public class AkwaPayController {
             }
         }
 
-        // Call AkwaPay FIRST — only persist to DB on success so intent_id is never null
+        // Persist BEFORE calling AkwaPay — intentId starts null. This is what
+        // survives a crash between "we decided to charge this user" and
+        // "AkwaPay confirmed the intent id" (see AkwaPayPendingIntent javadoc,
+        // "WHY intentId IS NULLABLE"). If the process dies here, the row is
+        // left with intentId=null and shows up in the abandon-after check.
+        recordPending(reference, null, user.getId(), amount, false);
+
         Map<String, Object> response;
         try {
             response = akwapayCreateIntent(
@@ -287,9 +319,15 @@ public class AkwaPayController {
                 // NaloPay may have already persisted a payment_intent record under
                 // the original reference even though it returned an error to us —
                 // retrying that same reference gets rejected as a duplicate.
-                var fallbackReference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
+                var fallbackReference = buildReference(REF_PREFIX_DEPOSIT);
                 log.info("initDeposit: retrying with fresh ref='{}' (was '{}') for userId='{}'",
                         fallbackReference, reference, user.getId());
+
+                // The original reference never got a real intent — drop its
+                // placeholder row rather than leaving an orphaned null-intentId
+                // row for the sweep to eventually abandon.
+                deletePending(reference, "superseded by fallback ref " + fallbackReference);
+                recordPending(fallbackReference, null, user.getId(), amount, false);
 
                 try {
                     response = akwapayCreateIntent(
@@ -307,18 +345,20 @@ public class AkwaPayController {
                 } catch (Exception fallbackEx) {
                     log.error("initDeposit: both MoMo push and checkout fallback failed for userId='{}' (attempted refs '{}' then '{}')",
                             user.getId(), reference, fallbackReference, fallbackEx);
+                    deletePending(fallbackReference, "both attempts failed — no intent ever created");
                     throw fallbackEx;
                 }
             } else {
+                deletePending(reference, "akwapay call failed and no fallback available");
                 throw ex;
             }
         }
 
-        // Persist AFTER AkwaPay succeeds — intent_id is never null this way
+        // Attach the confirmed intentId to the row we already persisted.
         var intentId       = String.valueOf(response.get("id"));
         var nextActionType = nextActionType(response);
 
-        recordPending(reference, intentId, user.getId(), amount, false);
+        attachIntentId(reference, intentId);
 
         log.info("initDeposit: intent='{}' status='{}' next_action='{}' ussdFallback='{}' checkoutUrl='{}' for userId='{}'",
                 intentId,
@@ -346,7 +386,7 @@ public class AkwaPayController {
         if (user.getRole().name().equals("ADMIN"))
             throw ApiException.badRequest("You are already an Admin.");
 
-        var reference = buildReference(REF_PREFIX_ADMIN, user.getId());
+        var reference = buildReference(REF_PREFIX_ADMIN);
 
         var phone        = req == null || req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req == null || req.get("network") == null ? null : req.get("network").toString();
@@ -372,6 +412,9 @@ public class AkwaPayController {
             }
         }
 
+        // Persist BEFORE calling AkwaPay — see initDeposit for why.
+        recordPending(reference, null, user.getId(), upgradeAmountGhs, true);
+
         Map<String, Object> response;
         try {
             response = akwapayCreateIntent(
@@ -393,9 +436,12 @@ public class AkwaPayController {
                         reference, user.getId(), ex.getMessage());
 
                 // Fresh reference for the fallback — see fix note above initDeposit.
-                var fallbackReference = buildReference(REF_PREFIX_ADMIN, user.getId());
+                var fallbackReference = buildReference(REF_PREFIX_ADMIN);
                 log.info("initAdminUpgrade: retrying with fresh ref='{}' (was '{}') for userId='{}'",
                         fallbackReference, reference, user.getId());
+
+                deletePending(reference, "superseded by fallback ref " + fallbackReference);
+                recordPending(fallbackReference, null, user.getId(), upgradeAmountGhs, true);
 
                 try {
                     response = akwapayCreateIntent(
@@ -417,16 +463,18 @@ public class AkwaPayController {
                 } catch (Exception fallbackEx) {
                     log.error("initAdminUpgrade: both MoMo and checkout failed for userId='{}' (attempted refs '{}' then '{}')",
                             user.getId(), reference, fallbackReference, fallbackEx);
+                    deletePending(fallbackReference, "both attempts failed — no intent ever created");
                     throw fallbackEx;
                 }
             } else {
+                deletePending(reference, "akwapay call failed and no fallback available");
                 throw ex;
             }
         }
 
-        // Persist AFTER AkwaPay succeeds — intent_id is never null
+        // Attach the confirmed intentId to the row we already persisted.
         var intentId = String.valueOf(response.get("id"));
-        recordPending(reference, intentId, user.getId(), upgradeAmountGhs, true);
+        attachIntentId(reference, intentId);
 
         log.info("initAdminUpgrade: intent='{}' status='{}' next_action='{}' checkoutUrl='{}' for userId='{}'",
                 intentId, response.get("status"), nextActionType(response),
@@ -435,6 +483,17 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
+    /**
+     * Persists a pending-intent row. Called BEFORE the AkwaPay create-intent
+     * call (with intentId=null) so that userId/amount/adminUpgrade survive a
+     * crash mid-call — see AkwaPayPendingIntent javadoc, "WHY intentId IS
+     * NULLABLE".
+     *
+     * Unlike the old post-success-only version, a failure here MUST stop the
+     * caller from proceeding to call AkwaPay: if we can't persist the row we
+     * have no durable record of the charge at all, which is the exact gap
+     * persist-before-call exists to close. Callers should let this propagate.
+     */
     private void recordPending(String reference, String intentId, UUID userId,
                                BigDecimal amountGhs, boolean adminUpgrade) {
         try {
@@ -444,8 +503,41 @@ public class AkwaPayController {
                     reference, intentId);
         } catch (Exception e) {
             log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
-                            "this payment can only be credited by webhook or by hand. Investigate.",
+                            "refusing to call AkwaPay without a durable row backing this charge.",
                     reference, intentId, userId, amountGhs, e);
+            throw new RuntimeException("Could not record pending payment. Please try again.", e);
+        }
+    }
+
+    /**
+     * Fills in the intentId on a row we already persisted with intentId=null,
+     * once AkwaPay's create-intent call has confirmed one. This is the second
+     * half of the persist-before-call flow: recordPending() writes the row
+     * before we ever talk to AkwaPay, this method patches it in afterward.
+     *
+     * If the row is missing entirely (e.g. it was deleted by a concurrent
+     * fallback cleanup, or the sweep already abandoned it), we log loudly
+     * rather than silently dropping the intentId — the row is meant to be
+     * the only way we can later poll AkwaPay about this charge.
+     */
+    private void attachIntentId(String reference, String intentId) {
+        try {
+            var existing = pendingIntents.findById(reference);
+            if (existing.isEmpty()) {
+                log.error("attachIntentId: no pending row for ref='{}' intent='{}' — AkwaPay confirmed an intent " +
+                                "but we have nowhere to record it. The sweep cannot pick this up; investigate and " +
+                                "credit manually if the payment succeeds.",
+                        reference, intentId);
+                return;
+            }
+            var row = existing.get();
+            row.setIntentId(intentId);
+            pendingIntents.save(row);
+            log.info("attachIntentId: ref='{}' intent='{}' attached — sweep can now poll", reference, intentId);
+        } catch (Exception e) {
+            log.error("attachIntentId: FAILED to attach intent='{}' to ref='{}' — sweep cannot poll until this " +
+                            "is fixed manually.",
+                    intentId, reference, e);
         }
     }
 
@@ -475,24 +567,33 @@ public class AkwaPayController {
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
                 .intValue();
 
-        var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
+        var reference = buildReference(REF_PREFIX_DEPOSIT);
 
         log.info("initCheckout: userId='{}' amount={} ref='{}' — hosted checkout fallback",
                 user.getId(), amount, reference);
 
-        var response = akwapayCreateIntent(
-                amountPesewas,
-                reference,
-                user.getEmail(),
-                null,     // no phone — checkout page collects it
-                null,     // no network
-                "card",   // triggers hosted checkout
-                frontendUrl + "/wallet?payment=success",
-                Map.of("userId", user.getId().toString(), "purpose", "deposit")
-        );
+        // Persist BEFORE calling AkwaPay — see initDeposit for why.
+        recordPending(reference, null, user.getId(), amount, false);
+
+        Map<String, Object> response;
+        try {
+            response = akwapayCreateIntent(
+                    amountPesewas,
+                    reference,
+                    user.getEmail(),
+                    null,     // no phone — checkout page collects it
+                    null,     // no network
+                    "card",   // triggers hosted checkout
+                    frontendUrl + "/wallet?payment=success",
+                    Map.of("userId", user.getId().toString(), "purpose", "deposit")
+            );
+        } catch (Exception ex) {
+            deletePending(reference, "akwapay checkout call failed — no intent ever created");
+            throw ex;
+        }
 
         var intentId = String.valueOf(response.get("id"));
-        recordPending(reference, intentId, user.getId(), amount, false);
+        attachIntentId(reference, intentId);
 
         log.info("initCheckout: intent='{}' checkoutUrl='{}' for userId='{}'",
                 intentId, response.get("checkout_url"), user.getId());
@@ -654,19 +755,20 @@ public class AkwaPayController {
             var amount        = BigDecimal.valueOf(amountPesewas)
                     .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
-            var parsed = parseReference(reference);
-            if (parsed == null) {
+            var pending = resolvePending(reference);
+            if (pending.isEmpty()) {
                 log.warn("AkwaPay webhook: unrecognised reference '{}' on event='{}' intent='{}' " +
-                                "amount={} — returning 200 so AkwaPay stops retrying. " +
-                                "If this is a real customer payment, credit it manually.",
+                                "amount={} — no matching pending intent in our ledger. Returning 200 so " +
+                                "AkwaPay stops retrying. If this is a real customer payment, credit it manually.",
                         reference, eventId, intentId, amount);
-                return ResponseEntity.ok("Ignored: foreign reference");
+                return ResponseEntity.ok("Ignored: unknown reference");
             }
+            var parsed = pending.get();
 
-            if (parsed.adminUpgrade()) {
-                handleAdminUpgrade(parsed.userId(), reference, amount, intentId);
+            if (parsed.isAdminUpgrade()) {
+                handleAdminUpgrade(parsed.getUserId(), reference, amount, intentId);
             } else {
-                handleDeposit(parsed.userId(), reference, amount, intentId);
+                handleDeposit(parsed.getUserId(), reference, amount, intentId);
             }
 
             deletePending(reference, "settled by webhook");
@@ -706,6 +808,15 @@ public class AkwaPayController {
     }
 
     private boolean isDue(AkwaPayPendingIntent intent, Instant now) {
+        // No intentId yet means AkwaPay's create-intent call hasn't (or
+        // never will) complete for this row — there is nothing to poll AkwaPay
+        // about. Per AkwaPayPendingIntent javadoc ("WHY intentId IS NULLABLE"),
+        // the sweep skips these; reconcileOne still abandons a null-intentId
+        // row that's stuck well past ABANDON_AFTER (the AkwaPay call itself
+        // died and nothing ever attached an intentId).
+        if (intent.getIntentId() == null) {
+            return intent.getCreatedAt().isBefore(now.minus(ABANDON_AFTER));
+        }
         var last = intent.getLastCheckedAt();
         if (last == null) return true;
         return last.plus(pollIntervalFor(intent, now)).isBefore(now);
@@ -726,6 +837,15 @@ public class AkwaPayController {
             log.warn("reconcile: abandoning ref='{}' intent='{}' after {}h with no settlement",
                     ref, intent.getIntentId(), ABANDON_AFTER.toHours());
             deletePending(ref, "abandoned after " + ABANDON_AFTER.toHours() + "h");
+            return;
+        }
+
+        if (intent.getIntentId() == null) {
+            // isDue() only lets a null-intentId row reach here once it's past
+            // ABANDON_AFTER, so in practice the branch above always catches
+            // it first. This guard exists so we never build a
+            // "/payment_intents/null" URL if that assumption ever changes.
+            log.warn("reconcile: ref='{}' has no intentId yet — nothing to poll, skipping this tick", ref);
             return;
         }
 
@@ -1043,43 +1163,55 @@ public class AkwaPayController {
         return ussd == null ? null : String.valueOf(ussd);
     }
 
-    // ─── Reference encoding / decoding ────────────────────────────────────────
+    // ─── Reference generation / resolution ─────────────────────────────────────
 
-    private String buildReference(String prefix, UUID userId) {
-        // UUID-based nonce guarantees uniqueness across all JVM restarts,
-        // concurrent requests, and retries — nanoTime() can repeat.
-        var nonce = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
-        return prefix
-                + userId.toString().replace("-", "")
-                + "-"
-                + nonce;
+    private static final String REF_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+    private static final int    REF_TOKEN_LENGTH    = 16;
+    private static final java.security.SecureRandom REF_RANDOM = new java.security.SecureRandom();
+
+    /**
+     * Builds a short, opaque merchant reference: prefix + 16 random
+     * lowercase-alphanumeric characters, exactly one hyphen total (the one
+     * baked into the prefix constant). e.g. "sbdep-9k2m7qw1x0az4btc".
+     *
+     * Deliberately does NOT encode the userId or anything else structured —
+     * NaloPay rejects longer, multi-hyphen references outright ("Invalid
+     * value for reference"), and AkwaPay's own docs/tests only ever use
+     * short single-segment references like "order-4471". The userId is
+     * resolved later via {@link #resolvePending}, not decoded from this
+     * string, so there is nothing to gain by embedding it here.
+     */
+    private String buildReference(String prefix) {
+        var sb = new StringBuilder(prefix.length() + REF_TOKEN_LENGTH);
+        sb.append(prefix);
+        for (int i = 0; i < REF_TOKEN_LENGTH; i++) {
+            sb.append(REF_TOKEN_ALPHABET.charAt(REF_RANDOM.nextInt(REF_TOKEN_ALPHABET.length())));
+        }
+        return sb.toString();
     }
 
-    private ParsedRef parseReference(String reference) {
-        boolean adminUpgrade;
-        if (reference.startsWith(REF_PREFIX_DEPOSIT))      adminUpgrade = false;
-        else if (reference.startsWith(REF_PREFIX_ADMIN))   adminUpgrade = true;
-        else return null;
-
-        var rest = reference.substring(REF_PREFIX_DEPOSIT.length());
-        if (rest.length() < 32) return null;
-
-        var hex = rest.substring(0, 32);
+    /**
+     * Resolves a reference back to the pending intent record we persisted
+     * when the charge was created — this is how we recover userId and
+     * whether the charge was an admin upgrade, now that the reference
+     * itself carries no structured data.
+     *
+     * Returns empty for a reference we have no record of (already
+     * reconciled and deleted, or genuinely foreign/unrecognised) — callers
+     * treat that the same way the old "malformed reference" case was
+     * treated: log it and skip, rather than throwing.
+     */
+    private Optional<AkwaPayPendingIntent> resolvePending(String reference) {
+        if (!reference.startsWith(REF_PREFIX_DEPOSIT) && !reference.startsWith(REF_PREFIX_ADMIN)) {
+            return Optional.empty();
+        }
         try {
-            var userId = UUID.fromString(
-                    hex.substring(0, 8)  + "-" +
-                            hex.substring(8, 12) + "-" +
-                            hex.substring(12, 16) + "-" +
-                            hex.substring(16, 20) + "-" +
-                            hex.substring(20, 32));
-            return new ParsedRef(userId, adminUpgrade);
-        } catch (IllegalArgumentException e) {
-            log.warn("parseReference: malformed userId segment in ref='{}'", reference);
-            return null;
+            return pendingIntents.findById(reference);
+        } catch (Exception e) {
+            log.warn("resolvePending: lookup failed for ref='{}': {}", reference, e.getMessage());
+            return Optional.empty();
         }
     }
-
-    private record ParsedRef(UUID userId, boolean adminUpgrade) {}
 
     // ─── Signature verification ───────────────────────────────────────────────
 
