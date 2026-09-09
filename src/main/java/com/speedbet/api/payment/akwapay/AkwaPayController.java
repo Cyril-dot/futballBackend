@@ -35,7 +35,6 @@ import java.math.MathContext;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.SecureRandom;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
@@ -77,25 +76,14 @@ import java.util.UUID;
  *      pending). The USSD code always works.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * REFERENCE FORMAT — 2026-09-09 FIX: SHORT + OPAQUE
+ * REFERENCE FORMAT — HYPHENS NOT UNDERSCORES
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * PREVIOUS bug: the reference embedded the full 32-hex user UUID, producing
- * a 47-character string (e.g. "sbdep-2ccd7eba0d704e9aa573207a00758763-2a694733").
- * NaloPay rejected these with "Invalid reference" — MoMo-routed references get
- * forwarded to the telco (MTN/Telecel/AirtelTigo) side, which typically caps
- * transaction reference fields well below 47 characters.
+ * NaloPay (via AkwaPay) uses our reference as the transaction reference.
+ * Only alphanumeric characters and hyphens are accepted — no underscores:
  *
- * FIX: references are now short random tokens, NOT encoded userId+intent.
- * All identity resolution (which user, deposit vs admin upgrade, amount) now
- * comes from looking up the AkwaPayPendingIntent row by its reference (the
- * @Id), which we already persist before calling AkwaPay. See resolvePending().
- *
- *     sbdep-<16 random alphanumeric>     wallet deposit   (22 chars total)
- *     sbadm-<16 random alphanumeric>     admin upgrade    (22 chars total)
- *
- * Only alphanumeric characters and hyphens — no underscores — per NaloPay's
- * accepted charset.
+ *     sbdep-<32-hex userId>-<8-hex nonce>     wallet deposit
+ *     sbadm-<32-hex userId>-<8-hex nonce>     admin upgrade
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
@@ -150,13 +138,6 @@ public class AkwaPayController {
     // Hyphens only — NaloPay/AkwaPay reject underscores in references.
     private static final String REF_PREFIX_DEPOSIT = "sbdep-";
     private static final String REF_PREFIX_ADMIN   = "sbadm-";
-
-    // Length of the random opaque token appended after the prefix.
-    // Total reference length = prefix(6) + token(16) = 22 chars, well under
-    // any MoMo-scheme reference cap we've seen documented (typically 18-35).
-    private static final int    REF_TOKEN_LENGTH = 16;
-    private static final String REF_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
-    private static final SecureRandom REF_RANDOM = new SecureRandom();
 
     private final Duration akwapayTimeout      = Duration.ofSeconds(15);
     private final long     akwapayRetryAttempts = 2;
@@ -233,7 +214,7 @@ public class AkwaPayController {
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
                 .intValue();
 
-        var reference = buildReference(REF_PREFIX_DEPOSIT);
+        var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
 
         var phone        = req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req.get("network") == null ? null : req.get("network").toString();
@@ -245,36 +226,76 @@ public class AkwaPayController {
         String  network     = useMomoPush ? resolveNetwork(requestedNet, phone) : null;
         String  method      = useMomoPush ? "mobile_money" : "card";
 
-        log.info("initDeposit: userId='{}' amount={} pesewas={} ref='{}' (len={}) method='{}' network='{}'",
-                user.getId(), amount, amountPesewas, reference, reference.length(), method, network);
+        log.info("initDeposit: userId='{}' amount={} pesewas={} ref='{}' method='{}' network='{}'",
+                user.getId(), amount, amountPesewas, reference, method, network);
 
-        // Persist BEFORE calling AkwaPay: recordPending is the only place the
-        // userId is stored against this reference. If AkwaPay call fails after
-        // this point, the sweep never sees a status="succeeded" for an intent
-        // that was never created, so this is safe to do first.
-        recordPending(reference, null, user.getId(), amount, false);
+        // Validate MSISDN before calling AkwaPay — non-Ghana numbers (e.g. 070xx = Nigeria)
+        // will be rejected by NaloPay with "Not a valid Ghanaian MSISDN". Catch it early
+        // so we fall back to checkout gracefully rather than surfacing a confusing error.
+        if (useMomoPush) {
+            var detected = detectNetworkFromPhone(phone);
+            if (detected.isEmpty()) {
+                log.warn("initDeposit: phone='{}' is not a recognised Ghana number — switching to hosted checkout fallback",
+                        phone.length() > 4 ? phone.substring(0, 3) + "***" + phone.substring(phone.length() - 2) : "***");
+                useMomoPush = false;
+                network     = null;
+                method      = "card";
+            }
+        }
 
-        var response = akwapayCreateIntent(
-                amountPesewas,
-                reference,
-                user.getEmail(),
-                phone,
-                network,
-                method,
-                frontendUrl + "/wallet?payment=success",
-                Map.of("userId", user.getId().toString(), "purpose", "deposit")
-        );
+        // Call AkwaPay FIRST — only persist to DB on success so intent_id is never null
+        Map<String, Object> response;
+        try {
+            response = akwapayCreateIntent(
+                    amountPesewas,
+                    reference,
+                    user.getEmail(),
+                    useMomoPush ? phone : null,
+                    useMomoPush ? network : null,
+                    method,
+                    frontendUrl + "/wallet?payment=success",
+                    Map.of("userId", user.getId().toString(), "purpose", "deposit")
+            );
+        } catch (Exception ex) {
+            // NaloPay direct MoMo push failed (PAY-FAIL-0070: push not activated,
+            // or account restriction). Auto-fallback to hosted checkout.
+            if (useMomoPush) {
+                log.warn("initDeposit: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back to hosted checkout. cause: {}",
+                        reference, user.getId(), ex.getMessage());
+                try {
+                    response = akwapayCreateIntent(
+                            amountPesewas,
+                            reference,
+                            user.getEmail(),
+                            null,
+                            null,
+                            "card",
+                            frontendUrl + "/wallet?payment=success",
+                            Map.of("userId", user.getId().toString(), "purpose", "deposit", "momo_fallback", "true")
+                    );
+                    log.info("initDeposit: fallback checkout OK for ref='{}' userId='{}'", reference, user.getId());
+                } catch (Exception fallbackEx) {
+                    log.error("initDeposit: both MoMo push and checkout fallback failed for ref='{}' userId='{}'",
+                            reference, user.getId(), fallbackEx);
+                    throw fallbackEx;
+                }
+            } else {
+                throw ex;
+            }
+        }
 
+        // Persist AFTER AkwaPay succeeds — intent_id is never null this way
         var intentId       = String.valueOf(response.get("id"));
         var nextActionType = nextActionType(response);
 
-        attachIntentId(reference, intentId);
+        recordPending(reference, intentId, user.getId(), amount, false);
 
-        log.info("initDeposit: intent='{}' status='{}' next_action='{}' ussdFallback='{}' for userId='{}'",
+        log.info("initDeposit: intent='{}' status='{}' next_action='{}' ussdFallback='{}' checkoutUrl='{}' for userId='{}'",
                 intentId,
                 response.get("status"),
                 nextActionType,
                 nextActionUssd(response),
+                response.get("checkout_url"),
                 user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(response));
@@ -290,7 +311,7 @@ public class AkwaPayController {
         if (user.getRole().name().equals("ADMIN"))
             throw ApiException.badRequest("You are already an Admin.");
 
-        var reference = buildReference(REF_PREFIX_ADMIN);
+        var reference = buildReference(REF_PREFIX_ADMIN, user.getId());
 
         var phone        = req == null || req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req == null || req.get("network") == null ? null : req.get("network").toString();
@@ -299,43 +320,79 @@ public class AkwaPayController {
         String  network     = useMomoPush ? resolveNetwork(requestedNet, phone) : null;
         String  method      = useMomoPush ? "mobile_money" : "card";
 
-        log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}' (len={}) method='{}' network='{}'",
-                user.getId(), user.getEmail(), reference, reference.length(), method, network);
+        log.info("initAdminUpgrade: userId='{}' email='{}' ref='{}' method='{}' network='{}'",
+                user.getId(), user.getEmail(), reference, method, network);
 
         var upgradeAmountGhs = BigDecimal.valueOf(ADMIN_UPGRADE_FEE_PESEWAS)
                 .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
-        recordPending(reference, null, user.getId(), upgradeAmountGhs, true);
+        // Validate MSISDN for admin upgrade too
+        if (useMomoPush) {
+            var detected = detectNetworkFromPhone(phone);
+            if (detected.isEmpty()) {
+                log.warn("initAdminUpgrade: phone not a Ghana number — switching to hosted checkout");
+                useMomoPush = false;
+                network     = null;
+                method      = "card";
+            }
+        }
 
-        var response = akwapayCreateIntent(
-                ADMIN_UPGRADE_FEE_PESEWAS,
-                reference,
-                user.getEmail(),
-                phone,
-                network,
-                method,
-                frontendUrl + "/app/upgrade?payment=success",
-                Map.of(
-                        "userId",        user.getId().toString(),
-                        "upgradeIntent", UPGRADE_INTENT_ADMIN
-                )
-        );
+        Map<String, Object> response;
+        try {
+            response = akwapayCreateIntent(
+                    ADMIN_UPGRADE_FEE_PESEWAS,
+                    reference,
+                    user.getEmail(),
+                    useMomoPush ? phone : null,
+                    useMomoPush ? network : null,
+                    method,
+                    frontendUrl + "/app/upgrade?payment=success",
+                    Map.of(
+                            "userId",        user.getId().toString(),
+                            "upgradeIntent", UPGRADE_INTENT_ADMIN
+                    )
+            );
+        } catch (Exception ex) {
+            if (useMomoPush) {
+                log.warn("initAdminUpgrade: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back to hosted checkout. cause: {}",
+                        reference, user.getId(), ex.getMessage());
+                try {
+                    response = akwapayCreateIntent(
+                            ADMIN_UPGRADE_FEE_PESEWAS,
+                            reference,
+                            user.getEmail(),
+                            null,
+                            null,
+                            "card",
+                            frontendUrl + "/app/upgrade?payment=success",
+                            Map.of(
+                                    "userId",        user.getId().toString(),
+                                    "upgradeIntent", UPGRADE_INTENT_ADMIN,
+                                    "momo_fallback", "true"
+                            )
+                    );
+                    log.info("initAdminUpgrade: fallback checkout OK for ref='{}' userId='{}'", reference, user.getId());
+                } catch (Exception fallbackEx) {
+                    log.error("initAdminUpgrade: both MoMo and checkout failed for ref='{}' userId='{}'",
+                            reference, user.getId(), fallbackEx);
+                    throw fallbackEx;
+                }
+            } else {
+                throw ex;
+            }
+        }
 
+        // Persist AFTER AkwaPay succeeds — intent_id is never null
         var intentId = String.valueOf(response.get("id"));
-        attachIntentId(reference, intentId);
+        recordPending(reference, intentId, user.getId(), upgradeAmountGhs, true);
 
-        log.info("initAdminUpgrade: intent='{}' status='{}' next_action='{}' for userId='{}'",
-                intentId, response.get("status"), nextActionType(response), user.getId());
+        log.info("initAdminUpgrade: intent='{}' status='{}' next_action='{}' checkoutUrl='{}' for userId='{}'",
+                intentId, response.get("status"), nextActionType(response),
+                response.get("checkout_url"), user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-    /**
-     * Persists the pending intent row. Called BEFORE the AkwaPay API call so
-     * that the (userId, amount, adminUpgrade) tuple is recoverable purely from
-     * the reference string even if the process crashes mid-request. intentId
-     * may be null initially — see attachIntentId().
-     */
     private void recordPending(String reference, String intentId, UUID userId,
                                BigDecimal amountGhs, boolean adminUpgrade) {
         try {
@@ -347,25 +404,6 @@ public class AkwaPayController {
             log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
                             "this payment can only be credited by webhook or by hand. Investigate.",
                     reference, intentId, userId, amountGhs, e);
-        }
-    }
-
-    /** Fills in the AkwaPay intent id once it's known, after the pending row already exists. */
-    private void attachIntentId(String reference, String intentId) {
-        try {
-            var existing = pendingIntents.findById(reference).orElse(null);
-            if (existing == null) {
-                log.error("attachIntentId: no pending row for ref='{}' (intent='{}') — " +
-                                "was recordPending() called first? This intent cannot be reconciled by the sweep.",
-                        reference, intentId);
-                return;
-            }
-            existing.setIntentId(intentId);
-            pendingIntents.save(existing);
-            log.info("attachIntentId: ref='{}' now linked to intent='{}'", reference, intentId);
-        } catch (Exception e) {
-            log.error("attachIntentId: FAILED for ref='{}' intent='{}' — sweep may not find this by intentId " +
-                    "but reconciliation still works via reference lookup on webhook.", reference, intentId, e);
         }
     }
 
@@ -395,12 +433,10 @@ public class AkwaPayController {
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
                 .intValue();
 
-        var reference = buildReference(REF_PREFIX_DEPOSIT);
+        var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
 
-        log.info("initCheckout: userId='{}' amount={} ref='{}' (len={}) — hosted checkout fallback",
-                user.getId(), amount, reference, reference.length());
-
-        recordPending(reference, null, user.getId(), amount, false);
+        log.info("initCheckout: userId='{}' amount={} ref='{}' — hosted checkout fallback",
+                user.getId(), amount, reference);
 
         var response = akwapayCreateIntent(
                 amountPesewas,
@@ -414,7 +450,7 @@ public class AkwaPayController {
         );
 
         var intentId = String.valueOf(response.get("id"));
-        attachIntentId(reference, intentId);
+        recordPending(reference, intentId, user.getId(), amount, false);
 
         log.info("initCheckout: intent='{}' checkoutUrl='{}' for userId='{}'",
                 intentId, response.get("checkout_url"), user.getId());
@@ -576,19 +612,19 @@ public class AkwaPayController {
             var amount        = BigDecimal.valueOf(amountPesewas)
                     .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
-            var pending = resolvePending(reference);
-            if (pending == null) {
+            var parsed = parseReference(reference);
+            if (parsed == null) {
                 log.warn("AkwaPay webhook: unrecognised reference '{}' on event='{}' intent='{}' " +
                                 "amount={} — returning 200 so AkwaPay stops retrying. " +
                                 "If this is a real customer payment, credit it manually.",
                         reference, eventId, intentId, amount);
-                return ResponseEntity.ok("Ignored: unknown reference");
+                return ResponseEntity.ok("Ignored: foreign reference");
             }
 
-            if (pending.isAdminUpgrade()) {
-                handleAdminUpgrade(pending.getUserId(), reference, amount, intentId);
+            if (parsed.adminUpgrade()) {
+                handleAdminUpgrade(parsed.userId(), reference, amount, intentId);
             } else {
-                handleDeposit(pending.getUserId(), reference, amount, intentId);
+                handleDeposit(parsed.userId(), reference, amount, intentId);
             }
 
             deletePending(reference, "settled by webhook");
@@ -628,9 +664,6 @@ public class AkwaPayController {
     }
 
     private boolean isDue(AkwaPayPendingIntent intent, Instant now) {
-        // No AkwaPay intent id yet means the create-intent call never finished
-        // (crashed between recordPending and attachIntentId) — nothing to poll.
-        if (intent.getIntentId() == null || intent.getIntentId().isBlank()) return false;
         var last = intent.getLastCheckedAt();
         if (last == null) return true;
         return last.plus(pollIntervalFor(intent, now)).isBefore(now);
@@ -871,9 +904,8 @@ public class AkwaPayController {
 
         var idempotencyKey = UUID.randomUUID().toString();
 
-        log.info("akwapayCreateIntent: ref='{}' (len={}) method='{}' network='{}' amountPesewas={} idempotencyKey='{}'",
-                reference, reference.length(), method, network, amountPesewas, idempotencyKey);
-        log.debug("akwapayCreateIntent: full request body for ref='{}': {}", reference, body);
+        log.info("akwapayCreateIntent: ref='{}' method='{}' network='{}' amountPesewas={} idempotencyKey='{}'",
+                reference, method, network, amountPesewas, idempotencyKey);
 
         var result = (Map<String, Object>) webClientBuilder.build()
                 .post().uri(baseUrl + "/payment_intents")
@@ -886,13 +918,8 @@ public class AkwaPayController {
                         status -> status.isError(),
                         clientResponse -> clientResponse.bodyToMono(String.class)
                                 .map(errBody -> {
-                                    // Log EVERYTHING about the failing request so a rejected
-                                    // reference (or any other field AkwaPay/NaloPay dislikes)
-                                    // is diagnosable from logs alone, without reproducing locally.
-                                    log.error("AkwaPay API error: status={} ref='{}' (len={}) method='{}' " +
-                                                    "network='{}' amountPesewas={} idempotencyKey='{}' body={}",
-                                            clientResponse.statusCode(), reference, reference.length(),
-                                            method, network, amountPesewas, idempotencyKey, errBody);
+                                    log.error("AkwaPay API error: status={} ref='{}' body={}",
+                                            clientResponse.statusCode(), reference, errBody);
 
                                     int code = clientResponse.statusCode().value();
                                     if (code >= 400 && code < 500) {
@@ -904,15 +931,10 @@ public class AkwaPayController {
                                             @SuppressWarnings("unchecked")
                                             var error = (Map<String, Object>) parsed.get("error");
                                             var msg = error != null ? (String) error.get("message") : null;
-                                            var errCode = error != null ? (String) error.get("code") : null;
-                                            log.error("AkwaPay API error detail: ref='{}' errorCode='{}' errorMessage='{}'",
-                                                    reference, errCode, msg);
                                             userMessage = (msg != null && !msg.isBlank())
                                                     ? msg
                                                     : "Payment was rejected. Please check your details and try again.";
                                         } catch (Exception parseEx) {
-                                            log.error("AkwaPay API error: could not parse error body as JSON for ref='{}': {}",
-                                                    reference, errBody);
                                             userMessage = "Payment was rejected. Please check your details and try again.";
                                         }
                                         return (Throwable) ApiException.badRequest(userMessage);
@@ -929,17 +951,13 @@ public class AkwaPayController {
                 .onErrorMap(
                         ex -> !(ex instanceof RuntimeException) || ex.getMessage() == null,
                         ex -> {
-                            log.error("AkwaPay API unreachable after {} retries, ref='{}'",
-                                    akwapayRetryAttempts, reference, ex);
+                            log.error("AkwaPay API unreachable after {} retries", akwapayRetryAttempts, ex);
                             return new RuntimeException("AkwaPay is currently unavailable. Please try again.");
                         }
                 )
                 .block();
 
-        if (result == null) {
-            log.error("akwapayCreateIntent: empty response body for ref='{}'", reference);
-            throw new RuntimeException("AkwaPay returned an empty response.");
-        }
+        if (result == null) throw new RuntimeException("AkwaPay returned an empty response.");
 
         var status = String.valueOf(result.get("status"));
         log.info("akwapayCreateIntent: intent='{}' status='{}' next_action='{}' ussdFallback='{}' ref='{}'",
@@ -976,50 +994,41 @@ public class AkwaPayController {
         return ussd == null ? null : String.valueOf(ussd);
     }
 
-    // ─── Reference generation / resolution ────────────────────────────────────
+    // ─── Reference encoding / decoding ────────────────────────────────────────
 
-    /**
-     * Builds a short, opaque reference: prefix + 16 random lowercase
-     * alphanumeric characters. 22 characters total, hyphens only, well under
-     * any MoMo-scheme reference length limit we've seen.
-     *
-     * IMPORTANT: unlike the old scheme, this reference does NOT encode the
-     * userId or anything else. All lookups go through resolvePending(), which
-     * reads the AkwaPayPendingIntent row keyed by this exact string. The row
-     * MUST be saved via recordPending() before this reference is sent to
-     * AkwaPay, or the webhook/sweep will have nothing to resolve it against.
-     */
-    private String buildReference(String prefix) {
-        var sb = new StringBuilder(prefix.length() + REF_TOKEN_LENGTH);
-        sb.append(prefix);
-        for (int i = 0; i < REF_TOKEN_LENGTH; i++) {
-            sb.append(REF_TOKEN_ALPHABET.charAt(REF_RANDOM.nextInt(REF_TOKEN_ALPHABET.length())));
-        }
-        var ref = sb.toString();
-        // Belt-and-suspenders: collisions are astronomically unlikely
-        // (36^16 keyspace) but a random generator is still a random
-        // generator, and this table is small — check is cheap.
-        if (pendingIntents.existsById(ref)) {
-            log.warn("buildReference: collision on '{}' — regenerating", ref);
-            return buildReference(prefix);
-        }
-        return ref;
+    private String buildReference(String prefix, UUID userId) {
+        var nonce = Long.toHexString(System.nanoTime() & 0xFFFFFFFFL);
+        return prefix
+                + userId.toString().replace("-", "")
+                + "-"
+                + String.format("%8s", nonce).replace(' ', '0');
     }
 
-    /**
-     * Resolves a reference back to its pending intent row. Replaces the old
-     * parseReference() which tried to decode the userId out of the string
-     * itself — that only worked because the string used to embed the UUID,
-     * which is exactly what made references too long for NaloPay to accept.
-     */
-    private AkwaPayPendingIntent resolvePending(String reference) {
-        if (reference == null || reference.isBlank()) return null;
-        if (!reference.startsWith(REF_PREFIX_DEPOSIT) && !reference.startsWith(REF_PREFIX_ADMIN)) {
-            log.warn("resolvePending: reference '{}' does not match any known prefix", reference);
+    private ParsedRef parseReference(String reference) {
+        boolean adminUpgrade;
+        if (reference.startsWith(REF_PREFIX_DEPOSIT))      adminUpgrade = false;
+        else if (reference.startsWith(REF_PREFIX_ADMIN))   adminUpgrade = true;
+        else return null;
+
+        var rest = reference.substring(REF_PREFIX_DEPOSIT.length());
+        if (rest.length() < 32) return null;
+
+        var hex = rest.substring(0, 32);
+        try {
+            var userId = UUID.fromString(
+                    hex.substring(0, 8)  + "-" +
+                            hex.substring(8, 12) + "-" +
+                            hex.substring(12, 16) + "-" +
+                            hex.substring(16, 20) + "-" +
+                            hex.substring(20, 32));
+            return new ParsedRef(userId, adminUpgrade);
+        } catch (IllegalArgumentException e) {
+            log.warn("parseReference: malformed userId segment in ref='{}'", reference);
             return null;
         }
-        return pendingIntents.findById(reference).orElse(null);
     }
+
+    private record ParsedRef(UUID userId, boolean adminUpgrade) {}
 
     // ─── Signature verification ───────────────────────────────────────────────
 
