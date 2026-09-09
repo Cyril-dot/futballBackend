@@ -217,6 +217,13 @@ public class SuperAdminController {
     /**
      * GET /api/super-admin/metrics/deposits
      *
+     * LEGACY / DEPRECATED — kept only so nothing currently depending on it
+     * breaks. Sums every deposit and withdrawal into ONE figure regardless
+     * of country, then hardcodes the "currency" field to "GHS" — meaning any
+     * Nigerian (naira) deposits are silently added into a cedi-labeled total.
+     * Do not use this for anything requiring an accurate total. Use
+     * GET /metrics/deposits/by-country instead.
+     *
      * Returns platform-wide deposit and withdrawal totals broken down by
      * all-time, this month, and today.
      *
@@ -235,6 +242,63 @@ public class SuperAdminController {
     @GetMapping("/metrics/deposits")
     public ResponseEntity<ApiResponse<SuperAdminDtos.RevenueOverviewDto>> depositMetrics() {
         return ResponseEntity.ok(ApiResponse.ok(queryService.getRevenueOverview()));
+    }
+
+    /**
+     * GET /api/super-admin/metrics/deposits/by-country
+     *
+     * Country-split replacement for /metrics/deposits. Returns Ghana and
+     * Nigeria figures as two fully independent blocks — each with its own
+     * currency, all-time/month/today deposit totals, withdrawal totals, and
+     * counts. GH and NG are never summed into a combined figure; the client
+     * must render them as two separate cards.
+     *
+     * Classification rule (see CountryUtils.classifyForRevenue):
+     *   1. The depositing/withdrawing user's own country wins if it resolves
+     *      to GH or NG, regardless of the amount. A GH user who deposits
+     *      ₵35,000 via bank transfer is still counted as GH.
+     *   2. Only when the user's country is OTHER/UNKNOWN does the amount
+     *      fallback apply: amount < 30,000 => GH, amount >= 30,000 => NG.
+     *      This applies uniformly across every deposit source — the
+     *      bank-transfer flow does not get its own override.
+     *
+     * Scope: only wallet Transaction rows (kind=DEPOSIT / kind=WITHDRAW) are
+     * counted. Every approved BankDeposit, SimpleDeposit, and BinanceDeposit
+     * submission already produces exactly one such Transaction row via
+     * WalletService.credit(...) at approval time, so this total already
+     * reflects those flows — it does not need to (and must not) separately
+     * add the staging tables on top, or approved deposits would be double
+     * counted.
+     *
+     * Response:
+     * {
+     *   "ghana": {
+     *     "country": "GH",
+     *     "currency": "GHS",
+     *     "totalDepositsAllTime": 9800000.00,
+     *     "totalDepositsThisMonth": 620000.00,
+     *     "totalDepositsToday": 2100.00,
+     *     "totalWithdrawalsAllTime": 3100000.00,
+     *     "totalWithdrawalsThisMonth": 240000.00,
+     *     "totalDepositCount": 980,
+     *     "totalWithdrawalCount": 260
+     *   },
+     *   "nigeria": {
+     *     "country": "NG",
+     *     "currency": "NGN",
+     *     "totalDepositsAllTime": 4100000.00,
+     *     "totalDepositsThisMonth": 310000.00,
+     *     "totalDepositsToday": 45000.00,
+     *     "totalWithdrawalsAllTime": 1500000.00,
+     *     "totalWithdrawalsThisMonth": 95000.00,
+     *     "totalDepositCount": 260,
+     *     "totalWithdrawalCount": 120
+     *   }
+     * }
+     */
+    @GetMapping("/metrics/deposits/by-country")
+    public ResponseEntity<ApiResponse<SuperAdminDtos.CountryRevenueOverviewDto>> depositMetricsByCountry() {
+        return ResponseEntity.ok(ApiResponse.ok(queryService.getCountryRevenueOverview()));
     }
 
     // ══════════════════════════════════════════════════════════════════════════

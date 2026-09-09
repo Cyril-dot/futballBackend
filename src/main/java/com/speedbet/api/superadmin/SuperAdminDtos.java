@@ -24,6 +24,48 @@ public class SuperAdminDtos {
             String currency
     ) {}
 
+    /**
+     * Country-split replacement for {@link RevenueOverviewDto}, used by the
+     * dashboard's revenue tiles. Ghana and Nigeria are returned as two fully
+     * independent blocks, each with its own currency, all-time/month/today
+     * deposit totals, withdrawal totals, and counts.
+     * <p>
+     * There is deliberately NO combined/platform-wide total field here — GH
+     * and NG amounts are in different currencies and must never be summed.
+     * The frontend must render {@code ghana} and {@code nigeria} as two
+     * separate cards.
+     */
+    public record CountryRevenueOverviewDto(
+            CountryRevenueBlockDto ghana,
+            CountryRevenueBlockDto nigeria
+    ) {}
+
+    /** One country's full revenue picture — the building block of {@link CountryRevenueOverviewDto}. */
+    public record CountryRevenueBlockDto(
+            String country,                        // "GH" or "NG"
+            String currency,                        // "GHS" or "NGN"
+            BigDecimal totalDepositsAllTime,
+            BigDecimal totalDepositsThisMonth,
+            BigDecimal totalDepositsToday,
+            BigDecimal totalWithdrawalsAllTime,
+            BigDecimal totalWithdrawalsThisMonth,
+            long totalDepositCount,
+            long totalWithdrawalCount
+    ) {}
+
+    /**
+     * Internal projection row used only while aggregating
+     * {@link CountryRevenueOverviewDto} inside SuperAdminQueryService. Never
+     * returned from a controller. Carries the user's raw (un-normalized)
+     * country string so classification can be done in Java via
+     * {@link CountryUtils#classifyForRevenue(String, BigDecimal)}.
+     */
+    public record RevenueRawRow(
+            BigDecimal amount,
+            String rawCountry,
+            Instant createdAt
+    ) {}
+
     public record AdminCommissionPeriodDto(
             String periodLabel,
             UUID adminId,

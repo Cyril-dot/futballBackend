@@ -147,4 +147,32 @@ public interface TransactionRepository
     default List<Transaction> findAllByKindSince(TxKind kind, Instant since) {
         return findByKindAndCreatedAtGreaterThanEqualOrderByCreatedAtAsc(kind, since);
     }
+
+    // ── NEW: added for the country-split revenue overview (GH/NG dashboard split) ─
+    //
+    // Raw projection rows for SuperAdminQueryService.getCountryRevenueOverview().
+    // Deliberately does NOT classify country here — it returns each row's raw,
+    // un-normalized User.country string plus the amount and timestamp, and lets
+    // CountryUtils.classifyForRevenue(rawCountry, amount) decide GH vs NG in
+    // Java. That method's amount-threshold fallback and string normalization
+    // are business logic that belongs in one place, not duplicated into SQL.
+    //
+    // Uses the same multi-table FROM/WHERE join style as
+    // findDepositsByAdminSince above (Transaction.walletId / Wallet.userId are
+    // plain UUID columns, not @ManyToOne relationships), rather than JPQL
+    // ad-hoc "JOIN ... ON" syntax, to stay consistent with what's already
+    // proven to compile and run in this repository.
+    //
+    // Called once per TxKind (DEPOSIT, then WITHDRAW) by the service.
+
+    @Query("""
+        SELECT new com.speedbet.api.superadmin.SuperAdminDtos$RevenueRawRow(
+            t.amount, u.country, t.createdAt
+        )
+        FROM Transaction t, Wallet w, com.speedbet.api.user.User u
+        WHERE t.walletId = w.id
+          AND w.userId = u.id
+          AND t.kind = :kind
+        """)
+    List<com.speedbet.api.superadmin.SuperAdminDtos.RevenueRawRow> findRawRowsByKind(@Param("kind") TxKind kind);
 }

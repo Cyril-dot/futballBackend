@@ -66,6 +66,101 @@ public class SuperAdminQueryService {
                 depositCount, withdrawalCount, "GHS");
     }
 
+    /**
+     * Country-split revenue overview — the fix for the dashboard mixing GH and
+     * NG deposits into one figure. Classifies every DEPOSIT and WITHDRAW
+     * transaction into GH or NG using CountryUtils.classifyForRevenue:
+     *   1. The depositing user's own country wins if it resolves to GH or NG,
+     *      regardless of amount.
+     *   2. Otherwise (user's country is OTHER/UNKNOWN), falls back to the
+     *      amount heuristic: amount < 30,000 => GH, amount >= 30,000 => NG.
+     * This applies uniformly to every deposit source that lands in the
+     * Transaction table (wallet top-ups, approved bank transfers, approved
+     * crypto deposits, approved simple/MoMo deposits) — all of them credit
+     * the wallet via WalletService.credit(...), which is what writes the
+     * DEPOSIT transaction row this method reads.
+     * <p>
+     * GH and NG totals are computed completely independently and are never
+     * added together — there is deliberately no combined "platform total"
+     * field on {@link SuperAdminDtos.CountryRevenueOverviewDto}.
+     */
+    public SuperAdminDtos.CountryRevenueOverviewDto getCountryRevenueOverview() {
+        log.info("getCountryRevenueOverview: computing GH/NG split revenue stats");
+
+        Instant startOfToday = Instant.now().truncatedTo(ChronoUnit.DAYS);
+        Instant startOfMonth = Instant.now()
+                .truncatedTo(ChronoUnit.DAYS)
+                .minus(Instant.now().atZone(java.time.ZoneOffset.UTC).getDayOfMonth() - 1L, ChronoUnit.DAYS);
+
+        List<SuperAdminDtos.RevenueRawRow> depositRows  = txRepo.findRawRowsByKind(TxKind.DEPOSIT);
+        List<SuperAdminDtos.RevenueRawRow> withdrawRows = txRepo.findRawRowsByKind(TxKind.WITHDRAW);
+
+        CountryAccumulator gh = new CountryAccumulator();
+        CountryAccumulator ng = new CountryAccumulator();
+
+        for (SuperAdminDtos.RevenueRawRow row : depositRows) {
+            String classified = CountryUtils.classifyForRevenue(row.rawCountry(), row.amount());
+            CountryAccumulator target = CountryUtils.GH.equals(classified) ? gh : ng;
+            target.addDeposit(row.amount(), row.createdAt(), startOfMonth, startOfToday);
+        }
+
+        for (SuperAdminDtos.RevenueRawRow row : withdrawRows) {
+            String classified = CountryUtils.classifyForRevenue(row.rawCountry(), row.amount());
+            CountryAccumulator target = CountryUtils.GH.equals(classified) ? gh : ng;
+            target.addWithdrawal(row.amount(), row.createdAt(), startOfMonth);
+        }
+
+        var ghanaBlock = new SuperAdminDtos.CountryRevenueBlockDto(
+                CountryUtils.GH, "GHS",
+                gh.depositsAllTime, gh.depositsThisMonth, gh.depositsToday,
+                gh.withdrawalsAllTime, gh.withdrawalsThisMonth,
+                gh.depositCount, gh.withdrawalCount);
+
+        var nigeriaBlock = new SuperAdminDtos.CountryRevenueBlockDto(
+                CountryUtils.NG, "NGN",
+                ng.depositsAllTime, ng.depositsThisMonth, ng.depositsToday,
+                ng.withdrawalsAllTime, ng.withdrawalsThisMonth,
+                ng.depositCount, ng.withdrawalCount);
+
+        return new SuperAdminDtos.CountryRevenueOverviewDto(ghanaBlock, nigeriaBlock);
+    }
+
+    /**
+     * Mutable running totals for one country while iterating raw rows in
+     * {@link #getCountryRevenueOverview()}. Kept private to this service —
+     * never exposed outside that method, never touches the database itself.
+     */
+    private static final class CountryAccumulator {
+        BigDecimal depositsAllTime      = BigDecimal.ZERO;
+        BigDecimal depositsThisMonth    = BigDecimal.ZERO;
+        BigDecimal depositsToday        = BigDecimal.ZERO;
+        BigDecimal withdrawalsAllTime   = BigDecimal.ZERO;
+        BigDecimal withdrawalsThisMonth = BigDecimal.ZERO;
+        long depositCount    = 0;
+        long withdrawalCount = 0;
+
+        void addDeposit(BigDecimal amount, Instant createdAt, Instant startOfMonth, Instant startOfToday) {
+            BigDecimal amt = amount != null ? amount : BigDecimal.ZERO;
+            depositsAllTime = depositsAllTime.add(amt);
+            depositCount++;
+            if (createdAt != null && !createdAt.isBefore(startOfMonth)) {
+                depositsThisMonth = depositsThisMonth.add(amt);
+            }
+            if (createdAt != null && !createdAt.isBefore(startOfToday)) {
+                depositsToday = depositsToday.add(amt);
+            }
+        }
+
+        void addWithdrawal(BigDecimal amount, Instant createdAt, Instant startOfMonth) {
+            BigDecimal amt = amount != null ? amount : BigDecimal.ZERO;
+            withdrawalsAllTime = withdrawalsAllTime.add(amt);
+            withdrawalCount++;
+            if (createdAt != null && !createdAt.isBefore(startOfMonth)) {
+                withdrawalsThisMonth = withdrawalsThisMonth.add(amt);
+            }
+        }
+    }
+
     // ─── All Users (paginated + search) ──────────────────────────────────────
 
     /**
@@ -217,7 +312,7 @@ public class SuperAdminQueryService {
         Pageable p = pageable.getSort().isSorted()
                 ? pageable
                 : PageRequest.of(pageable.getPageNumber(), pageable.getPageSize(),
-                        Sort.by(Sort.Direction.DESC, "createdAt"));
+                Sort.by(Sort.Direction.DESC, "createdAt"));
 
         Page<Transaction> page =
                 txRepo.findAll(TransactionSpecs.filtered(kind, status, walletId, from, to), p);
@@ -236,8 +331,8 @@ public class SuperAdminQueryService {
         Set<UUID> userIds = new HashSet<>(walletToUser.values());
         Map<UUID, User> usersById = userIds.isEmpty() ? Map.of()
                 : userRepo.findAllById(userIds).stream()
-                    .filter(u -> u != null && u.getId() != null)
-                    .collect(Collectors.toMap(User::getId, u -> u, (a, b) -> a));
+                .filter(u -> u != null && u.getId() != null)
+                .collect(Collectors.toMap(User::getId, u -> u, (a, b) -> a));
 
         return page.map(tx -> {
             UUID userId = walletToUser.get(tx.getWalletId());
