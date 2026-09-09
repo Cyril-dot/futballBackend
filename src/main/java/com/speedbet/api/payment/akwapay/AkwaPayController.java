@@ -880,6 +880,16 @@ public class AkwaPayController {
         log.info("reconcile: ref='{}' intent='{}' akwapayStatus='{}' attempt={}",
                 ref, intent.getIntentId(), akwapayStatus, intent.getAttempts());
 
+        // DIAGNOSTIC (2026-09-09) — "push never arrives" investigation.
+        // Dump the full raw status response on the first 3 attempts only
+        // (avoids flooding logs for a payment that's legitimately just
+        // sitting in await_prompt for a while). If NaloPay surfaces any
+        // delivery/provider hint beyond `status`, it'll be visible here.
+        if (intent.getAttempts() <= 3) {
+            log.info("reconcile[momo-diag]: ref='{}' intent='{}' attempt={} FULL response body={}",
+                    ref, intent.getIntentId(), intent.getAttempts(), result);
+        }
+
         switch (akwapayStatus) {
             case "succeeded" -> {
                 log.info("reconcile: ref='{}' succeeded on sweep — applying credit", ref);
@@ -1063,11 +1073,36 @@ public class AkwaPayController {
         body.put("method",     method);
 
         // Only set network for mobile_money — card doesn't need it
+        boolean networkAttached = false;
         if ("mobile_money".equals(method) && network != null) {
             body.put("network", network.toUpperCase());
+            networkAttached = true;
         }
 
         var idempotencyKey = UUID.randomUUID().toString();
+
+        // DIAGNOSTIC (2026-09-09) — "push never arrives" investigation.
+        // Logs the exact shape of what we send NaloPay for a mobile_money
+        // request: phone presence/length/format (masked, never the raw
+        // number) and whether `network` actually made it into the body —
+        // if networkAttached is false for a mobile_money call, NaloPay is
+        // getting a request with no network hint, which is one likely
+        // reason a push never reaches the handset.
+        if ("mobile_money".equals(method)) {
+            var maskedPhone = phone == null ? "null"
+                    : phone.length() > 4
+                      ? phone.substring(0, 3) + "***" + phone.substring(phone.length() - 2)
+                      : "<short>";
+            log.info("akwapayCreateIntent[momo-diag]: ref='{}' phoneMasked='{}' phoneLength={} phoneStartsWithPlus={} " +
+                            "network='{}' networkAttachedToBody={} idempotencyKey='{}'",
+                    reference,
+                    maskedPhone,
+                    phone == null ? 0 : phone.length(),
+                    phone != null && phone.startsWith("+"),
+                    network,
+                    networkAttached,
+                    idempotencyKey);
+        }
 
         log.info("akwapayCreateIntent: ref='{}' method='{}' network='{}' amountPesewas={} idempotencyKey='{}'",
                 reference, method, network, amountPesewas, idempotencyKey);
@@ -1127,6 +1162,18 @@ public class AkwaPayController {
         var status = String.valueOf(result.get("status"));
         log.info("akwapayCreateIntent: intent='{}' status='{}' next_action='{}' ussdFallback='{}' ref='{}'",
                 result.get("id"), status, nextActionType(result), nextActionUssd(result), reference);
+
+        // DIAGNOSTIC (2026-09-09) — dump the FULL raw response for mobile_money
+        // calls only (card/checkout responses are noisier and less relevant to
+        // "push never arrives"). AkwaPay may include provider-side fields we
+        // don't currently parse (e.g. a warning, a delivery hint, a different
+        // provider code) that explain why NaloPay accepted the request
+        // (status=requires_action, next_action=await_prompt) but the handset
+        // never got the prompt. If this ever shows something informative,
+        // promote it into nextActionType()/nextActionUssd() as a real field.
+        if ("mobile_money".equals(method)) {
+            log.info("akwapayCreateIntent[momo-diag]: ref='{}' FULL response body={}", reference, result);
+        }
 
         if (result.get("error") != null) {
             log.error("akwapayCreateIntent: error on ref='{}' — {}", reference, result.get("error"));
