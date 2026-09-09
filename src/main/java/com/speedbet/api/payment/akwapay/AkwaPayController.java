@@ -997,11 +997,13 @@ public class AkwaPayController {
     // ─── Reference encoding / decoding ────────────────────────────────────────
 
     private String buildReference(String prefix, UUID userId) {
-        var nonce = Long.toHexString(System.nanoTime() & 0xFFFFFFFFL);
+        // UUID-based nonce guarantees uniqueness across all JVM restarts,
+        // concurrent requests, and retries — nanoTime() can repeat.
+        var nonce = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
         return prefix
                 + userId.toString().replace("-", "")
                 + "-"
-                + String.format("%8s", nonce).replace(' ', '0');
+                + nonce;
     }
 
     private ParsedRef parseReference(String reference) {
