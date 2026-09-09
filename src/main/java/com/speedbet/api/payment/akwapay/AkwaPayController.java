@@ -86,6 +86,19 @@ import java.util.UUID;
  *     sbadm-<32-hex userId>-<8-hex nonce>     admin upgrade
  *
  * ─────────────────────────────────────────────────────────────────────────────
+ * FIX (2026-09-09) — DO NOT REUSE A REFERENCE ACROSS RETRY ATTEMPTS
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * NaloPay appears to persist a payment_intent record for a reference even
+ * when the create call ultimately errors back to us (e.g. MoMo push
+ * rejected due to account restriction/activation). If we retry the SAME
+ * reference against the hosted-checkout fallback, NaloPay rejects the
+ * second call with "You have already created a payment intent with this
+ * reference." Every call to AkwaPay — including same-request fallback
+ * retries — must use a freshly generated reference. See
+ * {@link #initDeposit} and {@link #initAdminUpgrade}.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -194,6 +207,13 @@ public class AkwaPayController {
      *   Response includes checkout_url — redirect the customer there.
      *   The AkwaPay checkout page handles MoMo form + USSD + card.
      *
+     * IMPORTANT: if the primary MoMo push attempt fails and we fall back to
+     * hosted checkout, the fallback call uses a NEWLY GENERATED reference,
+     * not the one that just failed. NaloPay can persist a payment_intent
+     * record for a reference even when it errors the create call back to
+     * us, so reusing that reference on the fallback gets rejected with
+     * "You have already created a payment intent with this reference."
+     *
      * Frontend should:
      *   1. If next_action.type == "await_prompt": show "Check your phone"
      *      spinner + ussdFallback USSD code as tap-to-dial.
@@ -262,10 +282,19 @@ public class AkwaPayController {
             if (useMomoPush) {
                 log.warn("initDeposit: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back to hosted checkout. cause: {}",
                         reference, user.getId(), ex.getMessage());
+
+                // IMPORTANT: generate a FRESH reference for the fallback attempt.
+                // NaloPay may have already persisted a payment_intent record under
+                // the original reference even though it returned an error to us —
+                // retrying that same reference gets rejected as a duplicate.
+                var fallbackReference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
+                log.info("initDeposit: retrying with fresh ref='{}' (was '{}') for userId='{}'",
+                        fallbackReference, reference, user.getId());
+
                 try {
                     response = akwapayCreateIntent(
                             amountPesewas,
-                            reference,
+                            fallbackReference,
                             user.getEmail(),
                             null,
                             null,
@@ -273,10 +302,11 @@ public class AkwaPayController {
                             frontendUrl + "/wallet?payment=success",
                             Map.of("userId", user.getId().toString(), "purpose", "deposit", "momo_fallback", "true")
                     );
+                    reference = fallbackReference; // downstream logging/persistence must use the ref that actually succeeded
                     log.info("initDeposit: fallback checkout OK for ref='{}' userId='{}'", reference, user.getId());
                 } catch (Exception fallbackEx) {
-                    log.error("initDeposit: both MoMo push and checkout fallback failed for ref='{}' userId='{}'",
-                            reference, user.getId(), fallbackEx);
+                    log.error("initDeposit: both MoMo push and checkout fallback failed for userId='{}' (attempted refs '{}' then '{}')",
+                            user.getId(), reference, fallbackReference, fallbackEx);
                     throw fallbackEx;
                 }
             } else {
@@ -303,6 +333,11 @@ public class AkwaPayController {
 
     // ─── Admin Upgrade Init ───────────────────────────────────────────────────
 
+    /**
+     * Same fresh-reference-on-fallback fix as {@link #initDeposit}: the
+     * hosted-checkout retry after a failed MoMo push must use a brand new
+     * reference, never the one that just failed against NaloPay.
+     */
     @PostMapping("/api/user/upgrade-to-admin/akwapay/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initAdminUpgrade(
             @AuthenticationPrincipal User user,
@@ -356,10 +391,16 @@ public class AkwaPayController {
             if (useMomoPush) {
                 log.warn("initAdminUpgrade: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back to hosted checkout. cause: {}",
                         reference, user.getId(), ex.getMessage());
+
+                // Fresh reference for the fallback — see fix note above initDeposit.
+                var fallbackReference = buildReference(REF_PREFIX_ADMIN, user.getId());
+                log.info("initAdminUpgrade: retrying with fresh ref='{}' (was '{}') for userId='{}'",
+                        fallbackReference, reference, user.getId());
+
                 try {
                     response = akwapayCreateIntent(
                             ADMIN_UPGRADE_FEE_PESEWAS,
-                            reference,
+                            fallbackReference,
                             user.getEmail(),
                             null,
                             null,
@@ -371,10 +412,11 @@ public class AkwaPayController {
                                     "momo_fallback", "true"
                             )
                     );
+                    reference = fallbackReference;
                     log.info("initAdminUpgrade: fallback checkout OK for ref='{}' userId='{}'", reference, user.getId());
                 } catch (Exception fallbackEx) {
-                    log.error("initAdminUpgrade: both MoMo and checkout failed for ref='{}' userId='{}'",
-                            reference, user.getId(), fallbackEx);
+                    log.error("initAdminUpgrade: both MoMo and checkout failed for userId='{}' (attempted refs '{}' then '{}')",
+                            user.getId(), reference, fallbackReference, fallbackEx);
                     throw fallbackEx;
                 }
             } else {
@@ -860,6 +902,13 @@ public class AkwaPayController {
      *     Response: next_action.type="await_prompt", next_action.ussdFallback="*920*1*xxx#"
      *   - method="card" (no phone) → hosted checkout session
      *     Response: next_action.type="redirect", checkout_url="https://akwapay.vercel.app/checkout/..."
+     *
+     * Every caller MUST pass a reference that has never been sent to
+     * NaloPay before — including on a same-request retry/fallback. NaloPay
+     * can persist a payment_intent for a reference even when this call
+     * ultimately throws, so retrying with the same reference is rejected
+     * as a duplicate. Callers that fall back after a failure must generate
+     * a new reference via {@link #buildReference} first.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> akwapayCreateIntent(int amountPesewas,
