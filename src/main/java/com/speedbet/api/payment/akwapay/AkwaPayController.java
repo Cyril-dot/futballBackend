@@ -1097,6 +1097,15 @@ public class AkwaPayController {
         body.put("metadata",   metadata);
         body.put("customer",   customer);
         body.put("method",     method);
+        // UNTESTED VARIABLE (2026-09-09): every manual curl/PowerShell test
+        // that succeeded against NaloPay's mobile_money collection included
+        // "description" in the body. The production backend never sent it.
+        // return_url and metadata were each proven harmless in isolation
+        // (Test A, Test C), but description was never tested on its own —
+        // this is the one remaining untested difference between "known
+        // good" and "known failing" requests. Sending a fixed, harmless
+        // value costs nothing if it turns out not to matter.
+        body.put("description", "Wallet deposit");
 
         // Only set network for mobile_money — card doesn't need it
         boolean networkAttached = false;
