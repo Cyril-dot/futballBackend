@@ -289,13 +289,17 @@ public class AkwaPayController {
             }
         }
 
-        // Persist BEFORE calling AkwaPay — intentId starts null. This is what
-        // survives a crash between "we decided to charge this user" and
-        // "AkwaPay confirmed the intent id" (see AkwaPayPendingIntent javadoc,
-        // "WHY intentId IS NULLABLE"). If the process dies here, the row is
-        // left with intentId=null and shows up in the abandon-after check.
-        recordPending(reference, null, user.getId(), amount, false);
-
+        // NOTE (2026-09-09): persist-before-call is reverted for now — the
+        // live "akwapay_pending_intents" table still has intent_id as
+        // NOT NULL, so inserting a row with intentId=null throws a
+        // DataIntegrityViolationException before we ever call AkwaPay
+        // (see prod log, SQLState 23502). The entity javadoc and the
+        // nullable=false-less @Column annotation both say intent_id SHOULD
+        // be nullable — the DB schema hasn't been migrated to match yet.
+        // Once `ALTER TABLE akwapay_pending_intents ALTER COLUMN intent_id
+        // DROP NOT NULL;` has been run, switch this back to persist-before-
+        // call (recordPending(reference, null, ...) here, attachIntentId()
+        // after success) to restore the crash-safety described there.
         Map<String, Object> response;
         try {
             response = akwapayCreateIntent(
@@ -323,12 +327,6 @@ public class AkwaPayController {
                 log.info("initDeposit: retrying with fresh ref='{}' (was '{}') for userId='{}'",
                         fallbackReference, reference, user.getId());
 
-                // The original reference never got a real intent — drop its
-                // placeholder row rather than leaving an orphaned null-intentId
-                // row for the sweep to eventually abandon.
-                deletePending(reference, "superseded by fallback ref " + fallbackReference);
-                recordPending(fallbackReference, null, user.getId(), amount, false);
-
                 try {
                     response = akwapayCreateIntent(
                             amountPesewas,
@@ -345,20 +343,19 @@ public class AkwaPayController {
                 } catch (Exception fallbackEx) {
                     log.error("initDeposit: both MoMo push and checkout fallback failed for userId='{}' (attempted refs '{}' then '{}')",
                             user.getId(), reference, fallbackReference, fallbackEx);
-                    deletePending(fallbackReference, "both attempts failed — no intent ever created");
                     throw fallbackEx;
                 }
             } else {
-                deletePending(reference, "akwapay call failed and no fallback available");
                 throw ex;
             }
         }
 
-        // Attach the confirmed intentId to the row we already persisted.
+        // Persist AFTER AkwaPay succeeds — intent_id is never null this way,
+        // which is required by the current DB schema (see NOTE above).
         var intentId       = String.valueOf(response.get("id"));
         var nextActionType = nextActionType(response);
 
-        attachIntentId(reference, intentId);
+        recordPending(reference, intentId, user.getId(), amount, false);
 
         log.info("initDeposit: intent='{}' status='{}' next_action='{}' ussdFallback='{}' checkoutUrl='{}' for userId='{}'",
                 intentId,
@@ -370,6 +367,7 @@ public class AkwaPayController {
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
+
 
     // ─── Admin Upgrade Init ───────────────────────────────────────────────────
 
@@ -412,9 +410,10 @@ public class AkwaPayController {
             }
         }
 
-        // Persist BEFORE calling AkwaPay — see initDeposit for why.
-        recordPending(reference, null, user.getId(), upgradeAmountGhs, true);
-
+        // NOTE (2026-09-09): persist-before-call reverted here too — see the
+        // matching NOTE in initDeposit. The current DB schema has intent_id
+        // NOT NULL, so this must stay persist-after-call until that column
+        // is migrated.
         Map<String, Object> response;
         try {
             response = akwapayCreateIntent(
@@ -440,9 +439,6 @@ public class AkwaPayController {
                 log.info("initAdminUpgrade: retrying with fresh ref='{}' (was '{}') for userId='{}'",
                         fallbackReference, reference, user.getId());
 
-                deletePending(reference, "superseded by fallback ref " + fallbackReference);
-                recordPending(fallbackReference, null, user.getId(), upgradeAmountGhs, true);
-
                 try {
                     response = akwapayCreateIntent(
                             ADMIN_UPGRADE_FEE_PESEWAS,
@@ -463,18 +459,16 @@ public class AkwaPayController {
                 } catch (Exception fallbackEx) {
                     log.error("initAdminUpgrade: both MoMo and checkout failed for userId='{}' (attempted refs '{}' then '{}')",
                             user.getId(), reference, fallbackReference, fallbackEx);
-                    deletePending(fallbackReference, "both attempts failed — no intent ever created");
                     throw fallbackEx;
                 }
             } else {
-                deletePending(reference, "akwapay call failed and no fallback available");
                 throw ex;
             }
         }
 
-        // Attach the confirmed intentId to the row we already persisted.
+        // Persist AFTER AkwaPay succeeds — required by current schema.
         var intentId = String.valueOf(response.get("id"));
-        attachIntentId(reference, intentId);
+        recordPending(reference, intentId, user.getId(), upgradeAmountGhs, true);
 
         log.info("initAdminUpgrade: intent='{}' status='{}' next_action='{}' checkoutUrl='{}' for userId='{}'",
                 intentId, response.get("status"), nextActionType(response),
@@ -484,15 +478,28 @@ public class AkwaPayController {
     }
 
     /**
-     * Persists a pending-intent row. Called BEFORE the AkwaPay create-intent
-     * call (with intentId=null) so that userId/amount/adminUpgrade survive a
-     * crash mid-call — see AkwaPayPendingIntent javadoc, "WHY intentId IS
-     * NULLABLE".
+     * Persists a pending-intent row AFTER AkwaPay has confirmed an intent id.
      *
-     * Unlike the old post-success-only version, a failure here MUST stop the
-     * caller from proceeding to call AkwaPay: if we can't persist the row we
-     * have no durable record of the charge at all, which is the exact gap
-     * persist-before-call exists to close. Callers should let this propagate.
+     * NOTE (2026-09-09): this is temporarily back to persist-AFTER-call only.
+     * The live "akwapay_pending_intents" table has intent_id as NOT NULL, so
+     * persist-before-call (recordPending with intentId=null) throws a
+     * DataIntegrityViolationException before AkwaPay is ever called — see
+     * prod log, SQLState 23502. The entity javadoc and its @Column
+     * annotation (no nullable=false) both describe intent_id as meant to be
+     * nullable; the DB schema just hasn't been migrated to match yet.
+     *
+     * Once `ALTER TABLE akwapay_pending_intents ALTER COLUMN intent_id DROP
+     * NOT NULL;` has been run: switch callers back to persist-before-call
+     * (recordPending(reference, null, ...) before the AkwaPay call,
+     * attachIntentId(reference, intentId) after success — see that method
+     * below, currently unused but left in place for this) to restore the
+     * crash-safety the entity javadoc describes.
+     *
+     * A failure to persist here is logged and swallowed rather than thrown:
+     * the AkwaPay call has already succeeded by the time this runs, so the
+     * charge exists on AkwaPay's side either way — the only thing lost on a
+     * failed save is our local backstop for reconciling it, which is why the
+     * error message says to investigate/credit manually.
      */
     private void recordPending(String reference, String intentId, UUID userId,
                                BigDecimal amountGhs, boolean adminUpgrade) {
@@ -503,22 +510,18 @@ public class AkwaPayController {
                     reference, intentId);
         } catch (Exception e) {
             log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
-                            "refusing to call AkwaPay without a durable row backing this charge.",
+                            "this payment can only be credited by webhook or by hand. Investigate.",
                     reference, intentId, userId, amountGhs, e);
-            throw new RuntimeException("Could not record pending payment. Please try again.", e);
         }
     }
 
     /**
-     * Fills in the intentId on a row we already persisted with intentId=null,
-     * once AkwaPay's create-intent call has confirmed one. This is the second
-     * half of the persist-before-call flow: recordPending() writes the row
-     * before we ever talk to AkwaPay, this method patches it in afterward.
+     * Fills in the intentId on a row previously persisted with intentId=null.
      *
-     * If the row is missing entirely (e.g. it was deleted by a concurrent
-     * fallback cleanup, or the sweep already abandoned it), we log loudly
-     * rather than silently dropping the intentId — the row is meant to be
-     * the only way we can later poll AkwaPay about this charge.
+     * Currently UNUSED — no caller reaches this while recordPending() is
+     * persist-after-call only (see the NOTE on recordPending above). Left in
+     * place, fully working, for when the intent_id column is migrated to
+     * nullable and callers switch back to persist-before-call.
      */
     private void attachIntentId(String reference, String intentId) {
         try {
@@ -572,28 +575,21 @@ public class AkwaPayController {
         log.info("initCheckout: userId='{}' amount={} ref='{}' — hosted checkout fallback",
                 user.getId(), amount, reference);
 
-        // Persist BEFORE calling AkwaPay — see initDeposit for why.
-        recordPending(reference, null, user.getId(), amount, false);
-
-        Map<String, Object> response;
-        try {
-            response = akwapayCreateIntent(
-                    amountPesewas,
-                    reference,
-                    user.getEmail(),
-                    null,     // no phone — checkout page collects it
-                    null,     // no network
-                    "card",   // triggers hosted checkout
-                    frontendUrl + "/wallet?payment=success",
-                    Map.of("userId", user.getId().toString(), "purpose", "deposit")
-            );
-        } catch (Exception ex) {
-            deletePending(reference, "akwapay checkout call failed — no intent ever created");
-            throw ex;
-        }
+        // Persist AFTER AkwaPay succeeds — required by current schema (see
+        // NOTE in initDeposit).
+        var response = akwapayCreateIntent(
+                amountPesewas,
+                reference,
+                user.getEmail(),
+                null,     // no phone — checkout page collects it
+                null,     // no network
+                "card",   // triggers hosted checkout
+                frontendUrl + "/wallet?payment=success",
+                Map.of("userId", user.getId().toString(), "purpose", "deposit")
+        );
 
         var intentId = String.valueOf(response.get("id"));
-        attachIntentId(reference, intentId);
+        recordPending(reference, intentId, user.getId(), amount, false);
 
         log.info("initCheckout: intent='{}' checkoutUrl='{}' for userId='{}'",
                 intentId, response.get("checkout_url"), user.getId());
