@@ -40,6 +40,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -152,6 +153,55 @@ import java.util.UUID;
  * ({@link #reconcilePendingIntents}) is the primary credit mechanism.
  * Both paths dedupe via WalletService.credit() (409 on duplicate reference)
  * so no double-credit is possible whichever wins the race.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * FIX (2026-09-10) — SETTLE-ON-READ: AkwaPay/NaloPay dashboard sync gap
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Confirmed in production by comparing the AkwaPay dashboard against the
+ * underlying NaloPay collection report for the SAME reference at the SAME
+ * moment:
+ *
+ *   AkwaPay dashboard    pi_f96d3a47843d4a05  sbdep-7sv4na556zk2ndz0  "awaiting customer"
+ *   NaloPay collections  jUxNhv8j34A5qx6GbusCCC sbdep-7sv4na556zk2ndz0 "Successful"
+ *
+ * NaloPay had already collected the money; AkwaPay's own
+ * /payment_intents/{id} record for that intent never advanced past
+ * requires_action. This is a sync gap between AkwaPay and its NaloPay
+ * channel, not a bug in this controller — but it means the webhook (which
+ * fires off AkwaPay's own internal state) and the sweep (which polls that
+ * same internal state) can both wait forever on a payment that has, in
+ * reality, already succeeded.
+ *
+ * Fix: stop treating "the webhook fired AND a pending row exists" as the
+ * only path to a credit. GET /status/{intentId} — the one endpoint the
+ * customer's own browser is actively polling every few seconds while a
+ * payment is in flight — now credits immediately the moment AkwaPay's own
+ * read of the intent EVER reports "succeeded", via {@link #settle}. This
+ * closes the gap the instant the customer (or their background poll) asks,
+ * rather than waiting on AkwaPay's internal sync with NaloPay to catch up
+ * on its own schedule — which, per the evidence above, may not happen for
+ * some intents.
+ *
+ * settle() is also the credit path used by the webhook and the sweep, so
+ * whichever of the three notices "succeeded" first wins; the other two are
+ * harmless no-ops via WalletService.credit()'s reference-based 409 dedupe.
+ * settle() additionally recovers the owning user from AkwaPay's own
+ * intent-metadata when the local pending row is missing (see the
+ * "recordPending failure" note below) — before this fix, a missing row
+ * meant an unrecoverable silent drop; now it is instead a same-request
+ * recovery.
+ *
+ * CAVEAT: if AkwaPay's own API read of an intent NEVER reports "succeeded"
+ * — i.e. their dashboard stays on "awaiting customer" indefinitely even
+ * though NaloPay's own collection report already says "Successful" for
+ * that reference — this fix cannot help, because it still only acts on
+ * what AkwaPay's API itself returns. That specific mismatch is on AkwaPay's
+ * side (their sync with the NaloPay channel is broken for that intent) and
+ * needs (a) a manual WalletService credit for the affected references,
+ * confirmed against the NaloPay collection report, and (b) an AkwaPay
+ * support ticket citing the pi_... IDs against their own matching NaloPay
+ * transaction IDs.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WEBHOOK PAYLOAD
@@ -511,6 +561,12 @@ public class AkwaPayController {
      * charge exists on AkwaPay's side either way — the only thing lost on a
      * failed save is our local backstop for reconciling it, which is why the
      * error message says to investigate/credit manually.
+     *
+     * NOTE (2026-09-10): a failed save here is no longer an unrecoverable
+     * loss on its own — see {@link #settle}, which now recovers the owning
+     * user from AkwaPay's own intent metadata whenever this row is missing.
+     * The error log below stays, because metadata recovery is a fallback,
+     * not a substitute for having the row.
      */
     private void recordPending(String reference, String intentId, UUID userId,
                                BigDecimal amountGhs, boolean adminUpgrade) {
@@ -521,7 +577,8 @@ public class AkwaPayController {
                     reference, intentId);
         } catch (Exception e) {
             log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
-                            "this payment can only be credited by webhook or by hand. Investigate.",
+                            "this payment can only be credited by webhook, sweep, status-probe settle-on-read, " +
+                            "or by hand. Investigate.",
                     reference, intentId, userId, amountGhs, e);
         }
     }
@@ -608,14 +665,64 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-    // ─── Status probe (read only) ─────────────────────────────────────────────
+    // ─── Status probe (SETTLE-ON-READ) ─────────────────────────────────────────
 
+    /**
+     * Reads the intent from AkwaPay and returns it unchanged to the caller —
+     * same response shape as before this fix, so the frontend needs no
+     * changes to consume this. The one behavioural addition (2026-09-10):
+     * if AkwaPay reports "succeeded" for a reference we recognise
+     * (sbdep-/sbadm- prefix), credit it right here via {@link #settle}
+     * before responding.
+     *
+     * WHY HERE: this is the one endpoint the customer's browser is actively
+     * polling every few seconds while a payment is in flight (see
+     * useBackgroundPoll in DepositPage.tsx, which now also polls during the
+     * await_prompt step, not just the pending step). If AkwaPay's own async
+     * webhook/intent-status pipeline is lagging — or has desynced entirely
+     * from the underlying NaloPay channel, as confirmed in production on
+     * 2026-09-10 (AkwaPay dashboard showed "awaiting customer" for several
+     * intents whose exact same reference showed "Successful" on NaloPay's
+     * own collection report) — this is the fastest and cheapest place to
+     * catch up: no new infrastructure, no second polling loop, just
+     * "credit before you answer, if the answer is good news".
+     *
+     * SAFETY: settle() → WalletService.credit() dedupes on reference via a
+     * 409 on repeat, so this races safely against the webhook and the
+     * scheduled sweep — whichever of the three notices "succeeded" first
+     * wins, the other two are harmless no-ops.
+     */
     @GetMapping("/api/wallet/deposit/akwapay/status/{intentId}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> status(
             @AuthenticationPrincipal User user,
             @PathVariable String intentId) {
 
-        @SuppressWarnings("unchecked")
+        var result    = probeIntent(intentId);
+        var statusStr = String.valueOf(result.get("status")).toLowerCase(Locale.ROOT);
+        var reference = result.get("reference") == null ? null : result.get("reference").toString();
+
+        log.info("status: userId='{}' intent='{}' status='{}' next_action='{}'",
+                user.getId(), intentId, statusStr, nextActionType(result));
+
+        // SETTLE-ON-READ — see the class-level "FIX (2026-09-10)" javadoc
+        // above for the full story. credit() dedupes on reference, so this
+        // is safe to call on every single poll tick that reports success,
+        // not just the first one.
+        if ("succeeded".equals(statusStr) && reference != null
+                && (reference.startsWith(REF_PREFIX_DEPOSIT) || reference.startsWith(REF_PREFIX_ADMIN))) {
+            settle(reference, intentId, result, "status-probe");
+        }
+
+        return ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    /**
+     * Reads a payment intent straight from AkwaPay. Extracted so both
+     * {@link #status} and {@link #reconcileOne} share one AkwaPay read
+     * path instead of two near-identical inline WebClient calls.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> probeIntent(String intentId) {
         var result = (Map<String, Object>) webClientBuilder.build()
                 .get().uri(baseUrl + "/payment_intents/" + intentId)
                 .header("Authorization", "Bearer " + secretKey)
@@ -632,11 +739,96 @@ public class AkwaPayController {
                 .block();
 
         if (result == null) throw new RuntimeException("AkwaPay returned an empty response.");
+        return result;
+    }
 
-        log.info("status: userId='{}' intent='{}' status='{}' next_action='{}'",
-                user.getId(), intentId, result.get("status"), nextActionType(result));
+    /**
+     * Single shared "this reference is confirmed paid — make sure the
+     * customer has been credited" path. Callable from the webhook, the
+     * sweep, or (new, 2026-09-10) the status-probe endpoint — whichever
+     * learns of a "succeeded" intent first.
+     *
+     * Resolves the owning user/amount from the pending row if it still
+     * exists. If the row is missing — recordPending() has failed in
+     * production before; see its own javadoc, SQLState 23502 — recovers
+     * both from the metadata AkwaPay echoes back on every intent read,
+     * which is stamped with userId/purpose at creation time in
+     * {@link #akwapayCreateIntent}. Credit always goes to the intent's
+     * OWNER, resolved from the pending row or from AkwaPay's own stored
+     * metadata for that specific intent — never to whoever happened to
+     * make the HTTP call that triggered settle(). A user polling a
+     * different user's intentId can therefore only ever cause a credit to
+     * land on the rightful owner of that intent, never on themselves.
+     */
+    private void settle(String reference, String intentId, Map<String, Object> akwapayIntent, String source) {
+        UUID       userId;
+        BigDecimal amount;
+        boolean    adminUpgrade = reference.startsWith(REF_PREFIX_ADMIN);
+        boolean    hadRow       = false;
 
-        return ResponseEntity.ok(ApiResponse.ok(result));
+        Optional<AkwaPayPendingIntent> pending;
+        try {
+            pending = pendingIntents.findById(reference);
+        } catch (Exception e) {
+            log.warn("settle({}): pending lookup failed for ref='{}': {}", source, reference, e.getMessage());
+            pending = Optional.empty();
+        }
+
+        if (pending.isPresent()) {
+            var row      = pending.get();
+            userId       = row.getUserId();
+            amount       = row.getAmountGhs();
+            adminUpgrade = row.isAdminUpgrade();
+            hadRow       = true;
+        } else {
+            userId = metadataUserId(akwapayIntent);
+            amount = pesewasToGhs(akwapayIntent.get("amount"));
+            log.warn("settle({}): pending row MISSING for ref='{}' intent='{}' — recovered owner from " +
+                            "metadata userId='{}' amount={}",
+                    source, reference, intentId, userId, amount);
+        }
+
+        if (userId == null || amount == null || amount.signum() <= 0) {
+            log.error("settle({}): ref='{}' intent='{}' SUCCEEDED at AkwaPay but owner unresolvable " +
+                            "(no pending row, no usable metadata). MANUAL CREDIT REQUIRED. intent={}",
+                    source, reference, intentId, akwapayIntent);
+            return;
+        }
+
+        try {
+            if (adminUpgrade) handleAdminUpgrade(userId, reference, amount, intentId);
+            else              handleDeposit(userId, reference, amount, intentId);
+        } catch (Exception e) {
+            log.error("settle({}): credit threw for ref='{}' userId='{}' amount={} — sweep/webhook/next " +
+                            "status-probe will retry",
+                    source, reference, userId, amount, e);
+            return;
+        }
+
+        if (hadRow) deletePending(reference, "settled by " + source);
+    }
+
+    /** Recovers userId from AkwaPay's own echoed intent metadata (stamped at creation — see akwapayCreateIntent). */
+    private UUID metadataUserId(Map<String, Object> akwapayIntent) {
+        if (akwapayIntent.get("metadata") instanceof Map<?, ?> m && m.get("userId") != null) {
+            try {
+                return UUID.fromString(m.get("userId").toString());
+            } catch (IllegalArgumentException ignored) {
+                // fall through — malformed/foreign metadata, treat as unresolvable
+            }
+        }
+        return null;
+    }
+
+    /** Converts AkwaPay's integer-pesewas amount field back to a GHS BigDecimal, or null if unusable. */
+    private BigDecimal pesewasToGhs(Object amount) {
+        if (amount == null) return null;
+        try {
+            var pesewas = new BigDecimal(amount.toString());
+            return pesewas.signum() <= 0 ? null : pesewas.divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     // ─── OTP submission (legacy — kept for non-NaloPay gateway fallback) ──────
@@ -726,10 +918,12 @@ public class AkwaPayController {
             return ResponseEntity.status(400).body("Invalid signature");
         }
 
+        Map<String, Object> event;
         try {
             @SuppressWarnings("unchecked")
-            var event = (Map<String, Object>) objectMapper
+            var parsedEvent = (Map<String, Object>) objectMapper
                     .readValue(new String(rawBody, StandardCharsets.UTF_8), Map.class);
+            event = parsedEvent;
 
             var eventId   = String.valueOf(event.get("id"));
             var eventType = String.valueOf(event.get("type"));
@@ -762,13 +956,29 @@ public class AkwaPayController {
             var amount        = BigDecimal.valueOf(amountPesewas)
                     .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
+            // FIX (2026-09-10): a missing pending row used to mean an
+            // unrecoverable silent drop — "Ignored: unknown reference",
+            // 200, done, money gone. Now: try to recover the owner from
+            // the metadata AkwaPay echoes back on the webhook payload
+            // itself (the same metadata stamped at intent creation), and
+            // credit via the same settle()-adjacent handlers used
+            // everywhere else. Only if BOTH the row AND the metadata are
+            // unusable do we give up — and even then, we now say so loudly
+            // (ERROR, not WARN) instead of quietly returning 200.
             var pending = resolvePending(reference);
             if (pending.isEmpty()) {
-                log.warn("AkwaPay webhook: unrecognised reference '{}' on event='{}' intent='{}' " +
-                                "amount={} — no matching pending intent in our ledger. Returning 200 so " +
-                                "AkwaPay stops retrying. If this is a real customer payment, credit it manually.",
-                        reference, eventId, intentId, amount);
-                return ResponseEntity.ok("Ignored: unknown reference");
+                var uid = metadataUserId(data);
+                if (uid != null) {
+                    log.warn("AkwaPay webhook: pending row missing for ref='{}' — crediting via metadata userId='{}'",
+                            reference, uid);
+                    if (reference.startsWith(REF_PREFIX_ADMIN)) handleAdminUpgrade(uid, reference, amount, intentId);
+                    else                                        handleDeposit(uid, reference, amount, intentId);
+                } else {
+                    log.error("AkwaPay webhook: UNRECOVERABLE payment ref='{}' intent='{}' amount={} " +
+                                    "— no pending row, no metadata. MANUAL CREDIT REQUIRED. delivery='{}' fullEvent={}",
+                            reference, intentId, amount, deliveryId, event);
+                }
+                return ResponseEntity.ok("OK");
             }
             var parsed = pending.get();
 
@@ -863,31 +1073,16 @@ public class AkwaPayController {
             log.warn("reconcile: could not stamp lastCheckedAt for ref='{}': {}", ref, e.getMessage());
         }
 
-        @SuppressWarnings("unchecked")
-        var result = (Map<String, Object>) webClientBuilder.build()
-                .get().uri(baseUrl + "/payment_intents/" + intent.getIntentId())
-                .header("Authorization", "Bearer " + secretKey)
-                .retrieve()
-                .onStatus(
-                        s -> s.isError(),
-                        r -> r.bodyToMono(String.class).map(body -> {
-                            log.error("reconcile: AkwaPay status error for ref='{}' status={} body={}",
-                                    ref, r.statusCode(), body);
-                            return new RuntimeException("AkwaPay returned " + r.statusCode());
-                        })
-                )
-                .bodyToMono(Map.class)
-                .timeout(akwapayTimeout)
-                .onErrorResume(e -> {
-                    log.warn("reconcile: status check failed for ref='{}' intent='{}' — retry next sweep: {}",
-                            ref, intent.getIntentId(), e.getMessage());
-                    return Mono.empty();
-                })
-                .block();
+        Map<String, Object> result;
+        try {
+            result = probeIntent(intent.getIntentId());
+        } catch (Exception e) {
+            log.warn("reconcile: status check failed for ref='{}' intent='{}' — retry next sweep: {}",
+                    ref, intent.getIntentId(), e.getMessage());
+            return;
+        }
 
-        if (result == null) return;
-
-        var akwapayStatus = String.valueOf(result.get("status")).toLowerCase();
+        var akwapayStatus = String.valueOf(result.get("status")).toLowerCase(Locale.ROOT);
         log.info("reconcile: ref='{}' intent='{}' akwapayStatus='{}' attempt={}",
                 ref, intent.getIntentId(), akwapayStatus, intent.getAttempts());
 
@@ -904,12 +1099,7 @@ public class AkwaPayController {
         switch (akwapayStatus) {
             case "succeeded" -> {
                 log.info("reconcile: ref='{}' succeeded on sweep — applying credit", ref);
-                if (intent.isAdminUpgrade()) {
-                    handleAdminUpgrade(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
-                } else {
-                    handleDeposit(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
-                }
-                deletePending(ref, "settled by sweep");
+                settle(ref, intent.getIntentId(), result, "sweep");
             }
 
             case "failed", "declined", "cancelled", "expired" -> {
@@ -1274,8 +1464,9 @@ public class AkwaPayController {
      * NaloPay rejects longer, multi-hyphen references outright ("Invalid
      * value for reference"), and AkwaPay's own docs/tests only ever use
      * short single-segment references like "order-4471". The userId is
-     * resolved later via {@link #resolvePending}, not decoded from this
-     * string, so there is nothing to gain by embedding it here.
+     * resolved later via {@link #resolvePending} (or, if that row is
+     * missing, via {@link #metadataUserId}), not decoded from this string,
+     * so there is nothing to gain by embedding it here.
      */
     private String buildReference(String prefix) {
         var sb = new StringBuilder(prefix.length() + REF_TOKEN_LENGTH);
@@ -1295,7 +1486,10 @@ public class AkwaPayController {
      * Returns empty for a reference we have no record of (already
      * reconciled and deleted, or genuinely foreign/unrecognised) — callers
      * treat that the same way the old "malformed reference" case was
-     * treated: log it and skip, rather than throwing.
+     * treated: log it and skip, rather than throwing. As of 2026-09-10,
+     * "empty" is no longer necessarily a dead end — see {@link #settle}
+     * and the webhook's metadata-recovery branch, both of which fall back
+     * to AkwaPay's own intent metadata when this returns empty.
      */
     private Optional<AkwaPayPendingIntent> resolvePending(String reference) {
         if (!reference.startsWith(REF_PREFIX_DEPOSIT) && !reference.startsWith(REF_PREFIX_ADMIN)) {
