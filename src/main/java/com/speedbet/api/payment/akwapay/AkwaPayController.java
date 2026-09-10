@@ -49,6 +49,48 @@ import java.util.UUID;
  * AkwaPay payment integration — updated for NaloPay gateway (September 2026).
  *
  * ─────────────────────────────────────────────────────────────────────────────
+ * PHONE-BLOCKING GATE (2026-09-10)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Any phone number that initiates ≥ BLOCK_THRESHOLD (3) payment attempts
+ * without completing any of them is permanently blocked. After that:
+ *
+ *   1. EXACT BLOCK   — the exact normalised number is blocked.
+ *   2. PATTERN BLOCK — the first 7 digits of the normalised number are stored
+ *      as a prefix pattern. Any number that shares those 7 digits (i.e. only
+ *      the last 3 digits differ) is also blocked, catching suffix-swappers.
+ *
+ * Blocking is enforced at the very start of initDeposit() and
+ * initAdminUpgrade() — before any AkwaPay call is made — via
+ * {@link #assertPhoneNotBlocked}.
+ *
+ * Attempt counting ({@link #recordPhoneAttempt}) happens AFTER a successful
+ * AkwaPay intent creation, so that a network error on our side does not
+ * unfairly count against the user. The count is cleared ({@link
+ * #clearPhoneAttempt}) whenever a payment settles (webhook / sweep /
+ * status-probe), so a user who eventually completes a payment is not
+ * penalised for earlier failed attempts.
+ *
+ * Storage:
+ *   akwapay_phone_attempts — running incomplete-attempt counters per number.
+ *   akwapay_phone_blocks   — permanent block records (fullNumber + pattern).
+ *
+ * Migration (run once):
+ *   CREATE TABLE akwapay_phone_attempts (
+ *       full_number     VARCHAR(15)  PRIMARY KEY,
+ *       attempt_count   INT          NOT NULL DEFAULT 0,
+ *       first_attempt_at TIMESTAMPTZ NOT NULL,
+ *       last_attempt_at  TIMESTAMPTZ NOT NULL
+ *   );
+ *   CREATE TABLE akwapay_phone_blocks (
+ *       full_number     VARCHAR(15)  PRIMARY KEY,
+ *       prefix_pattern  VARCHAR(10)  NOT NULL,
+ *       blocked_at      TIMESTAMPTZ  NOT NULL,
+ *       reason          VARCHAR(255)
+ *   );
+ *   CREATE INDEX idx_phone_blocks_prefix ON akwapay_phone_blocks(prefix_pattern);
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
  * GATEWAY CHANGE (2026-09-09) — NALOPAY INTEGRATION
  * ─────────────────────────────────────────────────────────────────────────────
  *
@@ -83,67 +125,32 @@ import java.util.UUID;
  * NaloPay (via AkwaPay) uses our reference as the transaction reference.
  * Only alphanumeric characters and hyphens are accepted — no underscores:
  *
- *     sbdep-<32-hex userId>-<8-hex nonce>     wallet deposit
- *     sbadm-<32-hex userId>-<8-hex nonce>     admin upgrade
+ *     sbdep-<16-alphanum nonce>     wallet deposit
+ *     sbadm-<16-alphanum nonce>     admin upgrade
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * FIX (2026-09-09) — DO NOT REUSE A REFERENCE ACROSS RETRY ATTEMPTS
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * NaloPay appears to persist a payment_intent record for a reference even
- * when the create call ultimately errors back to us (e.g. MoMo push
- * rejected due to account restriction/activation). If we retry the SAME
- * reference against the hosted-checkout fallback, NaloPay rejects the
- * second call with "You have already created a payment intent with this
- * reference." Every call to AkwaPay — including same-request fallback
- * retries — must use a freshly generated reference. See
- * {@link #initDeposit} and {@link #initAdminUpgrade}.
+ * when the create call ultimately errors back to us. Every call to AkwaPay —
+ * including same-request fallback retries — must use a freshly generated
+ * reference. See {@link #initDeposit} and {@link #initAdminUpgrade}.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * FIX (2026-09-09) — REFERENCE FORMAT: SHORT AND OPAQUE, NO EMBEDDED userId
+ * FIX (2026-09-09) — customer.email NEVER sent for method="mobile_money"
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * NaloPay rejected our previous reference shape outright — every attempt,
- * not just retries — with "Invalid value for reference". That shape was
- * "sbdep-<32-hex userId><hyphen><12-hex nonce>": 51 characters, 2 hyphens.
- * AkwaPay's own docs and test suite only ever use short, single-segment,
- * single-hyphen references such as "order-4471" or "REF123" — nothing
- * close to what we were sending survives Nalo's validation.
- *
- * The reference is now a short opaque token — prefix + 16 random
- * alphanumeric characters, ONE hyphen total — and no longer encodes the
- * userId. Encoding structured data into a merchant reference was never
- * something AkwaPay's contract promised to preserve; it's meant to be
- * opaque, matching their own examples.
- *
- * Because the userId is no longer recoverable from the string, the
- * webhook handler and the reconciliation sweep resolve userId (and
- * whether the charge was an admin upgrade) by looking up the
- * AkwaPayPendingIntent row keyed on the reference — see
- * {@link #resolvePending} — rather than decoding it. This is strictly
- * more robust: we already persist that row on every successful intent
- * creation, so there is no new failure mode, and a reference doesn't need
- * to describe itself to be looked up.
+ * The synthetic email was the root cause of every production MoMo-push
+ * failure up to 2026-09-09. See {@link #akwapayCreateIntent} for details.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY customer.email IS SYNTHETIC (PER-ATTEMPT) — CARD/CHECKOUT ONLY
+ * FIX (2026-09-10) — SETTLE-ON-READ via status probe
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * AkwaPay deduplicates customers by email on some gateway paths. For the
- * card/hosted-checkout path we use plus-addressing to make the email
- * unique per attempt: kojo@gmail.com → kojo+1724449830123@gmail.com. The
- * real email is preserved in metadata for audit.
- *
- * FIX (2026-09-09): customer.email is NEVER sent for method="mobile_money".
- * Confirmed via a controlled live test against AkwaPay's API directly —
- * the identical request that succeeds with customer={"phone":"..."} only
- * fails with 402 "NALOPAY collection rejected: Failed to create
- * collection" the moment an email field is added alongside the phone. This
- * was the root cause of every production MoMo-push failure up to
- * 2026-09-09: the synthetic email was being attached unconditionally on
- * every call, so every real mobile_money attempt was silently rejected by
- * NaloPay and fell back to hosted checkout without ever reaching a phone.
- * See {@link #akwapayCreateIntent} for where this is now suppressed.
+ * GET /status/{intentId} now credits immediately the moment AkwaPay reports
+ * "succeeded", closing the AkwaPay↔NaloPay sync gap confirmed in production.
+ * See {@link #status} and {@link #settle}.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * RELIABILITY GUARANTEE
@@ -153,76 +160,6 @@ import java.util.UUID;
  * ({@link #reconcilePendingIntents}) is the primary credit mechanism.
  * Both paths dedupe via WalletService.credit() (409 on duplicate reference)
  * so no double-credit is possible whichever wins the race.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * FIX (2026-09-10) — SETTLE-ON-READ: AkwaPay/NaloPay dashboard sync gap
- * ─────────────────────────────────────────────────────────────────────────────
- *
- * Confirmed in production by comparing the AkwaPay dashboard against the
- * underlying NaloPay collection report for the SAME reference at the SAME
- * moment:
- *
- *   AkwaPay dashboard    pi_f96d3a47843d4a05  sbdep-7sv4na556zk2ndz0  "awaiting customer"
- *   NaloPay collections  jUxNhv8j34A5qx6GbusCCC sbdep-7sv4na556zk2ndz0 "Successful"
- *
- * NaloPay had already collected the money; AkwaPay's own
- * /payment_intents/{id} record for that intent never advanced past
- * requires_action. This is a sync gap between AkwaPay and its NaloPay
- * channel, not a bug in this controller — but it means the webhook (which
- * fires off AkwaPay's own internal state) and the sweep (which polls that
- * same internal state) can both wait forever on a payment that has, in
- * reality, already succeeded.
- *
- * Fix: stop treating "the webhook fired AND a pending row exists" as the
- * only path to a credit. GET /status/{intentId} — the one endpoint the
- * customer's own browser is actively polling every few seconds while a
- * payment is in flight — now credits immediately the moment AkwaPay's own
- * read of the intent EVER reports "succeeded", via {@link #settle}. This
- * closes the gap the instant the customer (or their background poll) asks,
- * rather than waiting on AkwaPay's internal sync with NaloPay to catch up
- * on its own schedule — which, per the evidence above, may not happen for
- * some intents.
- *
- * settle() is also the credit path used by the webhook and the sweep, so
- * whichever of the three notices "succeeded" first wins; the other two are
- * harmless no-ops via WalletService.credit()'s reference-based 409 dedupe.
- * settle() additionally recovers the owning user from AkwaPay's own
- * intent-metadata when the local pending row is missing (see the
- * "recordPending failure" note below) — before this fix, a missing row
- * meant an unrecoverable silent drop; now it is instead a same-request
- * recovery.
- *
- * CAVEAT: if AkwaPay's own API read of an intent NEVER reports "succeeded"
- * — i.e. their dashboard stays on "awaiting customer" indefinitely even
- * though NaloPay's own collection report already says "Successful" for
- * that reference — this fix cannot help, because it still only acts on
- * what AkwaPay's API itself returns. That specific mismatch is on AkwaPay's
- * side (their sync with the NaloPay channel is broken for that intent) and
- * needs (a) a manual WalletService credit for the affected references,
- * confirmed against the NaloPay collection report, and (b) an AkwaPay
- * support ticket citing the pi_... IDs against their own matching NaloPay
- * transaction IDs.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * WEBHOOK PAYLOAD
- * ─────────────────────────────────────────────────────────────────────────────
- *
- *   {
- *     "id":         "evt_<chargePublicId>",
- *     "type":       "payment_intent.succeeded",
- *     "sequence":   <int>,
- *     "created_at": "<ISO-8601>",
- *     "data": {
- *       "intent_id": "<pi_...>",
- *       "amount":    <integer pesewas>,
- *       "currency":  "GHS",
- *       "reference": "<your reference string>",
- *       "status":    "succeeded"
- *     }
- *   }
- *
- * Delivery is at-least-once. Deduped inside WalletService.credit() via
- * the reference (409 → skip).
  */
 @Slf4j
 @EnableScheduling
@@ -257,6 +194,20 @@ public class AkwaPayController {
 
     private static final Duration ABANDON_AFTER = Duration.ofHours(24);
 
+    // ─── Phone-blocking constants ──────────────────────────────────────────────
+
+    /**
+     * Number of incomplete payment attempts before a phone is permanently blocked.
+     * "Incomplete" means the intent was created at AkwaPay but never settled.
+     */
+    private static final int BLOCK_THRESHOLD = 3;
+
+    /**
+     * Number of prefix digits used for pattern-blocking (suffix-swap detection).
+     * e.g. 7 → "0241234xxx" — any number sharing the first 7 digits is blocked.
+     */
+    private static final int BLOCK_PREFIX_LENGTH = 7;
+
     // Ghana MNO prefix → AkwaPay network code
     private static final Map<String, String> GH_NETWORK_PREFIXES = new LinkedHashMap<>();
     static {
@@ -270,6 +221,8 @@ public class AkwaPayController {
     private final AdminUpgradeChatService        adminUpgradeChatService;
     private final ReferralService                referralService;
     private final AkwaPayPendingIntentRepository pendingIntents;
+    private final PhoneBlockRepository           phoneBlocks;
+    private final PhoneAttemptTrackerRepository  phoneAttempts;
     private final WebClient.Builder              webClientBuilder;
     private final ObjectMapper                   objectMapper;
 
@@ -279,10 +232,196 @@ public class AkwaPayController {
     @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minDeposit;
     @Value("${app.platform.frontend-url}")           private String     frontendUrl;
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // PHONE-BLOCKING GATE
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Normalises a raw phone string to a 10-digit local Ghanaian number
+     * (e.g. "0241234567"), or returns empty if the number is unrecognisable.
+     * This canonical form is what is stored and compared in the block tables.
+     */
+    private Optional<String> normalisePhone(String phone) {
+        if (phone == null || phone.isBlank()) return Optional.empty();
+        var digits = phone.replaceAll("[^\\d]", "");
+        if (digits.startsWith("233") && digits.length() == 12) {
+            return Optional.of("0" + digits.substring(3));
+        }
+        if (digits.length() == 10 && digits.startsWith("0")) {
+            return Optional.of(digits);
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Returns the prefix pattern (first {@link #BLOCK_PREFIX_LENGTH} digits)
+     * of an already-normalised local number, used for suffix-swap detection.
+     *
+     * e.g. "0241234567" → "0241234"
+     */
+    private String prefixPattern(String normalised) {
+        return normalised.length() >= BLOCK_PREFIX_LENGTH
+                ? normalised.substring(0, BLOCK_PREFIX_LENGTH)
+                : normalised;
+    }
+
+    /**
+     * Throws {@link ApiException#badRequest} if {@code phone} is currently
+     * blocked — either by exact number or by prefix pattern match.
+     *
+     * Called at the very top of initDeposit() and initAdminUpgrade(), before
+     * any AkwaPay network call is made.
+     *
+     * For unrecognised phone formats (non-Ghana numbers) we skip the block
+     * check here — MSISDN validation downstream will reject them anyway.
+     */
+    private void assertPhoneNotBlocked(String phone) {
+        var norm = normalisePhone(phone);
+        if (norm.isEmpty()) return; // not a recognisable Ghana number; handled elsewhere
+
+        var fullNumber = norm.get();
+        var pattern    = prefixPattern(fullNumber);
+
+        boolean blocked;
+        try {
+            blocked = phoneBlocks.isBlockedByFullNumberOrPattern(fullNumber, pattern);
+        } catch (Exception e) {
+            // Fail open rather than blocking a legitimate payment on a DB hiccup.
+            log.error("assertPhoneNotBlocked: DB check failed for phone='{}***' — failing open: {}",
+                    fullNumber.substring(0, 3), e.getMessage());
+            return;
+        }
+
+        if (blocked) {
+            // Try to surface what matched for the log.
+            try {
+                var entry = phoneBlocks.findById(fullNumber)
+                        .or(() -> phoneBlocks.findByPrefixPattern(pattern))
+                        .orElse(null);
+                log.warn("assertPhoneNotBlocked: BLOCKED phone='{}***' matched entry fullNumber='{}' " +
+                                "pattern='{}' blockedAt='{}' reason='{}'",
+                        fullNumber.substring(0, 3),
+                        entry != null ? entry.getFullNumber().substring(0, 3) + "***" : "?",
+                        pattern,
+                        entry != null ? entry.getBlockedAt() : "?",
+                        entry != null ? entry.getReason() : "?");
+            } catch (Exception ignored) {}
+
+            throw ApiException.badRequest(
+                    "This phone number is not permitted to make payments. " +
+                    "Please contact support if you believe this is an error.");
+        }
+    }
+
+    /**
+     * Records one incomplete attempt for {@code phone}.
+     *
+     * If the running count reaches {@link #BLOCK_THRESHOLD}, the number is
+     * immediately and permanently blocked (exact + pattern), and the attempt
+     * tracker row is removed (replaced by the block entry).
+     *
+     * Called AFTER a successful AkwaPay intent creation — not before — so that
+     * an error on our side does not unfairly count against the user.
+     *
+     * @param phone       raw phone string as supplied by the caller
+     * @param reference   the AkwaPay reference, for logging
+     * @param context     "deposit" or "adminUpgrade", for log messages
+     */
+    private void recordPhoneAttempt(String phone, String reference, String context) {
+        var norm = normalisePhone(phone);
+        if (norm.isEmpty()) return; // non-Ghana number — MSISDN gate handled elsewhere
+
+        var fullNumber = norm.get();
+        var now        = Instant.now();
+
+        try {
+            var tracker = phoneAttempts.findById(fullNumber)
+                    .orElseGet(() -> new PhoneAttemptTracker(fullNumber, 0, now, now));
+
+            tracker.increment(now);
+
+            log.info("recordPhoneAttempt[{}]: phone='{}***' attempt={} ref='{}'",
+                    context, fullNumber.substring(0, 3), tracker.getAttemptCount(), reference);
+
+            if (tracker.getAttemptCount() >= BLOCK_THRESHOLD) {
+                applyPhoneBlock(fullNumber, tracker.getAttemptCount(), context);
+                phoneAttempts.deleteById(fullNumber);
+            } else {
+                phoneAttempts.save(tracker);
+            }
+        } catch (Exception e) {
+            log.error("recordPhoneAttempt[{}]: failed for phone='{}***' ref='{}': {}",
+                    context, fullNumber.substring(0, 3), reference, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Writes the permanent block entry for {@code fullNumber} (exact +
+     * pattern). Idempotent — if the block already exists it is a no-op.
+     */
+    private void applyPhoneBlock(String fullNumber, int attempts, String context) {
+        try {
+            if (phoneBlocks.existsByFullNumber(fullNumber)) {
+                log.info("applyPhoneBlock[{}]: phone='{}***' already blocked — skipping",
+                        context, fullNumber.substring(0, 3));
+                return;
+            }
+            var pattern = prefixPattern(fullNumber);
+            var reason  = String.format(
+                    "%d incomplete payment attempts via %s — auto-blocked", attempts, context);
+
+            var block = new PhoneBlockEntry(fullNumber, pattern, Instant.now(), reason);
+            phoneBlocks.save(block);
+
+            log.warn("applyPhoneBlock[{}]: PERMANENTLY BLOCKED phone='{}***' (fullNumber='{}') " +
+                            "pattern='{}' after {} incomplete attempts",
+                    context, fullNumber.substring(0, 3), fullNumber, pattern, attempts);
+
+        } catch (Exception e) {
+            log.error("applyPhoneBlock[{}]: FAILED to persist block for phone='{}***': {}",
+                    context, fullNumber.substring(0, 3), e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Clears the incomplete-attempt counter for {@code phone} because a
+     * payment just settled — the user should not be penalised for earlier
+     * failed attempts on a number that eventually succeeded.
+     *
+     * Called from {@link #handleDeposit} and {@link #handleAdminUpgrade}
+     * after a successful credit. Safe to call with null/blank phone — it
+     * will no-op.
+     *
+     * Note: the phone number must be recovered from the pending-intent row
+     * or the AkwaPay intent metadata (we store it there when creating the
+     * intent). Currently we recover it from metadata under key "phone".
+     */
+    private void clearPhoneAttempt(String phone, String reference) {
+        var norm = normalisePhone(phone);
+        if (norm.isEmpty()) return;
+
+        var fullNumber = norm.get();
+        try {
+            if (phoneAttempts.existsById(fullNumber)) {
+                phoneAttempts.deleteById(fullNumber);
+                log.info("clearPhoneAttempt: reset attempt count for phone='{}***' (ref='{}')",
+                        fullNumber.substring(0, 3), reference);
+            }
+        } catch (Exception e) {
+            log.warn("clearPhoneAttempt: failed for phone='{}***' ref='{}': {}",
+                    fullNumber.substring(0, 3), reference, e.getMessage());
+        }
+    }
+
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
     /**
      * Initiates a deposit via AkwaPay/NaloPay.
+     *
+     * Gate (2026-09-10): if the supplied phone is blocked (exact or pattern),
+     * rejects immediately with 400 before any AkwaPay call. After a
+     * successful intent creation the phone's incomplete-attempt counter is
+     * incremented; it is cleared when the payment settles.
      *
      * PRIMARY PATH (phone provided):
      *   method="mobile_money" → NaloPay sends MoMo push to customer's phone.
@@ -292,21 +431,11 @@ public class AkwaPayController {
      * FALLBACK PATH (no phone):
      *   method="card" → AkwaPay creates a hosted checkout session.
      *   Response includes checkout_url — redirect the customer there.
-     *   The AkwaPay checkout page handles MoMo form + USSD + card.
      *
      * IMPORTANT: if the primary MoMo push attempt fails and we fall back to
-     * hosted checkout, the fallback call uses a NEWLY GENERATED reference,
-     * not the one that just failed. NaloPay can persist a payment_intent
-     * record for a reference even when it errors the create call back to
-     * us, so reusing that reference on the fallback gets rejected with
-     * "You have already created a payment intent with this reference."
-     *
-     * Frontend should:
-     *   1. If next_action.type == "await_prompt": show "Check your phone"
-     *      spinner + ussdFallback USSD code as tap-to-dial.
-     *   2. If next_action.type == "redirect": redirect to checkout_url.
-     *   3. Poll GET /api/wallet/deposit/akwapay/status/{intentId} or listen
-     *      for the webhook to confirm success.
+     * hosted checkout, the fallback call uses a NEWLY GENERATED reference.
+     * NaloPay persists a payment_intent record even when it errors back to
+     * us, so reusing the reference gets rejected as a duplicate.
      */
     @PostMapping("/api/wallet/deposit/akwapay/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
@@ -326,9 +455,13 @@ public class AkwaPayController {
         var phone        = req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req.get("network") == null ? null : req.get("network").toString();
 
-        // Determine payment method:
-        // - phone provided → direct MoMo push (primary, NaloPay)
-        // - no phone       → hosted checkout fallback
+        // ── PHONE-BLOCKING GATE ───────────────────────────────────────────────
+        // Check before any AkwaPay call. Throws 400 if blocked.
+        if (phone != null && !phone.isBlank()) {
+            assertPhoneNotBlocked(phone);
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         boolean useMomoPush = phone != null && !phone.isBlank();
         String  network     = useMomoPush ? resolveNetwork(requestedNet, phone) : null;
         String  method      = useMomoPush ? "mobile_money" : "card";
@@ -336,13 +469,11 @@ public class AkwaPayController {
         log.info("initDeposit: userId='{}' amount={} pesewas={} ref='{}' method='{}' network='{}'",
                 user.getId(), amount, amountPesewas, reference, method, network);
 
-        // Validate MSISDN before calling AkwaPay — non-Ghana numbers (e.g. 070xx = Nigeria)
-        // will be rejected by NaloPay with "Not a valid Ghanaian MSISDN". Catch it early
-        // so we fall back to checkout gracefully rather than surfacing a confusing error.
+        // Validate MSISDN — non-Ghana numbers rejected early before AkwaPay call.
         if (useMomoPush) {
             var detected = detectNetworkFromPhone(phone);
             if (detected.isEmpty()) {
-                log.warn("initDeposit: phone='{}' is not a recognised Ghana number — switching to hosted checkout fallback",
+                log.warn("initDeposit: phone='{}' is not a recognised Ghana number — switching to hosted checkout",
                         phone.length() > 4 ? phone.substring(0, 3) + "***" + phone.substring(phone.length() - 2) : "***");
                 useMomoPush = false;
                 network     = null;
@@ -350,18 +481,12 @@ public class AkwaPayController {
             }
         }
 
-        // NOTE (2026-09-09): persist-before-call is reverted for now — the
-        // live "akwapay_pending_intents" table still has intent_id as
-        // NOT NULL, so inserting a row with intentId=null throws a
-        // DataIntegrityViolationException before we ever call AkwaPay
-        // (see prod log, SQLState 23502). The entity javadoc and the
-        // nullable=false-less @Column annotation both say intent_id SHOULD
-        // be nullable — the DB schema hasn't been migrated to match yet.
-        // Once `ALTER TABLE akwapay_pending_intents ALTER COLUMN intent_id
-        // DROP NOT NULL;` has been run, switch this back to persist-before-
-        // call (recordPending(reference, null, ...) here, attachIntentId()
-        // after success) to restore the crash-safety described there.
+        // NOTE (2026-09-09): persist-before-call reverted — live schema has
+        // intent_id NOT NULL. Switch back once the column is migrated to
+        // nullable. See recordPending() javadoc for full context.
         Map<String, Object> response;
+        String              finalPhone = useMomoPush ? phone : null; // captured for attempt tracking
+
         try {
             response = akwapayCreateIntent(
                     amountPesewas,
@@ -371,19 +496,20 @@ public class AkwaPayController {
                     useMomoPush ? network : null,
                     method,
                     frontendUrl + "/wallet?payment=success",
-                    Map.of("userId", user.getId().toString(), "purpose", "deposit")
+                    buildMetadata(user.getId(), "deposit", phone, null)
             );
         } catch (Exception ex) {
-            // NaloPay direct MoMo push failed (PAY-FAIL-0070: push not activated,
-            // or account restriction). Auto-fallback to hosted checkout.
+            // NaloPay direct MoMo push failed. Auto-fallback to hosted checkout.
             if (useMomoPush) {
-                log.warn("initDeposit: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back to hosted checkout. cause: {}",
+                log.warn("initDeposit: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back. cause: {}",
                         reference, user.getId(), ex.getMessage());
 
-                // IMPORTANT: generate a FRESH reference for the fallback attempt.
-                // NaloPay may have already persisted a payment_intent record under
-                // the original reference even though it returned an error to us —
-                // retrying that same reference gets rejected as a duplicate.
+                // ── ATTEMPT COUNTER (push failed — still counts) ──────────────
+                // The push was attempted and NaloPay may have persisted a record.
+                // Count it as an incomplete attempt.
+                recordPhoneAttempt(phone, reference, "deposit");
+                // ─────────────────────────────────────────────────────────────
+
                 var fallbackReference = buildReference(REF_PREFIX_DEPOSIT);
                 log.info("initDeposit: retrying with fresh ref='{}' (was '{}') for userId='{}'",
                         fallbackReference, reference, user.getId());
@@ -397,12 +523,14 @@ public class AkwaPayController {
                             null,
                             "card",
                             frontendUrl + "/wallet?payment=success",
-                            Map.of("userId", user.getId().toString(), "purpose", "deposit", "momo_fallback", "true")
+                            buildMetadata(user.getId(), "deposit", phone, "true")
                     );
-                    reference = fallbackReference; // downstream logging/persistence must use the ref that actually succeeded
+                    reference  = fallbackReference;
+                    finalPhone = null; // fallback is card — no phone to track
                     log.info("initDeposit: fallback checkout OK for ref='{}' userId='{}'", reference, user.getId());
                 } catch (Exception fallbackEx) {
-                    log.error("initDeposit: both MoMo push and checkout fallback failed for userId='{}' (attempted refs '{}' then '{}')",
+                    log.error("initDeposit: both MoMo push and checkout fallback failed for userId='{}' " +
+                                    "(attempted refs '{}' then '{}')",
                             user.getId(), reference, fallbackReference, fallbackEx);
                     throw fallbackEx;
                 }
@@ -411,8 +539,13 @@ public class AkwaPayController {
             }
         }
 
-        // Persist AFTER AkwaPay succeeds — intent_id is never null this way,
-        // which is required by the current DB schema (see NOTE above).
+        // ── ATTEMPT COUNTER (intent created, not yet settled) ─────────────────
+        // Only for phone-based (MoMo) payments that reached AkwaPay successfully.
+        if (finalPhone != null && !finalPhone.isBlank()) {
+            recordPhoneAttempt(finalPhone, reference, "deposit");
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         var intentId       = String.valueOf(response.get("id"));
         var nextActionType = nextActionType(response);
 
@@ -429,13 +562,11 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
-
     // ─── Admin Upgrade Init ───────────────────────────────────────────────────
 
     /**
-     * Same fresh-reference-on-fallback fix as {@link #initDeposit}: the
-     * hosted-checkout retry after a failed MoMo push must use a brand new
-     * reference, never the one that just failed against NaloPay.
+     * Same phone-blocking gate and attempt-tracking as {@link #initDeposit}.
+     * Same fresh-reference-on-fallback fix.
      */
     @PostMapping("/api/user/upgrade-to-admin/akwapay/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initAdminUpgrade(
@@ -450,6 +581,12 @@ public class AkwaPayController {
         var phone        = req == null || req.get("phone")   == null ? null : req.get("phone").toString();
         var requestedNet = req == null || req.get("network") == null ? null : req.get("network").toString();
 
+        // ── PHONE-BLOCKING GATE ───────────────────────────────────────────────
+        if (phone != null && !phone.isBlank()) {
+            assertPhoneNotBlocked(phone);
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         boolean useMomoPush = phone != null && !phone.isBlank();
         String  network     = useMomoPush ? resolveNetwork(requestedNet, phone) : null;
         String  method      = useMomoPush ? "mobile_money" : "card";
@@ -460,7 +597,6 @@ public class AkwaPayController {
         var upgradeAmountGhs = BigDecimal.valueOf(ADMIN_UPGRADE_FEE_PESEWAS)
                 .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
-        // Validate MSISDN for admin upgrade too
         if (useMomoPush) {
             var detected = detectNetworkFromPhone(phone);
             if (detected.isEmpty()) {
@@ -471,11 +607,9 @@ public class AkwaPayController {
             }
         }
 
-        // NOTE (2026-09-09): persist-before-call reverted here too — see the
-        // matching NOTE in initDeposit. The current DB schema has intent_id
-        // NOT NULL, so this must stay persist-after-call until that column
-        // is migrated.
         Map<String, Object> response;
+        String              finalPhone = useMomoPush ? phone : null;
+
         try {
             response = akwapayCreateIntent(
                     ADMIN_UPGRADE_FEE_PESEWAS,
@@ -485,17 +619,16 @@ public class AkwaPayController {
                     useMomoPush ? network : null,
                     method,
                     frontendUrl + "/app/upgrade?payment=success",
-                    Map.of(
-                            "userId",        user.getId().toString(),
-                            "upgradeIntent", UPGRADE_INTENT_ADMIN
-                    )
+                    buildMetadata(user.getId(), UPGRADE_INTENT_ADMIN, phone, null)
             );
         } catch (Exception ex) {
             if (useMomoPush) {
-                log.warn("initAdminUpgrade: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back to hosted checkout. cause: {}",
+                log.warn("initAdminUpgrade: MoMo push FAILED for ref='{}' userId='{}' — auto-falling back. cause: {}",
                         reference, user.getId(), ex.getMessage());
 
-                // Fresh reference for the fallback — see fix note above initDeposit.
+                // Count the failed push as an incomplete attempt.
+                recordPhoneAttempt(phone, reference, "adminUpgrade");
+
                 var fallbackReference = buildReference(REF_PREFIX_ADMIN);
                 log.info("initAdminUpgrade: retrying with fresh ref='{}' (was '{}') for userId='{}'",
                         fallbackReference, reference, user.getId());
@@ -509,16 +642,14 @@ public class AkwaPayController {
                             null,
                             "card",
                             frontendUrl + "/app/upgrade?payment=success",
-                            Map.of(
-                                    "userId",        user.getId().toString(),
-                                    "upgradeIntent", UPGRADE_INTENT_ADMIN,
-                                    "momo_fallback", "true"
-                            )
+                            buildMetadata(user.getId(), UPGRADE_INTENT_ADMIN, phone, "true")
                     );
-                    reference = fallbackReference;
+                    reference  = fallbackReference;
+                    finalPhone = null;
                     log.info("initAdminUpgrade: fallback checkout OK for ref='{}' userId='{}'", reference, user.getId());
                 } catch (Exception fallbackEx) {
-                    log.error("initAdminUpgrade: both MoMo and checkout failed for userId='{}' (attempted refs '{}' then '{}')",
+                    log.error("initAdminUpgrade: both MoMo and checkout failed for userId='{}' " +
+                                    "(attempted refs '{}' then '{}')",
                             user.getId(), reference, fallbackReference, fallbackEx);
                     throw fallbackEx;
                 }
@@ -527,7 +658,12 @@ public class AkwaPayController {
             }
         }
 
-        // Persist AFTER AkwaPay succeeds — required by current schema.
+        // ── ATTEMPT COUNTER ───────────────────────────────────────────────────
+        if (finalPhone != null && !finalPhone.isBlank()) {
+            recordPhoneAttempt(finalPhone, reference, "adminUpgrade");
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         var intentId = String.valueOf(response.get("id"));
         recordPending(reference, intentId, user.getId(), upgradeAmountGhs, true);
 
@@ -538,35 +674,39 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
+    // ─── Metadata builder ─────────────────────────────────────────────────────
+
+    /**
+     * Builds the metadata map stamped onto every AkwaPay intent at creation.
+     * The phone is stored here so that settle() can recover it when clearing
+     * the attempt counter even if the pending row is missing.
+     *
+     * @param momoFallback "true" if this is an auto-fallback to hosted checkout, null otherwise
+     */
+    private Map<String, Object> buildMetadata(UUID userId, String purpose,
+                                              String phone, String momoFallback) {
+        var m = new HashMap<String, Object>();
+        m.put("userId",  userId.toString());
+        m.put("purpose", purpose);
+        if (phone != null && !phone.isBlank())  m.put("phone",        phone);
+        if (momoFallback != null)               m.put("momo_fallback", momoFallback);
+        return m;
+    }
+
+    // ─── Pending-intent persistence ───────────────────────────────────────────
+
     /**
      * Persists a pending-intent row AFTER AkwaPay has confirmed an intent id.
      *
-     * NOTE (2026-09-09): this is temporarily back to persist-AFTER-call only.
-     * The live "akwapay_pending_intents" table has intent_id as NOT NULL, so
-     * persist-before-call (recordPending with intentId=null) throws a
-     * DataIntegrityViolationException before AkwaPay is ever called — see
-     * prod log, SQLState 23502. The entity javadoc and its @Column
-     * annotation (no nullable=false) both describe intent_id as meant to be
-     * nullable; the DB schema just hasn't been migrated to match yet.
+     * NOTE (2026-09-09): temporarily back to persist-AFTER-call only.
+     * The live "akwapay_pending_intents" table has intent_id as NOT NULL,
+     * so persist-before-call (recordPending with intentId=null) throws a
+     * DataIntegrityViolationException. Once the column is migrated to
+     * nullable, switch callers back to persist-before-call.
      *
-     * Once `ALTER TABLE akwapay_pending_intents ALTER COLUMN intent_id DROP
-     * NOT NULL;` has been run: switch callers back to persist-before-call
-     * (recordPending(reference, null, ...) before the AkwaPay call,
-     * attachIntentId(reference, intentId) after success — see that method
-     * below, currently unused but left in place for this) to restore the
-     * crash-safety the entity javadoc describes.
-     *
-     * A failure to persist here is logged and swallowed rather than thrown:
-     * the AkwaPay call has already succeeded by the time this runs, so the
-     * charge exists on AkwaPay's side either way — the only thing lost on a
-     * failed save is our local backstop for reconciling it, which is why the
-     * error message says to investigate/credit manually.
-     *
-     * NOTE (2026-09-10): a failed save here is no longer an unrecoverable
-     * loss on its own — see {@link #settle}, which now recovers the owning
-     * user from AkwaPay's own intent metadata whenever this row is missing.
-     * The error log below stays, because metadata recovery is a fallback,
-     * not a substitute for having the row.
+     * A failure to persist here is logged and swallowed — the AkwaPay call
+     * has already succeeded, and settle() can recover the owner from
+     * AkwaPay's own echoed metadata. See settle() javadoc.
      */
     private void recordPending(String reference, String intentId, UUID userId,
                                BigDecimal amountGhs, boolean adminUpgrade) {
@@ -577,38 +717,31 @@ public class AkwaPayController {
                     reference, intentId);
         } catch (Exception e) {
             log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
-                            "this payment can only be credited by webhook, sweep, status-probe settle-on-read, " +
-                            "or by hand. Investigate.",
+                            "can only be credited by webhook, sweep, status-probe settle-on-read, or by hand.",
                     reference, intentId, userId, amountGhs, e);
         }
     }
 
     /**
      * Fills in the intentId on a row previously persisted with intentId=null.
-     *
-     * Currently UNUSED — no caller reaches this while recordPending() is
-     * persist-after-call only (see the NOTE on recordPending above). Left in
-     * place, fully working, for when the intent_id column is migrated to
-     * nullable and callers switch back to persist-before-call.
+     * Currently UNUSED — left in place for when the intent_id column is
+     * migrated to nullable. See recordPending() NOTE.
      */
     private void attachIntentId(String reference, String intentId) {
         try {
             var existing = pendingIntents.findById(reference);
             if (existing.isEmpty()) {
-                log.error("attachIntentId: no pending row for ref='{}' intent='{}' — AkwaPay confirmed an intent " +
-                                "but we have nowhere to record it. The sweep cannot pick this up; investigate and " +
-                                "credit manually if the payment succeeds.",
+                log.error("attachIntentId: no pending row for ref='{}' intent='{}' — investigate and credit manually.",
                         reference, intentId);
                 return;
             }
             var row = existing.get();
             row.setIntentId(intentId);
             pendingIntents.save(row);
-            log.info("attachIntentId: ref='{}' intent='{}' attached — sweep can now poll", reference, intentId);
+            log.info("attachIntentId: ref='{}' intent='{}' attached", reference, intentId);
         } catch (Exception e) {
-            log.error("attachIntentId: FAILED to attach intent='{}' to ref='{}' — sweep cannot poll until this " +
-                            "is fixed manually.",
-                    intentId, reference, e);
+            log.error("attachIntentId: FAILED to attach intent='{}' to ref='{}': {}",
+                    intentId, reference, e.getMessage(), e);
         }
     }
 
@@ -616,11 +749,7 @@ public class AkwaPayController {
 
     /**
      * Explicitly creates a hosted checkout session when the frontend has no
-     * phone number (e.g. the customer skips the phone form).
-     *
-     * Returns checkout_url — redirect the customer to it.
-     * The AkwaPay checkout page collects the phone, sends the MoMo push,
-     * and shows the USSD fallback if push doesn't arrive.
+     * phone number. No phone → no blocking gate needed here.
      */
     @PostMapping("/api/wallet/deposit/akwapay/checkout")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initCheckout(
@@ -643,17 +772,15 @@ public class AkwaPayController {
         log.info("initCheckout: userId='{}' amount={} ref='{}' — hosted checkout fallback",
                 user.getId(), amount, reference);
 
-        // Persist AFTER AkwaPay succeeds — required by current schema (see
-        // NOTE in initDeposit).
         var response = akwapayCreateIntent(
                 amountPesewas,
                 reference,
                 user.getEmail(),
-                null,     // no phone — checkout page collects it
-                null,     // no network
-                "card",   // triggers hosted checkout
+                null,
+                null,
+                "card",
                 frontendUrl + "/wallet?payment=success",
-                Map.of("userId", user.getId().toString(), "purpose", "deposit")
+                buildMetadata(user.getId(), "deposit", null, null)
         );
 
         var intentId = String.valueOf(response.get("id"));
@@ -668,29 +795,10 @@ public class AkwaPayController {
     // ─── Status probe (SETTLE-ON-READ) ─────────────────────────────────────────
 
     /**
-     * Reads the intent from AkwaPay and returns it unchanged to the caller —
-     * same response shape as before this fix, so the frontend needs no
-     * changes to consume this. The one behavioural addition (2026-09-10):
-     * if AkwaPay reports "succeeded" for a reference we recognise
-     * (sbdep-/sbadm- prefix), credit it right here via {@link #settle}
-     * before responding.
-     *
-     * WHY HERE: this is the one endpoint the customer's browser is actively
-     * polling every few seconds while a payment is in flight (see
-     * useBackgroundPoll in DepositPage.tsx, which now also polls during the
-     * await_prompt step, not just the pending step). If AkwaPay's own async
-     * webhook/intent-status pipeline is lagging — or has desynced entirely
-     * from the underlying NaloPay channel, as confirmed in production on
-     * 2026-09-10 (AkwaPay dashboard showed "awaiting customer" for several
-     * intents whose exact same reference showed "Successful" on NaloPay's
-     * own collection report) — this is the fastest and cheapest place to
-     * catch up: no new infrastructure, no second polling loop, just
-     * "credit before you answer, if the answer is good news".
-     *
-     * SAFETY: settle() → WalletService.credit() dedupes on reference via a
-     * 409 on repeat, so this races safely against the webhook and the
-     * scheduled sweep — whichever of the three notices "succeeded" first
-     * wins, the other two are harmless no-ops.
+     * Reads the intent from AkwaPay and returns it unchanged. If AkwaPay
+     * reports "succeeded" for a reference we own, credits it immediately via
+     * {@link #settle} before responding. See the class-level "FIX (2026-09-10)"
+     * javadoc for the full rationale.
      */
     @GetMapping("/api/wallet/deposit/akwapay/status/{intentId}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> status(
@@ -704,10 +812,6 @@ public class AkwaPayController {
         log.info("status: userId='{}' intent='{}' status='{}' next_action='{}'",
                 user.getId(), intentId, statusStr, nextActionType(result));
 
-        // SETTLE-ON-READ — see the class-level "FIX (2026-09-10)" javadoc
-        // above for the full story. credit() dedupes on reference, so this
-        // is safe to call on every single poll tick that reports success,
-        // not just the first one.
         if ("succeeded".equals(statusStr) && reference != null
                 && (reference.startsWith(REF_PREFIX_DEPOSIT) || reference.startsWith(REF_PREFIX_ADMIN))) {
             settle(reference, intentId, result, "status-probe");
@@ -716,11 +820,7 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    /**
-     * Reads a payment intent straight from AkwaPay. Extracted so both
-     * {@link #status} and {@link #reconcileOne} share one AkwaPay read
-     * path instead of two near-identical inline WebClient calls.
-     */
+    /** Fetches a single intent directly from AkwaPay. Shared by status() and reconcileOne(). */
     @SuppressWarnings("unchecked")
     private Map<String, Object> probeIntent(String intentId) {
         var result = (Map<String, Object>) webClientBuilder.build()
@@ -743,28 +843,23 @@ public class AkwaPayController {
     }
 
     /**
-     * Single shared "this reference is confirmed paid — make sure the
-     * customer has been credited" path. Callable from the webhook, the
-     * sweep, or (new, 2026-09-10) the status-probe endpoint — whichever
-     * learns of a "succeeded" intent first.
+     * Shared "this reference is confirmed paid — credit the customer" path.
+     * Callable from the webhook, the sweep, or the status-probe — whichever
+     * notices "succeeded" first wins; the others are harmless 409 no-ops.
      *
-     * Resolves the owning user/amount from the pending row if it still
-     * exists. If the row is missing — recordPending() has failed in
-     * production before; see its own javadoc, SQLState 23502 — recovers
-     * both from the metadata AkwaPay echoes back on every intent read,
-     * which is stamped with userId/purpose at creation time in
-     * {@link #akwapayCreateIntent}. Credit always goes to the intent's
-     * OWNER, resolved from the pending row or from AkwaPay's own stored
-     * metadata for that specific intent — never to whoever happened to
-     * make the HTTP call that triggered settle(). A user polling a
-     * different user's intentId can therefore only ever cause a credit to
-     * land on the rightful owner of that intent, never on themselves.
+     * Also clears the phone's incomplete-attempt counter on success (via
+     * {@link #clearPhoneAttempt}) so a user who eventually completes a
+     * payment is not penalised for earlier failures.
+     *
+     * Credit always goes to the intent's owner (pending row or metadata),
+     * never to the caller of the HTTP endpoint that triggered settle().
      */
     private void settle(String reference, String intentId, Map<String, Object> akwapayIntent, String source) {
         UUID       userId;
         BigDecimal amount;
         boolean    adminUpgrade = reference.startsWith(REF_PREFIX_ADMIN);
         boolean    hadRow       = false;
+        String     phone        = null; // recovered for clearPhoneAttempt
 
         Optional<AkwaPayPendingIntent> pending;
         try {
@@ -788,9 +883,12 @@ public class AkwaPayController {
                     source, reference, intentId, userId, amount);
         }
 
+        // Recover phone from metadata for attempt counter reset.
+        phone = metadataPhone(akwapayIntent);
+
         if (userId == null || amount == null || amount.signum() <= 0) {
-            log.error("settle({}): ref='{}' intent='{}' SUCCEEDED at AkwaPay but owner unresolvable " +
-                            "(no pending row, no usable metadata). MANUAL CREDIT REQUIRED. intent={}",
+            log.error("settle({}): ref='{}' intent='{}' SUCCEEDED at AkwaPay but owner unresolvable. " +
+                            "MANUAL CREDIT REQUIRED. intent={}",
                     source, reference, intentId, akwapayIntent);
             return;
         }
@@ -799,46 +897,51 @@ public class AkwaPayController {
             if (adminUpgrade) handleAdminUpgrade(userId, reference, amount, intentId);
             else              handleDeposit(userId, reference, amount, intentId);
         } catch (Exception e) {
-            log.error("settle({}): credit threw for ref='{}' userId='{}' amount={} — sweep/webhook/next " +
-                            "status-probe will retry",
+            log.error("settle({}): credit threw for ref='{}' userId='{}' amount={} — will retry",
                     source, reference, userId, amount, e);
             return;
         }
 
+        // ── CLEAR ATTEMPT COUNTER on successful settlement ────────────────────
+        if (phone != null && !phone.isBlank()) {
+            clearPhoneAttempt(phone, reference);
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
         if (hadRow) deletePending(reference, "settled by " + source);
     }
 
-    /** Recovers userId from AkwaPay's own echoed intent metadata (stamped at creation — see akwapayCreateIntent). */
+    /** Recovers userId from AkwaPay's echoed intent metadata. */
     private UUID metadataUserId(Map<String, Object> akwapayIntent) {
         if (akwapayIntent.get("metadata") instanceof Map<?, ?> m && m.get("userId") != null) {
-            try {
-                return UUID.fromString(m.get("userId").toString());
-            } catch (IllegalArgumentException ignored) {
-                // fall through — malformed/foreign metadata, treat as unresolvable
-            }
+            try { return UUID.fromString(m.get("userId").toString()); }
+            catch (IllegalArgumentException ignored) {}
         }
         return null;
     }
 
-    /** Converts AkwaPay's integer-pesewas amount field back to a GHS BigDecimal, or null if unusable. */
+    /** Recovers the phone number from AkwaPay's echoed intent metadata (stored at creation). */
+    private String metadataPhone(Map<String, Object> akwapayIntent) {
+        if (akwapayIntent.get("metadata") instanceof Map<?, ?> m && m.get("phone") != null) {
+            return m.get("phone").toString();
+        }
+        return null;
+    }
+
+    /** Converts AkwaPay's integer-pesewas amount field back to GHS BigDecimal, or null if unusable. */
     private BigDecimal pesewasToGhs(Object amount) {
         if (amount == null) return null;
         try {
             var pesewas = new BigDecimal(amount.toString());
             return pesewas.signum() <= 0 ? null : pesewas.divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
-        } catch (Exception e) {
-            return null;
-        }
+        } catch (Exception e) { return null; }
     }
 
     // ─── OTP submission (legacy — kept for non-NaloPay gateway fallback) ──────
 
     /**
      * NaloPay does not use OTP — it uses USSD fallback instead.
-     * This endpoint is kept for backward compatibility if AkwaPay routes
-     * to a different gateway that still uses the submit_otp flow.
-     *
-     * For NaloPay: surface next_action.ussdFallback to the user instead.
+     * Kept for backward compatibility with other gateways.
      */
     @PostMapping("/api/wallet/deposit/akwapay/otp")
     public ResponseEntity<ApiResponse<Map<String, Object>>> submitOtp(
@@ -913,7 +1016,7 @@ public class AkwaPayController {
 
         if (!verifySignature(rawBody, signature)) {
             log.warn("AkwaPay webhook: invalid signature, delivery='{}' eventType='{}' — " +
-                            "check AKWAPAY_WEBHOOK_SECRET matches the whsec_ for this endpoint",
+                            "check AKWAPAY_WEBHOOK_SECRET",
                     deliveryId, headerEventType);
             return ResponseEntity.status(400).body("Invalid signature");
         }
@@ -956,23 +1059,18 @@ public class AkwaPayController {
             var amount        = BigDecimal.valueOf(amountPesewas)
                     .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
 
-            // FIX (2026-09-10): a missing pending row used to mean an
-            // unrecoverable silent drop — "Ignored: unknown reference",
-            // 200, done, money gone. Now: try to recover the owner from
-            // the metadata AkwaPay echoes back on the webhook payload
-            // itself (the same metadata stamped at intent creation), and
-            // credit via the same settle()-adjacent handlers used
-            // everywhere else. Only if BOTH the row AND the metadata are
-            // unusable do we give up — and even then, we now say so loudly
-            // (ERROR, not WARN) instead of quietly returning 200.
+            // FIX (2026-09-10): missing pending row is no longer an unrecoverable drop.
+            // Recover owner from metadata; if also missing, log loudly.
             var pending = resolvePending(reference);
             if (pending.isEmpty()) {
-                var uid = metadataUserId(data);
+                var uid   = metadataUserId(data);
+                var phone = metadataPhone(data);
                 if (uid != null) {
                     log.warn("AkwaPay webhook: pending row missing for ref='{}' — crediting via metadata userId='{}'",
                             reference, uid);
                     if (reference.startsWith(REF_PREFIX_ADMIN)) handleAdminUpgrade(uid, reference, amount, intentId);
                     else                                        handleDeposit(uid, reference, amount, intentId);
+                    if (phone != null) clearPhoneAttempt(phone, reference);
                 } else {
                     log.error("AkwaPay webhook: UNRECOVERABLE payment ref='{}' intent='{}' amount={} " +
                                     "— no pending row, no metadata. MANUAL CREDIT REQUIRED. delivery='{}' fullEvent={}",
@@ -987,6 +1085,10 @@ public class AkwaPayController {
             } else {
                 handleDeposit(parsed.getUserId(), reference, amount, intentId);
             }
+
+            // Clear attempt counter if phone was stored in metadata.
+            var phone = metadataPhone(data);
+            if (phone != null) clearPhoneAttempt(phone, reference);
 
             deletePending(reference, "settled by webhook");
 
@@ -1018,19 +1120,13 @@ public class AkwaPayController {
             try {
                 reconcileOne(intent);
             } catch (Exception e) {
-                log.error("reconcile: unexpected error for ref='{}' intent='{}' — will retry next tick",
+                log.error("reconcile: unexpected error for ref='{}' intent='{}' — will retry",
                         intent.getReference(), intent.getIntentId(), e);
             }
         }
     }
 
     private boolean isDue(AkwaPayPendingIntent intent, Instant now) {
-        // No intentId yet means AkwaPay's create-intent call hasn't (or
-        // never will) complete for this row — there is nothing to poll AkwaPay
-        // about. Per AkwaPayPendingIntent javadoc ("WHY intentId IS NULLABLE"),
-        // the sweep skips these; reconcileOne still abandons a null-intentId
-        // row that's stuck well past ABANDON_AFTER (the AkwaPay call itself
-        // died and nothing ever attached an intentId).
         if (intent.getIntentId() == null) {
             return intent.getCreatedAt().isBefore(now.minus(ABANDON_AFTER));
         }
@@ -1058,11 +1154,7 @@ public class AkwaPayController {
         }
 
         if (intent.getIntentId() == null) {
-            // isDue() only lets a null-intentId row reach here once it's past
-            // ABANDON_AFTER, so in practice the branch above always catches
-            // it first. This guard exists so we never build a
-            // "/payment_intents/null" URL if that assumption ever changes.
-            log.warn("reconcile: ref='{}' has no intentId yet — nothing to poll, skipping this tick", ref);
+            log.warn("reconcile: ref='{}' has no intentId yet — skipping this tick", ref);
             return;
         }
 
@@ -1086,11 +1178,6 @@ public class AkwaPayController {
         log.info("reconcile: ref='{}' intent='{}' akwapayStatus='{}' attempt={}",
                 ref, intent.getIntentId(), akwapayStatus, intent.getAttempts());
 
-        // DIAGNOSTIC (2026-09-09) — "push never arrives" investigation.
-        // Dump the full raw status response on the first 3 attempts only
-        // (avoids flooding logs for a payment that's legitimately just
-        // sitting in await_prompt for a while). If NaloPay surfaces any
-        // delivery/provider hint beyond `status`, it'll be visible here.
         if (intent.getAttempts() <= 3) {
             log.info("reconcile[momo-diag]: ref='{}' intent='{}' attempt={} FULL response body={}",
                     ref, intent.getIntentId(), intent.getAttempts(), result);
@@ -1101,16 +1188,14 @@ public class AkwaPayController {
                 log.info("reconcile: ref='{}' succeeded on sweep — applying credit", ref);
                 settle(ref, intent.getIntentId(), result, "sweep");
             }
-
             case "failed", "declined", "cancelled", "expired" -> {
                 log.warn("reconcile: ref='{}' intent='{}' terminal status='{}' — no credit applied",
                         ref, intent.getIntentId(), akwapayStatus);
                 deletePending(ref, "terminal status " + akwapayStatus);
             }
-
             default ->
-                    log.info("reconcile: ref='{}' status='{}' — still in flight, next check in {}s",
-                            ref, akwapayStatus, pollIntervalFor(intent, Instant.now()).toSeconds());
+                log.info("reconcile: ref='{}' status='{}' — still in flight, next check in {}s",
+                        ref, akwapayStatus, pollIntervalFor(intent, Instant.now()).toSeconds());
         }
     }
 
@@ -1121,7 +1206,7 @@ public class AkwaPayController {
                 log.info("deletePending: ref='{}' removed from pending ledger ({})", reference, why);
             }
         } catch (Exception e) {
-            log.warn("deletePending: could not remove ref='{}' ({}) — sweep will re-check and skip: {}",
+            log.warn("deletePending: could not remove ref='{}' ({}) — sweep will re-check: {}",
                     reference, why, e.getMessage());
         }
     }
@@ -1196,8 +1281,7 @@ public class AkwaPayController {
             return detected.get();
         }
 
-        log.warn("resolveNetwork: could not resolve network from phone='{}' and no network was selected",
-                phone == null ? "null" : "<redacted>");
+        log.warn("resolveNetwork: could not resolve network from phone and no network was selected");
         throw ApiException.badRequest(
                 "We couldn't detect which network that number is on. Please select MTN, Telecel, or AirtelTigo.");
     }
@@ -1224,18 +1308,11 @@ public class AkwaPayController {
     /**
      * Creates a payment intent on AkwaPay.
      *
-     * For NaloPay (primary gateway):
-     *   - method="mobile_money" + phone + network → direct MoMo push
-     *     Response: next_action.type="await_prompt", next_action.ussdFallback="*920*1*xxx#"
-     *   - method="card" (no phone) → hosted checkout session
-     *     Response: next_action.type="redirect", checkout_url="https://akwapay.vercel.app/checkout/..."
+     * ROOT CAUSE FIX (2026-09-09): customer.email NEVER sent for
+     * method="mobile_money" — it was the cause of every MoMo failure.
      *
-     * Every caller MUST pass a reference that has never been sent to
-     * NaloPay before — including on a same-request retry/fallback. NaloPay
-     * can persist a payment_intent for a reference even when this call
-     * ultimately throws, so retrying with the same reference is rejected
-     * as a duplicate. Callers that fall back after a failure must generate
-     * a new reference via {@link #buildReference} first.
+     * Every caller MUST pass a reference that has never been sent to NaloPay
+     * before, including on a fallback retry. See initDeposit() for details.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> akwapayCreateIntent(int amountPesewas,
@@ -1247,20 +1324,6 @@ public class AkwaPayController {
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
-        // ROOT CAUSE FIX (2026-09-09): customer.email BREAKS NaloPay's MoMo
-        // collection path. Confirmed via a controlled live test — the exact
-        // same request that succeeds with only {"phone": "..."} in customer
-        // fails with 402 "NALOPAY collection rejected: Failed to create
-        // collection" the moment an email field is added. This matches every
-        // production mobile_money failure logged so far: the synthetic email
-        // below was being attached unconditionally, on every call, including
-        // mobile_money — so every real MoMo push attempt failed at NaloPay
-        // and silently fell back to checkout.
-        //
-        // customer.email is still useful for the card/checkout path (it's
-        // shown in AkwaPay's own docs example alongside phone), so only
-        // suppress it for mobile_money specifically rather than dropping it
-        // everywhere.
         String syntheticEmail;
         if (email != null && email.contains("@")) {
             int atIdx = email.indexOf("@");
@@ -1275,29 +1338,21 @@ public class AkwaPayController {
 
         var customer = new HashMap<String, Object>();
         if (!"mobile_money".equals(method)) {
+            // email breaks NaloPay's MoMo collection — only attach for card/checkout
             customer.put("email", syntheticEmail);
         }
         if (phone != null && !phone.isBlank()) customer.put("phone", phone);
 
         var body = new HashMap<String, Object>();
-        body.put("amount",     amountPesewas);
-        body.put("currency",   "GHS");
-        body.put("reference",  reference);
-        body.put("return_url", returnUrl);
-        body.put("metadata",   metadata);
-        body.put("customer",   customer);
-        body.put("method",     method);
-        // UNTESTED VARIABLE (2026-09-09): every manual curl/PowerShell test
-        // that succeeded against NaloPay's mobile_money collection included
-        // "description" in the body. The production backend never sent it.
-        // return_url and metadata were each proven harmless in isolation
-        // (Test A, Test C), but description was never tested on its own —
-        // this is the one remaining untested difference between "known
-        // good" and "known failing" requests. Sending a fixed, harmless
-        // value costs nothing if it turns out not to matter.
+        body.put("amount",      amountPesewas);
+        body.put("currency",    "GHS");
+        body.put("reference",   reference);
+        body.put("return_url",  returnUrl);
+        body.put("metadata",    metadata);
+        body.put("customer",    customer);
+        body.put("method",      method);
         body.put("description", "Wallet deposit");
 
-        // Only set network for mobile_money — card doesn't need it
         boolean networkAttached = false;
         if ("mobile_money".equals(method) && network != null) {
             body.put("network", network.toUpperCase());
@@ -1306,44 +1361,27 @@ public class AkwaPayController {
 
         var idempotencyKey = UUID.randomUUID().toString();
 
-        // DIAGNOSTIC (2026-09-09) — "Failed to create collection" investigation.
-        // Logs the exact shape of what we send NaloPay for a mobile_money
-        // request, PLUS the literal JSON body on the wire (below) so there
-        // is no more guessing from reading the code — this is what actually
-        // gets sent, byte for byte, to compare directly against a manual
-        // curl/PowerShell call that is known to succeed.
         if ("mobile_money".equals(method)) {
             var maskedPhone = phone == null ? "null"
                     : phone.length() > 4
                       ? phone.substring(0, 3) + "***" + phone.substring(phone.length() - 2)
                       : "<short>";
-            log.info("akwapayCreateIntent[momo-diag]: ref='{}' phoneMasked='{}' phoneLength={} phoneStartsWithPlus={} " +
+            log.info("akwapayCreateIntent[momo-diag]: ref='{}' phoneMasked='{}' phoneLength={} " +
                             "network='{}' networkAttachedToBody={} emailOmittedFromBody={} idempotencyKey='{}'",
-                    reference,
-                    maskedPhone,
+                    reference, maskedPhone,
                     phone == null ? 0 : phone.length(),
-                    phone != null && phone.startsWith("+"),
-                    network,
-                    networkAttached,
-                    !customer.containsKey("email"),
-                    idempotencyKey);
+                    network, networkAttached, !customer.containsKey("email"), idempotencyKey);
 
             try {
-                // Mask the phone in the logged copy only — never log the raw
-                // number, even in a diagnostic dump. The actual request sent
-                // to AkwaPay still carries the real phone; only the log line
-                // is redacted.
-                var loggable = new HashMap<>(body);
+                var loggable         = new HashMap<>(body);
                 var loggableCustomer = new HashMap<>(customer);
-                if (loggableCustomer.containsKey("phone")) {
-                    loggableCustomer.put("phone", maskedPhone);
-                }
+                if (loggableCustomer.containsKey("phone")) loggableCustomer.put("phone", maskedPhone);
                 loggable.put("customer", loggableCustomer);
                 log.info("akwapayCreateIntent[momo-diag]: ref='{}' LITERAL outbound JSON body={}",
                         reference, objectMapper.writeValueAsString(loggable));
             } catch (Exception serializeEx) {
-                log.warn("akwapayCreateIntent[momo-diag]: could not serialize outbound body for logging, ref='{}': {}",
-                        reference, serializeEx.getMessage());
+                log.warn("akwapayCreateIntent[momo-diag]: could not serialize body for logging: {}",
+                        serializeEx.getMessage());
             }
         }
 
@@ -1406,14 +1444,6 @@ public class AkwaPayController {
         log.info("akwapayCreateIntent: intent='{}' status='{}' next_action='{}' ussdFallback='{}' ref='{}'",
                 result.get("id"), status, nextActionType(result), nextActionUssd(result), reference);
 
-        // DIAGNOSTIC (2026-09-09) — dump the FULL raw response for mobile_money
-        // calls only (card/checkout responses are noisier and less relevant to
-        // "push never arrives"). AkwaPay may include provider-side fields we
-        // don't currently parse (e.g. a warning, a delivery hint, a different
-        // provider code) that explain why NaloPay accepted the request
-        // (status=requires_action, next_action=await_prompt) but the handset
-        // never got the prompt. If this ever shows something informative,
-        // promote it into nextActionType()/nextActionUssd() as a real field.
         if ("mobile_money".equals(method)) {
             log.info("akwapayCreateIntent[momo-diag]: ref='{}' FULL response body={}", reference, result);
         }
@@ -1437,11 +1467,6 @@ public class AkwaPayController {
         return String.valueOf(m.get("type"));
     }
 
-    /**
-     * Extracts the USSD fallback code from next_action.
-     * NaloPay returns this as ussdFallback (e.g. "*920*1*486#").
-     * Surface this to the frontend — always show it, always.
-     */
     private String nextActionUssd(Map<String, Object> response) {
         var na = response.get("next_action");
         if (!(na instanceof Map<?, ?> m)) return null;
@@ -1449,7 +1474,7 @@ public class AkwaPayController {
         return ussd == null ? null : String.valueOf(ussd);
     }
 
-    // ─── Reference generation / resolution ─────────────────────────────────────
+    // ─── Reference generation / resolution ────────────────────────────────────
 
     private static final String REF_TOKEN_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
     private static final int    REF_TOKEN_LENGTH    = 16;
@@ -1457,16 +1482,8 @@ public class AkwaPayController {
 
     /**
      * Builds a short, opaque merchant reference: prefix + 16 random
-     * lowercase-alphanumeric characters, exactly one hyphen total (the one
-     * baked into the prefix constant). e.g. "sbdep-9k2m7qw1x0az4btc".
-     *
-     * Deliberately does NOT encode the userId or anything else structured —
-     * NaloPay rejects longer, multi-hyphen references outright ("Invalid
-     * value for reference"), and AkwaPay's own docs/tests only ever use
-     * short single-segment references like "order-4471". The userId is
-     * resolved later via {@link #resolvePending} (or, if that row is
-     * missing, via {@link #metadataUserId}), not decoded from this string,
-     * so there is nothing to gain by embedding it here.
+     * lowercase-alphanumeric characters, exactly one hyphen total.
+     * e.g. "sbdep-9k2m7qw1x0az4btc".
      */
     private String buildReference(String prefix) {
         var sb = new StringBuilder(prefix.length() + REF_TOKEN_LENGTH);
@@ -1478,18 +1495,10 @@ public class AkwaPayController {
     }
 
     /**
-     * Resolves a reference back to the pending intent record we persisted
-     * when the charge was created — this is how we recover userId and
-     * whether the charge was an admin upgrade, now that the reference
-     * itself carries no structured data.
-     *
-     * Returns empty for a reference we have no record of (already
-     * reconciled and deleted, or genuinely foreign/unrecognised) — callers
-     * treat that the same way the old "malformed reference" case was
-     * treated: log it and skip, rather than throwing. As of 2026-09-10,
-     * "empty" is no longer necessarily a dead end — see {@link #settle}
-     * and the webhook's metadata-recovery branch, both of which fall back
-     * to AkwaPay's own intent metadata when this returns empty.
+     * Resolves a reference back to the pending intent record.
+     * Returns empty for references we have no record of (already settled,
+     * or genuinely foreign). As of 2026-09-10, empty is no longer a dead
+     * end — settle() and the webhook both fall back to metadata recovery.
      */
     private Optional<AkwaPayPendingIntent> resolvePending(String reference) {
         if (!reference.startsWith(REF_PREFIX_DEPOSIT) && !reference.startsWith(REF_PREFIX_ADMIN)) {
@@ -1516,7 +1525,7 @@ public class AkwaPayController {
             }
 
             if (t == null || v1 == null) {
-                log.warn("AkwaPay webhook: malformed signature header — missing 't' or 'v1' part");
+                log.warn("AkwaPay webhook: malformed signature header — missing 't' or 'v1'");
                 return false;
             }
 
