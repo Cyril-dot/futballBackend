@@ -21,7 +21,7 @@ import java.util.stream.Collectors;
 public class EspnFootballDataService {
 
     private static final String BASE_URL = "https://site.web.api.espn.com/apis/site/v2/sports/soccer";
-    
+
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
     private static final DateTimeFormatter ESPN_DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
@@ -55,6 +55,10 @@ public class EspnFootballDataService {
         UGANDAN_PL          ("uga.1",  "Ugandan Premier League",           false),
         ZAMBIAN_SL          ("zam.1",  "Zambian Super League",             false),
         ZIMBABWE_PSL        ("zim.1",  "Zimbabwean Premier Soccer League", false),
+        EGYPTIAN_PL         ("egy.1",  "Egyptian Premier League",          false),
+        MOROCCAN_BOTOLA     ("mar.1",  "Moroccan Botola Pro",              false),
+        ALGERIAN_L1         ("alg.1",  "Algerian Ligue 1",                 false),
+        TUNISIAN_L1         ("tun.1",  "Tunisian Ligue 1",                 false),
 
         // ── ADDITIONAL EUROPE ──────────────────────────────────
         BELGIAN_PRO         ("bel.1",  "Belgian Pro League",            false),
@@ -63,6 +67,11 @@ public class EspnFootballDataService {
         DANISH_SL           ("den.1",  "Danish Superliga",              false),
         SWEDISH_AL          ("swe.1",  "Swedish Allsvenskan",           false),
         NORWEGIAN_EL        ("nor.1",  "Norwegian Eliteserien",         false),
+        SWISS_SL            ("sui.1",  "Swiss Super League",            false),
+        AUSTRIAN_BL         ("aut.1",  "Austrian Bundesliga",           false),
+        POLISH_E            ("pol.1",  "Polish Ekstraklasa",            false),
+        UKRAINIAN_PL        ("ukr.1",  "Ukrainian Premier League",      false),
+        CZECH_FL            ("cze.1",  "Czech First League",            false),
 
         // ── ADDITIONAL AMERICAS ────────────────────────────────
         COLOMBIAN_LP        ("col.1",  "Colombian Liga BetPlay",        false),
@@ -72,10 +81,12 @@ public class EspnFootballDataService {
         PERUVIAN_PD         ("per.1",  "Peruvian Liga 1",               false),
         URUGUAYAN_PD        ("uru.1",  "Uruguayan Primera División",    false),
 
-        // ── ASIA / MENA ────────────────────────────────────────
+        // ── ASIA / MENA / OCEANIA ───────────────────────────────
         CHINESE_SL          ("chn.1",  "Chinese Super League",          false),
         JAPANESE_J1         ("jpn.1",  "J1 League",                     false),
-        KOREAN_KL           ("kor.1",  "Korean K League 1",             false);
+        KOREAN_KL           ("kor.1",  "Korean K League 1",             false),
+        AUSTRALIAN_ALEAGUE  ("aus.1",  "Australian A-League",           false),
+        INDIAN_SL           ("ind.1",  "Indian Super League",           false);
 
         private final String  slug;
         private final String  displayName;
@@ -98,7 +109,8 @@ public class EspnFootballDataService {
         public static List<EspnLeague> african() {
             return List.of(
                     RSA_PREMIERSHIP, RSA_FIRST_DIVISION, NIGERIAN_PL, GHANAIAN_PL,
-                    KENYAN_PL, UGANDAN_PL, ZAMBIAN_SL, ZIMBABWE_PSL
+                    KENYAN_PL, UGANDAN_PL, ZAMBIAN_SL, ZIMBABWE_PSL,
+                    EGYPTIAN_PL, MOROCCAN_BOTOLA, ALGERIAN_L1, TUNISIAN_L1
             );
         }
     }
@@ -115,6 +127,18 @@ public class EspnFootballDataService {
         CONFERENCE_LEAGUE("uefa.europa.conference", "UEFA Conference League",true),
 
         // NOTE: FIFA World Cup removed — tournament has concluded, no longer polled.
+
+        // ── INTERNATIONAL TOURNAMENTS ────────────────────────────
+        UEFA_EURO             ("uefa.euro",              "UEFA European Championship", false),
+        COPA_AMERICA          ("conmebol.america",       "Copa América",               false),
+        AFCON                 ("caf.nations",            "Africa Cup of Nations",      false),
+        FIFA_CLUB_WORLD_CUP   ("fifa.cwc",               "FIFA Club World Cup",        false),
+
+        // ── CONTINENTAL CLUB COMPETITIONS (NON-UEFA) ─────────────
+        CAF_CHAMPIONS_LEAGUE     ("caf.champions",           "CAF Champions League",        false),
+        CONCACAF_CHAMPIONS_CUP   ("concacaf.champions",      "CONCACAF Champions Cup",      false),
+        COPA_LIBERTADORES        ("conmebol.libertadores",   "Copa Libertadores",           false),
+        COPA_SUDAMERICANA        ("conmebol.sudamericana",   "Copa Sudamericana",           false),
 
         // ── PRESEASON / CLUB FRIENDLIES ─────────────────────────
         // Soccer has no discrete "preseason" the way American sports do — preseason
@@ -152,6 +176,16 @@ public class EspnFootballDataService {
             return Arrays.stream(values()).filter(EspnCup::isTop6Related).collect(Collectors.toList());
         }
 
+        /** International national-team tournaments (Euros, Copa América, AFCON, Club World Cup). */
+        public static List<EspnCup> internationalTournaments() {
+            return List.of(UEFA_EURO, COPA_AMERICA, AFCON, FIFA_CLUB_WORLD_CUP);
+        }
+
+        /** Continental club competitions outside of UEFA (CAF, CONCACAF, CONMEBOL). */
+        public static List<EspnCup> continentalClubComps() {
+            return List.of(CAF_CHAMPIONS_LEAGUE, CONCACAF_CHAMPIONS_CUP, COPA_LIBERTADORES, COPA_SUDAMERICANA);
+        }
+
         /** Preseason / club friendly / exhibition competitions (ICC, Emirates Cup, etc). */
         public static List<EspnCup> preseasonAndFriendlies() {
             return List.of(
@@ -160,7 +194,7 @@ public class EspnFootballDataService {
             );
         }
 
-        /** All cups (domestic cups, UEFA club comps, preseason/friendlies) — used for upcoming fixture and live scanning. */
+        /** All cups (domestic cups, UEFA club comps, international tournaments, continental club comps, preseason/friendlies) — used for upcoming fixture and live scanning. */
         public static List<EspnCup> allCups() {
             return Arrays.asList(values());
         }
@@ -323,14 +357,17 @@ public class EspnFootballDataService {
 
     /**
      * Scans EVERY league (all of {@link EspnLeague#values()}) plus every cup/competition
-     * (all of {@link EspnCup#allCups()}) and returns every currently in-progress match.
+     * (all of {@link EspnCup#allCups()} — domestic cups, UEFA club comps, international
+     * tournaments like the Euros/Copa América/AFCON/Club World Cup, continental club comps
+     * like the CAF Champions League/CONCACAF Champions Cup/Copa Libertadores/Copa Sudamericana,
+     * and preseason/friendlies) and returns every currently in-progress match.
      * This is the canonical "all live games" entry point — nothing is restricted to
      * top-6 or any subset here; it always hits ESPN directly (never the std/static
      * caches) so live state can never go stale beyond the 30s live-cache TTL.
      */
     public List<Map<String, Object>> getAllLiveMatchesToday() {
         return cachedLive("today:all:live", () -> {
-            log.info("ESPN getAllLiveMatchesToday: scanning EVERY league + EVERY cup for live matches");
+            log.info("ESPN getAllLiveMatchesToday: scanning EVERY league + EVERY cup/competition for live matches");
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -345,7 +382,8 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Also scan cups (UCL/UEL/UECL, domestic cups, preseason/club friendlies, etc.) for live matches
+            // Also scan cups/competitions (UCL/UEL/UECL, domestic cups, international
+            // tournaments, continental club comps, preseason/club friendlies, etc.) for live matches
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
                     List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
@@ -358,14 +396,14 @@ public class EspnFootballDataService {
             }
 
             List<Map<String, Object>> merged = mergeByEventId(all);
-            log.info("ESPN getAllLiveMatchesToday: {} live event(s) across every league + every cup", merged.size());
+            log.info("ESPN getAllLiveMatchesToday: {} live event(s) across every league + every cup/competition", merged.size());
             return merged;
         });
     }
 
     public List<Map<String, Object>> getAllUpcomingMatchesToday() {
         return cachedStd("today:all:upcoming", () -> {
-            log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues + cups");
+            log.info("ESPN getAllUpcomingMatchesToday: scanning all leagues + cups/competitions");
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -379,7 +417,8 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Include cups (UCL/UEL/UECL, domestic cups, preseason/club friendlies) for upcoming today
+            // Include cups/competitions (UCL/UEL/UECL, domestic cups, international
+            // tournaments, continental club comps, preseason/club friendlies) for upcoming today
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
                     List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
@@ -392,14 +431,14 @@ public class EspnFootballDataService {
             }
 
             List<Map<String, Object>> merged = mergeByEventId(all);
-            log.info("ESPN getAllUpcomingMatchesToday: {} upcoming event(s) across all leagues + cups", merged.size());
+            log.info("ESPN getAllUpcomingMatchesToday: {} upcoming event(s) across all leagues + cups/competitions", merged.size());
             return merged;
         });
     }
 
     public List<Map<String, Object>> getAllFinishedMatchesToday() {
         return cachedStd("today:all:finished", () -> {
-            log.info("ESPN getAllFinishedMatchesToday: scanning all leagues + cups");
+            log.info("ESPN getAllFinishedMatchesToday: scanning all leagues + cups/competitions");
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -413,7 +452,8 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Cups (UCL/UEL/UECL, domestic cups, preseason/club friendlies) were previously
+            // Cups/competitions (UCL/UEL/UECL, domestic cups, international tournaments,
+            // continental club comps, preseason/club friendlies) were previously
             // missing from this bucket even though the live/upcoming buckets included them.
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
@@ -427,7 +467,7 @@ public class EspnFootballDataService {
             }
 
             List<Map<String, Object>> merged = mergeByEventId(all);
-            log.info("ESPN getAllFinishedMatchesToday: {} finished event(s) across all leagues + cups", merged.size());
+            log.info("ESPN getAllFinishedMatchesToday: {} finished event(s) across all leagues + cups/competitions", merged.size());
             return merged;
         });
     }
@@ -450,7 +490,7 @@ public class EspnFootballDataService {
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
         return cachedStd(cacheKey, () -> {
-            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups incl. UCL/UEL/UECL and preseason/friendlies", yyyymmdd);
+            log.info("ESPN getAllUpcomingFixturesByDate({}): scanning all leagues + cups/competitions incl. UCL/UEL/UECL, international tournaments, continental club comps and preseason/friendlies", yyyymmdd);
             List<Map<String, Object>> all = new ArrayList<>();
 
             for (EspnLeague league : EspnLeague.values()) {
@@ -462,7 +502,10 @@ public class EspnFootballDataService {
                 }
             }
 
-            // Include ALL cups — Champions League, domestic cups, preseason/club friendlies, etc.
+            // Include ALL cups/competitions — Champions League, Europa League, Conference
+            // League, domestic cups, international tournaments (Euros/Copa América/AFCON/
+            // Club World Cup), continental club comps (CAF/CONCACAF/CONMEBOL), preseason/
+            // club friendlies, etc.
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
                     all.addAll(extractEvents(fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd)));
@@ -658,7 +701,85 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 2B: PRESEASON / CLUB FRIENDLIES ───────────────────────────
+    // ── SECTION 2B: INTERNATIONAL TOURNAMENTS ─────────────────────────────
+    // (UEFA European Championship, Copa América, Africa Cup of Nations, FIFA Club World Cup)
+
+    public List<Map<String, Object>> getInternationalTournamentsTodayMatches() {
+        return cachedStd("today:intl-tournaments:all", () -> {
+            List<Map<String, Object>> merged = new ArrayList<>();
+            for (EspnCup cup : EspnCup.internationalTournaments()) {
+                merged.addAll(getCupScoreboard(cup));
+            }
+            merged = mergeByEventId(merged);
+            log.info("ESPN getInternationalTournamentsTodayMatches: {} deduplicated event(s)", merged.size());
+            return merged;
+        });
+    }
+
+    public List<Map<String, Object>> getInternationalTournamentsLiveMatches() {
+        return cachedLive("live:intl-tournaments:all", () -> {
+            List<Map<String, Object>> live = new ArrayList<>();
+            for (EspnCup cup : EspnCup.internationalTournaments()) {
+                live.addAll(getCupLiveMatches(cup));
+            }
+            live = mergeByEventId(live);
+            log.info("ESPN getInternationalTournamentsLiveMatches: {} live event(s)", live.size());
+            return live;
+        });
+    }
+
+    public List<Map<String, Object>> getInternationalTournamentsUpcomingMatches() {
+        return cachedStd("upcoming:intl-tournaments:all", () -> {
+            List<Map<String, Object>> upcoming = new ArrayList<>();
+            for (EspnCup cup : EspnCup.internationalTournaments()) {
+                upcoming.addAll(getCupUpcomingMatches(cup));
+            }
+            upcoming = mergeByEventId(upcoming);
+            log.info("ESPN getInternationalTournamentsUpcomingMatches: {} upcoming event(s)", upcoming.size());
+            return upcoming;
+        });
+    }
+
+    // ── SECTION 2C: CONTINENTAL CLUB COMPETITIONS (NON-UEFA) ──────────────
+    // (CAF Champions League, CONCACAF Champions Cup, Copa Libertadores, Copa Sudamericana)
+
+    public List<Map<String, Object>> getContinentalClubCompsTodayMatches() {
+        return cachedStd("today:continental-clubs:all", () -> {
+            List<Map<String, Object>> merged = new ArrayList<>();
+            for (EspnCup cup : EspnCup.continentalClubComps()) {
+                merged.addAll(getCupScoreboard(cup));
+            }
+            merged = mergeByEventId(merged);
+            log.info("ESPN getContinentalClubCompsTodayMatches: {} deduplicated event(s)", merged.size());
+            return merged;
+        });
+    }
+
+    public List<Map<String, Object>> getContinentalClubCompsLiveMatches() {
+        return cachedLive("live:continental-clubs:all", () -> {
+            List<Map<String, Object>> live = new ArrayList<>();
+            for (EspnCup cup : EspnCup.continentalClubComps()) {
+                live.addAll(getCupLiveMatches(cup));
+            }
+            live = mergeByEventId(live);
+            log.info("ESPN getContinentalClubCompsLiveMatches: {} live event(s)", live.size());
+            return live;
+        });
+    }
+
+    public List<Map<String, Object>> getContinentalClubCompsUpcomingMatches() {
+        return cachedStd("upcoming:continental-clubs:all", () -> {
+            List<Map<String, Object>> upcoming = new ArrayList<>();
+            for (EspnCup cup : EspnCup.continentalClubComps()) {
+                upcoming.addAll(getCupUpcomingMatches(cup));
+            }
+            upcoming = mergeByEventId(upcoming);
+            log.info("ESPN getContinentalClubCompsUpcomingMatches: {} upcoming event(s)", upcoming.size());
+            return upcoming;
+        });
+    }
+
+    // ── SECTION 2D: PRESEASON / CLUB FRIENDLIES ───────────────────────────
 
     public List<Map<String, Object>> getPreseasonFriendliesTodayMatches() {
         return cachedStd("today:preseason:all", () -> {
