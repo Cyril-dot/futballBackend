@@ -165,4 +165,7 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
               AND m.settledAt IS NULL
             """)
     List<Match> findUnsettledFinishedBySport(@Param("sport") String sport);
+
+    List<Match> findBySourceAndStatusInAndKickoffAtLessThanEqual(
+            MatchSource source, List<String> statuses, Instant cutoff);
 }

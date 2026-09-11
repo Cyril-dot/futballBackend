@@ -8,6 +8,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -104,4 +105,16 @@ public interface MatchScheduledEventRepository extends JpaRepository<MatchSchedu
     // ── Inspect ─────────────────────────────────────────────────────────
 
     List<MatchScheduledEvent> findByMatchIdOrderByFireAtAsc(UUID matchId);
+
+    /**
+     * Finds the single FINISHED event for a match — used by the overdue-finish
+     * sweep and stale-match recovery to retrieve the intended final score when
+     * no in-memory handle is available.
+     *
+     * Returns Optional.empty() if no FINISHED event was ever persisted (e.g.
+     * a manually created SCHEDULED match with no auto-events).
+     */
+    Optional<MatchScheduledEvent> findTopByMatchIdAndEventType(
+            @Param("matchId")   UUID matchId,
+            @Param("eventType") String eventType);
 }

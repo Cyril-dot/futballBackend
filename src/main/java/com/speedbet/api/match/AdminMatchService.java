@@ -54,8 +54,7 @@ import java.util.UUID;
  *   ON SCORE UPDATE (LIVE / HALF_TIME / SECOND_HALF):
  *     → generateAndSaveLiveOdds()
  *       Every score change triggers a full refresh of 1X2 + asian_handicap
- *       rows so the DB always reflects the current scoreline. This is the
- *       same path LiveScorePoller uses for external-feed matches.
+ *       rows so the DB always reflects the current scoreline.
  *
  * ── Other rules ───────────────────────────────────────────────────────────
  *   - Admins never supply odds — all values are computed by the odds services.
@@ -64,65 +63,23 @@ import java.util.UUID;
  *   - No match events (goalscorers, cards, substitutions) are tracked.
  *
  * ══════════════════════════════════════════════════════════════════════════
- *  FIXES IN THIS REVISION
+ *  FIXES / CHANGES
  * ══════════════════════════════════════════════════════════════════════════
  *
- *  FIX 1 — updateScore() now evicts the match caches.
- *  ──────────────────────────────────────────────────
- *    createMatch() and updateStatus() both carried @CacheEvict. updateScore()
- *    did not. The score was written to the database correctly, but every
- *    cached read path ("matches", "todayMatches", "featuredMatches",
- *    "futureMatches") kept serving the pre-goal snapshot until the cache
- *    happened to expire.
- *
- *    To anyone watching the app, an automated match "kicked off and then
- *    nothing ever happened" — the goals were real and in the DB, they were
- *    just invisible on every endpoint that mattered. This single missing
- *    annotation accounts for a large share of the reported symptom.
- *
- *  FIX 2 — UUID-based overloads for every mutator.
- *  ───────────────────────────────────────────────
- *    Background jobs must not carry a detached {@code User} JPA entity across
- *    hours and thread boundaries — by the time the job runs there is no
- *    persistence context, and any lazy access throws. The scheduler now
- *    passes only the admin's UUID. The User-based signatures are unchanged so
- *    controllers need no edits.
- *
+ *  FIX 1 — updateScore() now evicts caches.
+ *  FIX 2 — UUID-based overloads for every mutator (background-job safe).
  *  FIX 3 — advanceStatusTo(): idempotent, self-healing transitions.
- *  ────────────────────────────────────────────────────────────────
- *    Strict updateStatus() is still what the admin UI calls, and still
- *    rejects illegal jumps. But an automated lifecycle has to survive a
- *    missed step.
- *
- *    Previously, if the kickoff transition was lost (restart, downtime,
- *    starved scheduler thread), the HALF_TIME job would then be rejected as
- *    an illegal jump from SCHEDULED — and so would SECOND_HALF, and so would
- *    FINISHED. Every remaining step failed like dominoes, each failure only
- *    reaching a log line, and the match hung mid-lifecycle forever. That is
- *    the "it starts and never ends" bug.
- *
- *    advanceStatusTo() instead walks the canonical path forward from wherever
- *    the match ACTUALLY is, applying every intermediate step in order, and is
- *    a no-op if the match is already at or past the requested state. It never
- *    moves a match backwards and never resurrects a FINISHED match.
- *
- *  FIX 4 — tickMinute(): the displayed clock now advances on its own.
- *  ────────────────────────────────────────────────────────────────────
- *    Before this fix, {@code minutePlayed} was only ever written in three
- *    places: once to 0 on entering LIVE, forced to 45/90 on HALF_TIME /
- *    SECOND_HALF / FINISHED, and as a side-effect of updateScore() — which
- *    only runs when a goal happens. During any scoreless stretch of a live
- *    match nothing touched the field at all, so the match was genuinely
- *    LIVE in the database while the timer on screen sat frozen.
- *
- *    tickMinute() is a small, separate write path: it updates ONLY
- *    minutePlayed, does not touch score, and does not regenerate odds (odds
- *    already refresh on score changes and status transitions; the clock
- *    itself doesn't need to move the price). It is intentionally monotonic —
- *    it never moves the clock backwards — so it is safe to call from a
- *    once-a-minute scheduled tick AND from the reconciliation watchdog
- *    without the two ever fighting each other or undoing a more recent
- *    goal-driven update.
+ *  FIX 4 — tickMinute(): clock advances on its own between goals.
+ *  FIX 5 — forceFinish(): guaranteed terminal state from any starting status.
+ *  FIX 6 — tickMinute() now evicts caches so updated minute is visible.
+ *  FIX 7 — deleteMatch(): hard-delete with cache eviction, used by both
+ *           the stale-match cleanup sweep and the post-settlement sweep.
+ *  FIX 8 — createdAt exposed via getCreatedAt() so the scheduler can apply
+ *           the 3-day stale threshold correctly.
+ *  FIX 9 — deleteSettledFinishedMatches() uses match.settledAt (set by the
+ *           SettlementEngine, already on the Match entity) as the finish-time
+ *           reference, falling back to kickoffAt + 105 min. No entity changes
+ *           required.
  */
 @Slf4j
 @Service
@@ -133,7 +90,7 @@ public class AdminMatchService {
 
     /**
      * The lifecycle in order. Index position defines "how far along" a match
-     * is, which is what lets advanceStatusTo() catch up or safely no-op.
+     * is, which lets advanceStatusTo() catch up or safely no-op.
      */
     private static final List<String> CANONICAL_ORDER = List.of(
             "SCHEDULED", "LIVE", "HALF_TIME", "SECOND_HALF", "FINISHED"
@@ -162,7 +119,7 @@ public class AdminMatchService {
 
     // ── Dependencies ──────────────────────────────────────────────────────
     private final MatchRepository        matchRepo;
-    private final OddsPersistenceService oddsPersistenceService;   // ← single odds entry point
+    private final OddsPersistenceService oddsPersistenceService;
 
     // ══════════════════════════════════════════════════════════════════════
     // CREATE
@@ -171,13 +128,6 @@ public class AdminMatchService {
     /**
      * Creates a match owned by {@code admin} and immediately persists all
      * betting markets so the match is open for bets the moment it is saved.
-     *
-     * Markets saved on creation (every status):
-     *   1X2 · half_time · asian_handicap · correct_score
-     *
-     * If the initial status is LIVE / HALF_TIME / SECOND_HALF the live
-     * odds engine runs immediately after to replace 1X2 + handicap rows
-     * with score-aware in-play prices.
      */
     @Transactional
     @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
@@ -185,9 +135,7 @@ public class AdminMatchService {
         return createMatchInternal(req, admin.getId());
     }
 
-    /**
-     * UUID-based overload for background jobs — see FIX 2 in the class javadoc.
-     */
+    /** UUID-based overload for background jobs — see FIX 2. */
     @Transactional
     @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
     public Match createMatch(AdminMatchRequest req, UUID adminId) {
@@ -211,6 +159,7 @@ public class AdminMatchService {
                 .status(status)
                 .scoreHome(0)
                 .scoreAway(0)
+                .minutePlayed(0)
                 .featured(req.isFeatured())
                 .build();
 
@@ -218,12 +167,8 @@ public class AdminMatchService {
         log.info("AdminMatchService.createMatch: adminId={} matchId={} home='{}' away='{}' status={}",
                 adminId, saved.getId(), saved.getHomeTeam(), saved.getAwayTeam(), saved.getStatus());
 
-        // ── Step 1: persist ALL markets (1X2, HT, handicap, correct score) ──
-        // This is the same call LiveScorePoller makes for external fixtures.
         persistAllOdds(saved, "createMatch");
 
-        // ── Step 2: if match starts in a live state, also run live odds ─────
-        // Replaces the 1X2 + asian_handicap rows with score/time-aware prices.
         if (LIVE_STATUSES.contains(status)) {
             persistLiveOdds(saved, "createMatch[live-init]");
         }
@@ -235,30 +180,23 @@ public class AdminMatchService {
     // READ
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Returns all matches created by this admin, newest kickoff first.
-     * Matches from other admins or external feeds are never included.
-     */
+    /** Returns all matches created by this admin, newest kickoff first. */
     public List<Match> getMyMatches(User admin) {
         List<Match> matches = matchRepo.findByCreatedByAdminIdOrderByKickoffAtDesc(admin.getId());
-        log.debug("AdminMatchService.getMyMatches: adminId={} → {} match(es)", admin.getId(), matches.size());
+        log.debug("AdminMatchService.getMyMatches: adminId={} → {} match(es)",
+                admin.getId(), matches.size());
         return matches;
     }
 
     /**
      * Returns a single match, enforcing ownership.
-     *
      * @throws ApiException 404 if not found or owned by a different admin
      */
     public Match getMyMatch(String id, User admin) {
         return getMyMatch(parseUuid(id), admin.getId());
     }
 
-    /**
-     * UUID-based overload for background jobs.
-     *
-     * @throws ApiException 404 if not found or owned by a different admin
-     */
+    /** UUID-based overload for background jobs. */
     public Match getMyMatch(UUID id, UUID adminId) {
         Match match = findOrThrow(id);
         assertOwnership(match, adminId);
@@ -267,8 +205,8 @@ public class AdminMatchService {
 
     /**
      * Ownership-checked lookup that returns null instead of throwing.
-     * Used by the schedule watchdog, which sweeps many matches and must not
-     * abort the whole sweep because one row vanished.
+     * Used by the schedule watchdog — must not abort the whole sweep if one
+     * row has vanished.
      */
     public Match findMyMatchOrNull(UUID id, UUID adminId) {
         return matchRepo.findById(id)
@@ -281,15 +219,7 @@ public class AdminMatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Transitions the match through the state machine and regenerates odds
-     * appropriate to the new status. Rejects any transition that is not legal
-     * from the current state.
-     *
-     * Odds behaviour per transition:
-     *   SCHEDULED → LIVE        : generateAndSaveLiveOdds (score-aware 1X2 + handicap)
-     *   LIVE      → HALF_TIME   : generateAndSaveLiveOdds (refreshed at HT scoreline)
-     *   HALF_TIME → SECOND_HALF : generateAndSaveLiveOdds (second-half prices)
-     *   any       → FINISHED    : no odds generated; existing rows kept for settlement
+     * Transitions the match and regenerates odds. Rejects illegal transitions.
      *
      * @throws ApiException 400 if the transition is illegal or match is FINISHED
      * @throws ApiException 404 if match not found or owned by a different admin
@@ -300,9 +230,7 @@ public class AdminMatchService {
         return updateStatus(matchId, req.getStatus(), admin.getId());
     }
 
-    /**
-     * UUID-based overload. Same strict validation.
-     */
+    /** UUID-based overload. Same strict validation. */
     @Transactional
     @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
     public Match updateStatus(UUID matchId, String rawTarget, UUID adminId) {
@@ -337,17 +265,9 @@ public class AdminMatchService {
      * Drives the match FORWARD to {@code rawTarget}, applying every
      * intermediate step in order. Idempotent and self-healing:
      *
-     *   • already at or past the target → no-op, returns the match unchanged
-     *   • one or more steps behind      → walks each step in sequence, so the
-     *                                     HALF_TIME metadata snapshot and the
-     *                                     live-odds refresh still happen for
-     *                                     every state passed through
-     *   • never moves a match backwards, never resurrects a FINISHED match
-     *
-     * This is what makes a missed step survivable. Strict updateStatus() would
-     * throw on a skipped step and, because scheduled work is fire-and-forget,
-     * that exception would only ever land in a log line — leaving the match
-     * frozen partway through its lifecycle with no visible error anywhere.
+     *   • already at or past the target → no-op
+     *   • one or more steps behind      → walks each step in sequence
+     *   • never moves backwards, never resurrects a FINISHED match
      *
      * @throws ApiException 404 if match not found or owned by a different admin
      */
@@ -382,22 +302,16 @@ public class AdminMatchService {
     }
 
     /**
-     * Applies exactly ONE forward step. Assumes the caller has already
-     * validated ownership and legality.
-     *
-     * Kept private and called in-transaction so the HT snapshot and the odds
-     * refresh happen for every state a match passes through, including during
-     * a multi-step catch-up.
+     * Applies exactly ONE forward step. Assumes caller has already validated
+     * ownership and legality. Kept private and called in-transaction so the
+     * HT snapshot and odds refresh happen for every state passed through,
+     * including during a multi-step catch-up.
      */
     private Match applyStatusStep(Match match, String target) {
         String current = match.getStatus();
 
-        // ── Snapshot half-time score into metadata on → HALF_TIME ─────────
-        // SettlementEngine.evaluateHalfTime() reads metadata keys
-        // "score_home_ht" and "score_away_ht" to settle HALF_TIME bets.
-        // Without this snapshot those bets always VOID on admin matches.
-        // We capture the score BEFORE setStatus so we record the exact
-        // scoreline at the moment the break begins.
+        // Snapshot HT score into metadata so SettlementEngine can settle
+        // HALF_TIME bets correctly (reads "score_home_ht" / "score_away_ht").
         if ("HALF_TIME".equals(target)) {
             int htHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
             int htAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
@@ -410,10 +324,10 @@ public class AdminMatchService {
                     match.getId(), htHome, htAway);
         }
 
-        // Keep the displayed clock consistent with the state machine, so the
-        // UI never shows a FINISHED match sitting on minute 12.
+        // Keep the displayed clock consistent with the state machine.
         switch (target) {
-            case "LIVE"        -> { if (match.getMinutePlayed() == null) match.setMinutePlayed(0); }
+            case "LIVE"        -> { if (match.getMinutePlayed() == null || match.getMinutePlayed() == 0)
+                                        match.setMinutePlayed(0); }
             case "HALF_TIME"   -> match.setMinutePlayed(FIRST_HALF_MINUTES);
             case "SECOND_HALF" -> match.setMinutePlayed(FIRST_HALF_MINUTES);
             case "FINISHED"    -> match.setMinutePlayed(FULL_TIME_MINUTES);
@@ -423,11 +337,8 @@ public class AdminMatchService {
         match.setStatus(target);
         Match saved = matchRepo.save(match);
 
-        // ── Odds regeneration based on target status ──────────────────────
-        //   → LIVE / HALF_TIME / SECOND_HALF : refresh 1X2 + asian_handicap
-        //   → FINISHED : no odds generated; existing rows stay for settlement.
         if (LIVE_STATUSES.contains(target)) {
-            persistLiveOdds(saved, "statusStep[" + current + "\u2192" + target + "]");
+            persistLiveOdds(saved, "statusStep[" + current + "→" + target + "]");
         }
 
         return saved;
@@ -438,8 +349,7 @@ public class AdminMatchService {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Updates the live score and immediately regenerates live odds so the
-     * DB reflects the new scoreline for any bets placed after this call.
+     * Updates the live score and immediately regenerates live odds.
      *
      * @throws ApiException 400 if match is FINISHED or not in a live status
      * @throws ApiException 404 if match not found or owned by a different admin
@@ -452,17 +362,8 @@ public class AdminMatchService {
     }
 
     /**
-     * UUID-based overload.
-     *
-     * Markets refreshed: 1X2 (match_result) + asian_handicap.
-     * Markets unchanged: half_time + correct_score (set at creation).
-     *
-     * Blocked when status is FINISHED or SCHEDULED.
-     * No match events (goalscorers, cards, substitutions) are accepted here.
-     *
-     * NOTE the @CacheEvict on this method — see FIX 1 in the class javadoc.
-     * Without it the goals land in the database but never reach any cached
-     * read endpoint, which is indistinguishable from the match being stuck.
+     * UUID-based overload. See FIX 1 — @CacheEvict is required here so goals
+     * are immediately visible on every cached read endpoint.
      *
      * @throws ApiException 400 if match is FINISHED or not in a live status
      * @throws ApiException 404 if match not found or owned by a different admin
@@ -496,40 +397,35 @@ public class AdminMatchService {
 
         match.setScoreHome(scoreHome);
         match.setScoreAway(scoreAway);
-        if (minutePlayed != null) match.setMinutePlayed(minutePlayed);
+
+        // Monotonic guard — only advance the clock, never move it backwards.
+        if (minutePlayed != null) {
+            Integer current = match.getMinutePlayed();
+            if (current == null || minutePlayed > current) {
+                match.setMinutePlayed(minutePlayed);
+            }
+        }
 
         Match saved = matchRepo.save(match);
-
-        // Regenerate live odds immediately after every score change so the
-        // odds table is always consistent with the current scoreline.
-        // This mirrors exactly what LiveScorePoller does for external-feed matches.
         persistLiveOdds(saved, "updateScore[" + scoreHome + ":" + scoreAway + "]");
-
         return saved;
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // CLOCK TICK — keeps minutePlayed moving with no goal required
+    // CLOCK TICK — keeps minutePlayed moving with no goal required  (FIX 4)
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Advances ONLY the displayed clock ({@code minutePlayed}). No score
-     * change, no odds regeneration — this exists purely so the timer keeps
-     * moving during a scoreless stretch of live play. See FIX 4 in the class
-     * javadoc for why this was missing.
+     * Advances ONLY the displayed clock ({@code minutePlayed}).
      *
      * Deliberately monotonic and tolerant:
-     *   • silently no-ops if the match isn't in a LIVE_STATUSES state right
-     *     now (e.g. it already reached HALF_TIME/FINISHED, or hasn't kicked
-     *     off yet) — a late-firing tick must never drag the clock backwards
-     *     or fight a status transition
-     *   • silently no-ops if {@code minute} is not strictly ahead of the
-     *     current value — so an out-of-order tick, or one that raced a
-     *     goal-driven updateScore() call, can never undo a more recent value
+     *   • no-ops if match isn't in LIVE / SECOND_HALF (including HALF_TIME,
+     *     where the clock stays frozen at 45 until SECOND_HALF fires)
+     *   • no-ops if {@code minute} is not strictly ahead of current value
+     *   • evicts caches (FIX 6) so updated minute is visible immediately
      *
-     * Called once a minute by AdminMatchScheduleService for the duration of
-     * each half, and again by the reconciliation watchdog so a dropped tick
-     * self-corrects within 60s exactly like a dropped status transition does.
+     * Called every 60s by AdminMatchScheduleService and by the watchdog as
+     * a fallback in case the tick job was lost on restart.
      *
      * @throws ApiException 404 if match not found or owned by a different admin
      */
@@ -540,15 +436,17 @@ public class AdminMatchService {
         assertOwnership(match, adminId);
 
         String status = match.getStatus();
-        if (!LIVE_STATUSES.contains(status)) {
-            log.debug("AdminMatchService.tickMinute: matchId={} status={} not live — ignoring stale tick(min={})",
+
+        // Freeze during HALF_TIME break and skip non-live states entirely.
+        if ("HALF_TIME".equals(status) || !LIVE_STATUSES.contains(status)) {
+            log.debug("AdminMatchService.tickMinute: matchId={} status={} — ignoring stale tick(min={})",
                     matchId, status, minute);
             return;
         }
 
         Integer current = match.getMinutePlayed();
         if (current != null && current >= minute) {
-            log.debug("AdminMatchService.tickMinute: matchId={} current minute {} already >= {} — ignoring",
+            log.debug("AdminMatchService.tickMinute: matchId={} current={} already >= {} — ignoring",
                     matchId, current, minute);
             return;
         }
@@ -559,29 +457,115 @@ public class AdminMatchService {
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // FORCE FINISH — guaranteed terminal state  (FIX 5)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Drives the match to FINISHED regardless of its current state, applying
+     * the supplied final score first. Called by the scheduler's finish job
+     * and by the overdue-match and stale-match watchdogs.
+     *
+     * Behaviour:
+     *   • already FINISHED  → logs a warning and returns the match unchanged
+     *   • otherwise         → forces SECOND_HALF, sets final score + minute
+     *                         to 90, then drives to FINISHED
+     *
+     * @param matchId   the match to finish
+     * @param finalHome final home score
+     * @param finalAway final away score
+     * @param adminId   owning admin (for ownership assertion)
+     */
+    @Transactional
+    public Match forceFinish(UUID matchId, int finalHome, int finalAway, UUID adminId) {
+        Match match = findOrThrow(matchId);
+        assertOwnership(match, adminId);
+
+        if ("FINISHED".equals(match.getStatus())) {
+            log.warn("AdminMatchService.forceFinish: matchId={} already FINISHED — skipping", matchId);
+            return match;
+        }
+
+        log.info("AdminMatchService.forceFinish: matchId={} forcing finish finalScore={}:{} from status={}",
+                matchId, finalHome, finalAway, match.getStatus());
+
+        // Step 1: walk to SECOND_HALF so we're in a legal state to write the score.
+        advanceStatusTo(matchId, "SECOND_HALF", adminId);
+
+        // Step 2: force the exact final score.
+        try {
+            Match refreshed = findOrThrow(matchId);
+            refreshed.setScoreHome(finalHome);
+            refreshed.setScoreAway(finalAway);
+            refreshed.setMinutePlayed(FULL_TIME_MINUTES);
+            matchRepo.save(refreshed);
+            log.info("AdminMatchService.forceFinish: matchId={} score forced to {}:{}",
+                    matchId, finalHome, finalAway);
+        } catch (Exception e) {
+            log.error("AdminMatchService.forceFinish: matchId={} could not force score — {}",
+                    matchId, e.getMessage(), e);
+        }
+
+        // Step 3: drive to FINISHED. advanceStatusTo() handles cache eviction.
+        return advanceStatusTo(matchId, "FINISHED", adminId);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // DELETE — hard-delete for stale matches  (FIX 7)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Hard-deletes a match row. Called by two automated sweeps:
+     *
+     *   1. Stale-match cleanup — SCHEDULED matches whose kickoffAt AND
+     *      createdAt are both 3+ days in the past (never started, no bets).
+     *
+     *   2. Post-settlement cleanup — FINISHED matches where 1 hour has
+     *      elapsed since finishing AND all bets are settled/graded.
+     *
+     * Ownership is enforced — an admin can only delete their own matches.
+     * Evicts all match caches so deleted matches stop appearing on read
+     * endpoints immediately.
+     *
+     * No status guard is applied here — the caller (the sweep) is responsible
+     * for verifying that deletion is safe before calling this method.
+     *
+     * @throws ApiException 404 if not found or owned by a different admin
+     */
+    @Transactional
+    @CacheEvict(value = {"matches", "featuredMatches", "todayMatches", "futureMatches"}, allEntries = true)
+    public void deleteMatch(UUID matchId, UUID adminId) {
+        Match match = findOrThrow(matchId);
+        assertOwnership(match, adminId);
+
+        log.info("AdminMatchService.deleteMatch: adminId={} matchId={} status={} settledAt={} — deleting",
+                adminId, matchId, match.getStatus(), match.getSettledAt());
+
+        matchRepo.delete(match);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     // ODDS PERSISTENCE HELPERS
     // ══════════════════════════════════════════════════════════════════════
 
     /**
      * Persists ALL markets: 1X2, half_time, asian_handicap, correct_score.
-     * Called once at match creation.
-     * Any failure is logged but does NOT roll back the match row — odds can
-     * be regenerated via the MatchService on-demand endpoints if needed.
+     * Called once at match creation. Failure is logged but does NOT roll
+     * back the match row.
      */
     private void persistAllOdds(Match match, String caller) {
         try {
             oddsPersistenceService.generateAndSaveAllOdds(match);
             log.info("persistAllOdds [{}]: matchId={} — all markets saved", caller, match.getId());
         } catch (Exception e) {
-            log.error("persistAllOdds [{}]: matchId={} FAILED — {} | bets may not be placeable until odds are regenerated",
+            log.error("persistAllOdds [{}]: matchId={} FAILED — {} | " +
+                            "bets may not be placeable until odds are regenerated",
                     caller, match.getId(), e.getMessage(), e);
         }
     }
 
     /**
      * Persists live markets: 1X2 (match_result) + asian_handicap.
-     * Replaces existing rows for those two markets with score/time-aware prices.
-     * HT and correct_score rows are left intact (they were saved at creation).
+     * HT and correct_score rows are left intact.
      */
     private void persistLiveOdds(Match match, String caller) {
         try {
@@ -599,10 +583,6 @@ public class AdminMatchService {
     // PRIVATE HELPERS
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Ownership check — enforced at the top of every read and write method.
-     * Returns 404 so match existence is never leaked across admin accounts.
-     */
     private void assertOwnership(Match match, UUID adminId) {
         if (adminId == null || !adminId.equals(match.getCreatedByAdminId())) {
             log.warn("AdminMatchService.assertOwnership: DENIED — adminId={} tried matchId={} owned by adminId={}",
