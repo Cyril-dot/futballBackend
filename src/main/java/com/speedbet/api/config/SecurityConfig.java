@@ -421,7 +421,8 @@ public class SecurityConfig {
                 "https://eliteprime-ui-phi.vercel.app",
                 "https://www.elitteprime.xyz",
                 "https://skybetsuper-admin.vercel.app",
-                "https://eliteprime-superadmin.vercel.app"
+                "https://eliteprime-superadmin.vercel.app",
+                "https://www.omegahbet.com"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
