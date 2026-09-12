@@ -11,152 +11,92 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
 /**
- * FlutterwaveGhV4DepositController — GHS MoMo deposits via Flutterwave's
- * v4 Orchestrator API (push-notification flow), built on the shared
- * plumbing in {@link AbstractFlutterwaveV4DepositController}.
+ * Ghana Cedi (GHS) Mobile Money deposits via Flutterwave v4 Orchestrator.
  *
- * This is the v4 counterpart to {@link FlutterwaveGhDepositController}
- * (v3, redirect-based). Flutterwave has no backend-relayed-OTP option for
- * Ghana MoMo in either API version; v4's push-notification flow just
- * removes the browser redirect — the customer still authorizes on their own
- * phone with their PIN.
+ * Supports MTN, AirtelTigo, and Vodafone/Telecel MoMo — push-notification
+ * flow. Customer approves on their phone; no redirect needed.
  *
- * ══════════════════════════════════════════════════════════════════════════
- *  IMPORTANT — read {@link AbstractFlutterwaveV4DepositController}'s class
- *  javadoc before deploying. v4 is public beta, the production base URL
- *  needs confirming, and the webhook signature header + payload shape are
- *  the two things that have actually bitten in production.
- * ══════════════════════════════════════════════════════════════════════════
+ * Endpoints:
+ *   POST /api/wallet/deposit/flutterwave/gh/v4/init
+ *     body:    { amount, phoneNumber?, network }
+ *     returns: { txRef, message }
  *
- * ══════════════════════════════════════════════════════════════════════════
- *  FIX (this revision) — webhook signature header, and a /verify 500 leak.
+ *   POST /api/wallet/deposit/flutterwave/gh/v4/verify
+ *     body:    { txRef }
+ *     returns: { credited, status, message }
  *
- *  Production logs showed EVERY inbound webhook rejected with "missing
- *  verif-hash header" — v4 does not send v3's header. The webhook therefore
- *  credited nothing, ever, which is the root cause of "user deposits but
- *  it doesn't enter their account". The webhook endpoint below now forwards
- *  the whole header map to the shared handler, which matches
- *  case-insensitively across candidate names and can log unknown ones. See
- *  the abstract class's FIX note for the two temporary config flags used to
- *  identify the real header.
+ *   POST /api/webhooks/flutterwave/v4/gh
+ *     Flutterwave charge.completed event for GHS charges.
  *
- *  Separately, /verify used to propagate Flutterwave's 10500
- *  INTERNAL_SERVER_ERROR straight out to the client on every poll. That's
- *  now reported as "still confirming" — see verifyAndCredit().
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  CRITICAL FIX — same root cause as the NG controller
+ * ═══════════════════════════════════════════════════════════════════════════
  *
- *  Operational note from the same logs: the GHS 1 test deposits are the ones
- *  whose GET /charges/{id} 500s persistently, while GHS 200 charges resolve
- *  fine. That points at a Flutterwave-side minimum rather than a bug here —
- *  consider raising app.platform.min-deposit-amount-ghs above 1.
- * ══════════════════════════════════════════════════════════════════════════
+ *  The abstract base class used a Svix HMAC-SHA256 scheme
+ *  (over "{svix-id}.{svix-timestamp}.{body}") that Flutterwave does not use.
+ *  Every GHS webhook was being rejected with 401, so NO GHS deposits were
+ *  ever credited automatically.
  *
- * ══════════════════════════════════════════════════════════════════════════
- *  FIX (earlier revision) — durable pending charges + background reconciler.
+ *  Correct algorithm from developer.flutterwave.com/docs/webhooks:
+ *    Header:    flutterwave-signature
+ *    Algorithm: HMAC-SHA256(key=secretHash, data=rawBody) → base64
+ *    Compare:   computedBase64 == flutterwave-signature header value
+ *    Secret:    plain-text value from Flutterwave dashboard → Settings →
+ *               Webhooks → "Secret hash" field. Same value as
+ *               app.flutterwave.webhook-hash in application.properties.
  *
- *  Pending charges were an in-memory ConcurrentHashMap, so a restart between
- *  init and webhook destroyed the only handle we had on the charge. They're
- *  now {@link FlutterwaveV4PendingCharge} rows, and
- *  {@link FlutterwaveV4DepositReconciler} polls every still-PENDING charge
- *  against Flutterwave's live API until it settles. Given the webhook was
- *  100% broken, the reconciler is currently doing the real work.
- * ══════════════════════════════════════════════════════════════════════════
+ *  This controller implements the correct algorithm directly in its own
+ *  webhook() method instead of delegating to the abstract base's
+ *  processV4Webhook(), so it is not dependent on the base being fixed.
  *
- * ══════════════════════════════════════════════════════════════════════════
- *  FIX (earlier revision) — reference length. Flutterwave v4 rejects any
- *  `reference` outside 6–42 characters:
- *
- *    {"status":"failed","error":{"type":"REQUEST_NOT_VALID","code":"10400",
- *     "message":"Request is not valid","validation_errors":[{"field_name":
- *     "reference","message":"size must be between 6 and 42"}]}}
- *
- *  The old format ("SPB-GH-V4-" + user UUID + "-" + random UUID, ~85 chars)
- *  failed every charge. Now "GHV4-" + 32 hex = 37 chars, and the userId is
- *  resolved from the persisted pending-charge row rather than parsed out of
- *  the reference string.
- * ══════════════════════════════════════════════════════════════════════════
- *
- * ══════════════════════════════════════════════════════════════════════════
- *  FIX (earlier revision) — Ghana network values, confirmed against
- *  Flutterwave's live GET /mobile-networks?country=GH:
- *
- *    {"status":"success","data":[
- *      {"id":"79","network":"AIRTELTIGO","name":"AIRTEL-TIGO"},
- *      {"id":"82","network":"MTN","name":"MTN Mobile"},
- *      {"id":"80","network":"VODAFONE","name":"Vodafone"}
- *    ]}
- *
- *  This superseded an earlier guess that Flutterwave had renamed Vodafone
- *  Ghana to "TELECEL" following the real-world rebrand. It hasn't —
- *  "TELECEL" is not a recognized value and would have failed every
- *  Vodafone deposit. resolveNetwork() still accepts the legacy
- *  "TIGO"/"AIRTEL" and the incorrect "TELECEL" from un-updated clients and
- *  maps them onto the correct names.
- * ══════════════════════════════════════════════════════════════════════════
- *
- * ─── Flow ─────────────────────────────────────────────────────────────────
- *
- *  1. POST /api/wallet/deposit/flutterwave/gh/v4/init
- *     • Accepts { amount, phoneNumber?, network }.
- *     • Calls orchestratorCharge() with payment_method.type = "mobile_money".
- *     • PERSISTS reference -> charge id + userId via cachePendingCharge().
- *       Without this row the charge is unrecoverable — v4 has no
- *       lookup-by-our-reference.
- *     • Returns { txRef, message }. No OTP screen.
- *
- *  2. POST /api/wallet/deposit/flutterwave/gh/v4/verify
- *     • Shared verifyAndCredit() — safe to poll, credits once Flutterwave's
- *       own API confirms success.
- *
- *  3. POST /api/webhooks/flutterwave/gh/v4
- *     • Shared processV4Webhook(), which re-verifies via Flutterwave's API
- *       before crediting and never trusts the payload.
- *     • Also reachable via {@link FlutterwaveWebhookRouterController}, the
- *       URL actually registered in the dashboard (one per account).
- *
- *  4. Background reconciler (no endpoint) — the safety net.
- *
- *  All three credit paths funnel into the idempotent handleVerifiedDeposit();
- *  whichever lands first wins.
- *
- * ─── application.properties keys needed ──────────────────────────────────
- *   See AbstractFlutterwaveV4DepositController for the shared v4 keys and
- *   the reconcile/webhook-diagnostic keys. This controller additionally
- *   needs:
- *     app.platform.min-deposit-amount-ghs (default: 1 — see FIX note, likely
- *                                          too low for Flutterwave)
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  application.properties keys used by this class
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  app.flutterwave.webhook-hash            — plain-text secret from dashboard
+ *  app.platform.min-deposit-amount-ghs     — default 1 (already in your file)
+ *  app.flutterwave.v4.base-url             — on abstract base
+ *  app.flutterwave.v4.client-id            — on abstract base
+ *  app.flutterwave.v4.client-secret        — on abstract base
  */
 @Slf4j
 @RestController
 @RequiredArgsConstructor
 public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4DepositController {
 
-    private static final String EXPECTED_CURRENCY = "GHS";
-    private static final String GH_DIAL_CODE      = "233";
+    // ── Constants ─────────────────────────────────────────────────────────────
 
-    /**
-     * Networks accepted from the frontend, including legacy/superseded
-     * values kept for backward compatibility (see resolveNetwork()). The
-     * value actually sent to Flutterwave is always the resolved,
-     * API-confirmed name.
-     */
-    private static final Set<String> VALID_NETWORKS =
-            Set.of("MTN", "AIRTELTIGO", "VODAFONE", "TIGO", "AIRTEL", "TELECEL");
+    static final String EXPECTED_CURRENCY = "GHS";
+    static final String PROVIDER_TAG      = "flutterwave_gh_v4";
+    static final String TXREF_PREFIX      = "GHV4-";  // 5 + 32 hex = 37 chars (v4 limit: 6–42)
 
-    private static final String TXREF_PREFIX = "GHV4-";
-    private static final String PROVIDER_TAG = "flutterwave_gh_v4";
+    /** Accepted network names — includes common aliases customers might send. */
+    private static final Set<String> VALID_NETWORKS = Set.of(
+            "MTN", "AIRTELTIGO", "VODAFONE", "TELECEL",
+            // Legacy aliases that map to the same networks
+            "TIGO", "AIRTEL");
+
+    // ── Dependencies ──────────────────────────────────────────────────────────
 
     private final WalletService                   walletService;
     private final ReferralService                 referralService;
@@ -164,217 +104,507 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
     private final ObjectMapper                    objectMapper;
     private final FlutterwaveV4PendingChargeStore pendingChargeStore;
 
+    // ── Config ────────────────────────────────────────────────────────────────
+
+    /**
+     * Minimum GHS deposit. In application.properties:
+     *   app.platform.min-deposit-amount-ghs=1
+     */
     @Value("${app.platform.min-deposit-amount-ghs:1}")
     private BigDecimal minDeposit;
 
-    @Override protected WalletService     walletService()     { return walletService; }
-    @Override protected ReferralService   referralService()   { return referralService; }
-    @Override protected WebClient.Builder webClientBuilder()  { return webClientBuilder; }
-    @Override protected ObjectMapper      objectMapper()      { return objectMapper; }
+    /**
+     * Plain-text webhook secret hash — same value as NG controller.
+     * In application.properties: app.flutterwave.webhook-hash=${FLUTTERWAVE_WEBHOOK_HASH:}
+     */
+    @Value("${app.flutterwave.webhook-hash}")
+    private String webhookSecretHash;
 
-    /** Durable pending-charge store — replaced the in-memory map. */
+    // ── Abstract base wiring ──────────────────────────────────────────────────
+
+    @Override protected WalletService                   walletService()      { return walletService; }
+    @Override protected ReferralService                 referralService()    { return referralService; }
+    @Override protected WebClient.Builder               webClientBuilder()   { return webClientBuilder; }
+    @Override protected ObjectMapper                    objectMapper()       { return objectMapper; }
     @Override protected FlutterwaveV4PendingChargeStore pendingChargeStore() { return pendingChargeStore; }
 
-    /**
-     * Exposed to the base class because the reconciler runs without a request
-     * context. providerTag() MUST match what's passed to verifyAndCredit()
-     * and processV4Webhook() below, or the reconciler looks for rows under a
-     * tag nothing writes and silently polls nothing.
-     */
     @Override public String expectedCurrency() { return EXPECTED_CURRENCY; }
     @Override public String providerTag()      { return PROVIDER_TAG; }
 
-    // ─── Deposit Init ─────────────────────────────────────────────────────────
+    // =========================================================================
+    // INIT — initiate a Mobile Money charge
+    // =========================================================================
 
+    /**
+     * Initiates a GHS Mobile Money charge via the v4 Orchestrator.
+     *
+     * Request body: { "amount": 100, "phoneNumber": "0241234567", "network": "MTN" }
+     *   phoneNumber — optional if user.getPhone() is set on the User entity
+     *   network     — MTN | AIRTELTIGO | VODAFONE (and legacy aliases TIGO/AIRTEL/TELECEL)
+     *
+     * Response: { "txRef": "GHV4-...", "message": "Approve on your phone..." }
+     *
+     * Flow: customer receives a push notification on their phone and enters
+     * their MoMo PIN. No redirect step needed. The webhook (or reconciler)
+     * credits the wallet when the customer approves.
+     */
     @PostMapping("/api/wallet/deposit/flutterwave/gh/v4/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDeposit(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
-        var amount = new BigDecimal(req.get("amount").toString());
-        if (amount.compareTo(minDeposit) < 0) {
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
-        }
+        BigDecimal amount = parseAmount(req);
+        validateMin(amount);
 
-        var phoneNumber = req.get("phoneNumber") != null
-                ? req.get("phoneNumber").toString()
-                : user.getPhone();
+        // Phone — fallback to user profile if not in body
+        String phoneNumber = req.get("phoneNumber") != null
+                ? req.get("phoneNumber").toString().trim()
+                : (user.getPhone() != null ? user.getPhone().trim() : null);
         if (phoneNumber == null || phoneNumber.isBlank()) {
-            throw ApiException.badRequest("phoneNumber is required");
+            throw ApiException.badRequest(
+                    "phoneNumber is required (or set a phone number on your profile).");
         }
 
-        var rawNetwork = req.get("network");
-        if (rawNetwork == null || !VALID_NETWORKS.contains(rawNetwork.toString().toUpperCase())) {
-            throw ApiException.badRequest("network must be one of MTN, AIRTELTIGO, VODAFONE");
+        // Network validation
+        Object networkRaw = req.get("network");
+        if (networkRaw == null || networkRaw.toString().isBlank()) {
+            throw ApiException.badRequest(
+                    "network is required: MTN, AIRTELTIGO, or VODAFONE.");
         }
-        var network = resolveNetwork(rawNetwork.toString());
+        String network = networkRaw.toString().trim().toUpperCase();
+        if (!VALID_NETWORKS.contains(network)) {
+            throw ApiException.badRequest(
+                    "Invalid network '" + network + "'. Use MTN, AIRTELTIGO, or VODAFONE.");
+        }
+        // Normalise legacy aliases to canonical v4 names
+        network = switch (network) {
+            case "TIGO", "AIRTEL" -> "AIRTELTIGO";
+            case "TELECEL"        -> "VODAFONE";
+            default               -> network;
+        };
 
-        // Flutterwave v4 requires `reference` to be 6–42 characters. Short,
-        // opaque, random — userId is NOT encoded here, it's persisted below.
-        var txRef = TXREF_PREFIX + UUID.randomUUID().toString().replace("-", "");
+        // "GHV4-" = 5 + 32 hex = 37 chars (within v4's 6–42 limit)
+        String txRef = TXREF_PREFIX + randomHex();
 
-        log.info("initDeposit(GH v4): userId='{}' amount={} network='{}' txRef='{}'",
+        log.info("initDeposit(GH v4): userId='{}' amount={} network='{}' ref='{}'",
                 user.getId(), amount, network, txRef);
 
-        var mobileMoney = new LinkedHashMap<String, Object>();
-        mobileMoney.put("country_code", GH_DIAL_CODE);
-        mobileMoney.put("network", network);
-        mobileMoney.put("phone_number", normalizeLocalPhone(phoneNumber));
+        Map<String, Object> body = buildMomoBody(amount, user, phoneNumber, network, txRef);
+        Map<String, Object> response = orchestratorCharge(body);
 
-        var paymentMethod = new LinkedHashMap<String, Object>();
-        paymentMethod.put("type", "mobile_money");
-        paymentMethod.put("mobile_money", mobileMoney);
+        Map<String, Object> data    = unwrapData(response, txRef, "mobile_money");
+        String chargeId             = data.get("id").toString();
+        String instruction          = extractInstruction(data);
 
-        var name = new LinkedHashMap<String, Object>();
-        name.put("first", firstName(user));
-        name.put("last", lastName(user));
+        // CRITICAL: persist before returning. v4 has no lookup-by-reference.
+        cachePendingCharge(txRef, chargeId, user.getId(), amount);
 
-        var phone = new LinkedHashMap<String, Object>();
-        phone.put("country_code", GH_DIAL_CODE);
-        phone.put("number", normalizeLocalPhone(phoneNumber));
+        log.info("initDeposit(GH v4): chargeId='{}' status='{}' userId='{}'",
+                chargeId, data.get("status"), user.getId());
 
-        var customer = new LinkedHashMap<String, Object>();
-        customer.put("email", user.getEmail());
-        customer.put("name", name);
-        customer.put("phone", phone);
-
-        var body = new LinkedHashMap<String, Object>();
-        body.put("amount", amount);
-        body.put("currency", EXPECTED_CURRENCY);
-        body.put("reference", txRef);
-        body.put("payment_method", paymentMethod);
-        body.put("customer", customer);
-
-        String message;
-        try {
-            var charge = orchestratorCharge(body);
-
-            @SuppressWarnings("unchecked")
-            var data = (Map<String, Object>) charge.getOrDefault("data", Map.of());
-            var chargeId = data.get("id") != null ? data.get("id").toString() : null;
-            if (chargeId == null || chargeId.isBlank()) {
-                throw new RuntimeException("Flutterwave did not return a charge id.");
-            }
-
-            // CRITICAL: the only handle we'll ever have on this charge. Carries
-            // the userId for the webhook, the chargeId for /verify, and puts the
-            // charge on the reconciler's queue. Written before the client responds.
-            cachePendingCharge(txRef, chargeId, user.getId(), amount);
-
-            @SuppressWarnings("unchecked")
-            var nextAction = (Map<String, Object>) charge.getOrDefault("next_action", Map.of());
-            var instructionMessage = nextAction.get("message");
-            message = instructionMessage != null
-                    ? instructionMessage.toString()
-                    : "Please check your phone and approve the payment request.";
-
-            log.info("initDeposit(GH v4): chargeId='{}' status='{}' txRef='{}'",
-                    chargeId, data.get("status"), txRef);
-
-        } catch (RuntimeException ex) {
-            log.error("initDeposit(GH v4): Flutterwave charge failed for userId='{}' txRef='{}' — {}",
-                    user.getId(), txRef, ex.getMessage(), ex);
-            throw ApiException.badRequest(ex.getMessage() != null
-                    ? ex.getMessage()
-                    : "Payment initiation failed. Please try again.");
-        }
-
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "txRef", txRef,
-                "message", message
-        )));
-    }
-
-    // ─── Payment Verification ──────────────────────────────────────────────────
-
-    @PostMapping("/api/wallet/deposit/flutterwave/gh/v4/verify")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> verifyPayment(
-            @AuthenticationPrincipal User user,
-            @RequestBody Map<String, Object> req) {
-
-        var txRef = req.get("txRef");
-        if (txRef == null || txRef.toString().isBlank())
-            throw ApiException.badRequest("txRef is required.");
-
-        var ref = txRef.toString().trim();
-        log.info("verifyPayment(GH v4): userId='{}' txRef='{}'", user.getId(), ref);
-
-        var result = verifyAndCredit(user.getId(), ref, EXPECTED_CURRENCY, PROVIDER_TAG);
+        Map<String, Object> result = new HashMap<>();
+        result.put("txRef",   txRef);
+        result.put("message", instruction != null
+                ? instruction
+                : "Please approve the payment prompt on your phone.");
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    // ─── Webhook ────────────────────────────────────────────────────────────────
+    // =========================================================================
+    // VERIFY — safe frontend polling endpoint
+    // =========================================================================
 
     /**
-     * Standalone GH v4 webhook endpoint. Kept for direct testing (curl), but
-     * Flutterwave should be pointed at FlutterwaveWebhookRouterController's
-     * /api/webhooks/flutterwave instead — only one webhook URL per account.
+     * Polls Flutterwave GET /charges/{chargeId} for the current status and
+     * credits the wallet if the charge has succeeded. Safe to call repeatedly —
+     * handleVerifiedDeposit() is idempotent on txRef.
      *
-     * Takes the FULL header map rather than a named @RequestHeader: v4 does
-     * not send v3's "verif-hash", and binding to that one name is what made
-     * every delivery fail authentication. The shared handler decides which
-     * header carries the signature — see the abstract class's FIX note.
+     * Request body: { "txRef": "GHV4-..." }
+     * Response:     { "credited": bool, "status": string, "message": string }
      */
-    @PostMapping("/api/webhooks/flutterwave/gh/v4")
+    @PostMapping("/api/wallet/deposit/flutterwave/gh/v4/verify")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> verify(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        Object txRefRaw = req.get("txRef");
+        if (txRefRaw == null || txRefRaw.toString().isBlank()) {
+            throw ApiException.badRequest("txRef is required");
+        }
+        String txRef = txRefRaw.toString().trim();
+
+        Map<String, Object> result = verifyAndCredit(
+                user.getId(), txRef, EXPECTED_CURRENCY, PROVIDER_TAG);
+        return ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    // =========================================================================
+    // WEBHOOK — correct Flutterwave v4 signature verification
+    //
+    // Does NOT delegate to the abstract base's processV4Webhook() because the
+    // base used the wrong Svix algorithm. This implements the correct algorithm
+    // directly — same as FlutterwaveNgBankV4DepositController.
+    //
+    // CORRECT ALGORITHM (developer.flutterwave.com/docs/webhooks):
+    //   hash = HMAC-SHA256(key=webhookSecretHash, data=rawBody) → base64
+    //   valid = (hash == flutterwave-signature header value)
+    // =========================================================================
+
+    @PostMapping("/api/webhooks/flutterwave/v4/gh")
     public ResponseEntity<String> webhook(
             @RequestHeader Map<String, String> headers,
             @RequestBody byte[] rawBody) {
-        return processV4Webhook(headers, rawBody, EXPECTED_CURRENCY, PROVIDER_TAG,
-                this::resolveUserIdFromStore);
-    }
 
-    // ─── Helpers ────────────────────────────────────────────────────────────────
+        // ── Step 1: Verify signature ──────────────────────────────────────────
 
-    /**
-     * Resolves the owning userId for a reference from the persisted
-     * pending-charge row. Returns null (webhook rejects with 400) only if no
-     * such row exists — which now means the reference was never ours or was
-     * pruned, not merely that we restarted.
-     */
-    private UUID resolveUserIdFromStore(String txRef) {
-        var pending = getPendingCharge(txRef);
-        if (pending == null) {
-            log.error("resolveUserIdFromStore(GH v4): no pending charge row for txRef='{}'", txRef);
-            return null;
+        String signature = null;
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if ("flutterwave-signature".equalsIgnoreCase(entry.getKey())) {
+                signature = entry.getValue();
+                break;
+            }
         }
-        return pending.userId();
+
+        if (signature == null || signature.isBlank()) {
+            log.warn("webhook(GH v4): missing flutterwave-signature header — headers: {}",
+                    headers.keySet());
+            return ResponseEntity.status(401).body("Missing signature");
+        }
+
+        if (!verifyFlutterwaveSignature(rawBody, signature)) {
+            log.warn("webhook(GH v4): signature mismatch — request rejected");
+            return ResponseEntity.status(401).body("Invalid signature");
+        }
+
+        // ── Step 2: Parse body ────────────────────────────────────────────────
+
+        Map<String, Object> event;
+        try {
+            //noinspection unchecked
+            event = (Map<String, Object>) objectMapper.readValue(
+                    new String(rawBody, StandardCharsets.UTF_8), Map.class);
+        } catch (Exception ex) {
+            log.error("webhook(GH v4): failed to parse body", ex);
+            return ResponseEntity.status(400).body("Invalid body");
+        }
+
+        // ── Step 3: Only handle charge.completed ──────────────────────────────
+
+        String eventType = String.valueOf(event.get("type"));
+        if (!"charge.completed".equals(eventType)) {
+            log.info("webhook(GH v4): ignoring event type='{}'", eventType);
+            return ResponseEntity.ok("Ignored — not charge.completed");
+        }
+
+        // ── Step 4: Extract and validate data ─────────────────────────────────
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = (Map<String, Object>) event.get("data");
+        if (data == null) {
+            log.warn("webhook(GH v4): missing data field — top-level keys: {}", event.keySet());
+            return ResponseEntity.status(400).body("Missing data");
+        }
+
+        String currency = String.valueOf(data.get("currency"));
+        if (!EXPECTED_CURRENCY.equalsIgnoreCase(currency)) {
+            log.info("webhook(GH v4): ignoring currency='{}' (expected {})", currency, EXPECTED_CURRENCY);
+            return ResponseEntity.ok("Ignored — different currency");
+        }
+
+        // ── Step 5: Look up the pending charge ────────────────────────────────
+
+        Object refObj      = data.get("reference");
+        Object chargeIdObj = data.get("id");
+        if (refObj == null || refObj.toString().isBlank()) {
+            log.error("webhook(GH v4): missing reference — data keys: {}", data.keySet());
+            return ResponseEntity.status(400).body("Missing reference");
+        }
+
+        String txRef    = refObj.toString();
+        String chargeId = chargeIdObj != null ? chargeIdObj.toString() : "unknown";
+
+        AbstractFlutterwaveV4DepositController.PendingV4Charge pending = getPendingCharge(txRef);
+        if (pending == null) {
+            log.warn("webhook(GH v4): no pending charge for ref='{}' — not ours or already settled", txRef);
+            // 200 so Flutterwave stops retrying something we can never satisfy
+            return ResponseEntity.ok("Unknown reference");
+        }
+
+        // Already credited (idempotency guard at the store level, but check early)
+        if (pending.isCredited()) {
+            log.info("webhook(GH v4): ref='{}' already credited — ignoring duplicate delivery", txRef);
+            return ResponseEntity.ok("Already credited");
+        }
+
+        // ── Step 6: Check status in payload ──────────────────────────────────
+
+        String status = String.valueOf(data.getOrDefault("status", "unknown"));
+
+        if (!isSuccess(status)) {
+            if (isTerminalFailure(status)) {
+                pendingChargeStore().markFailed(txRef, status);
+                log.info("webhook(GH v4): terminal failure status='{}' for ref='{}'", status, txRef);
+            } else {
+                log.info("webhook(GH v4): non-terminal status='{}' for ref='{}' — waiting", status, txRef);
+            }
+            return ResponseEntity.ok("Acknowledged — status: " + status);
+        }
+
+        // ── Step 7: Re-verify via GET /charges/{id} ───────────────────────────
+        //
+        // Per docs: always re-query before giving value.
+        // If lookup fails, fall back to the signed payload with amount cross-check.
+
+        BigDecimal creditAmount;
+        boolean reVerified = false;
+
+        try {
+            Map<String, Object> verified = getCharge(chargeId);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> vData    = (Map<String, Object>) verified.getOrDefault("data", Map.of());
+
+            String vStatus   = String.valueOf(vData.getOrDefault("status", "unknown"));
+            String vCurrency = String.valueOf(vData.get("currency"));
+
+            if (!isSuccess(vStatus)) {
+                log.warn("webhook(GH v4): re-verify status='{}' for ref='{}' — not crediting", vStatus, txRef);
+                if (isTerminalFailure(vStatus)) pendingChargeStore().markFailed(txRef, vStatus);
+                return ResponseEntity.ok("Not crediting — re-verification status: " + vStatus);
+            }
+
+            if (!EXPECTED_CURRENCY.equalsIgnoreCase(vCurrency)) {
+                log.error("webhook(GH v4): currency mismatch on re-verify: got='{}' ref='{}'", vCurrency, txRef);
+                return ResponseEntity.status(400).body("Currency mismatch on verification");
+            }
+
+            creditAmount = new BigDecimal(String.valueOf(vData.get("amount")));
+            reVerified   = true;
+            log.info("webhook(GH v4): re-verified chargeId='{}' amount={} ref='{}'",
+                    chargeId, creditAmount, txRef);
+
+        } catch (Exception ex) {
+            // GET /charges/{id} is known to return 500 for valid charges.
+            // The signed webhook payload is our fallback.
+            log.warn("webhook(GH v4): re-verify failed for chargeId='{}' — using signed payload. {}",
+                    chargeId, ex.getMessage());
+
+            Object rawAmount = data.get("amount");
+            if (rawAmount == null) {
+                log.error("webhook(GH v4): re-verify failed AND payload missing amount for ref='{}'", txRef);
+                return ResponseEntity.status(500).body("Verification unavailable, will retry");
+            }
+
+            creditAmount = new BigDecimal(String.valueOf(rawAmount));
+
+            if (pending.amount() != null && creditAmount.compareTo(pending.amount()) > 0) {
+                log.error("webhook(GH v4): payload amount={} > requested={} for ref='{}' — rejecting",
+                        creditAmount, pending.amount(), txRef);
+                return ResponseEntity.status(400).body("Amount exceeds requested");
+            }
+        }
+
+        // ── Step 8: Credit wallet ─────────────────────────────────────────────
+
+        try {
+            handleVerifiedDeposit(
+                    pending.userId(), txRef, creditAmount, EXPECTED_CURRENCY, PROVIDER_TAG);
+
+            String via = reVerified ? "webhook" : "webhook_payload_fallback";
+            pendingChargeStore().markCredited(txRef, via);
+
+            log.info("webhook(GH v4): credited userId='{}' amount={} GHS ref='{}' via='{}'",
+                    pending.userId(), creditAmount, txRef, via);
+
+            return ResponseEntity.ok("OK");
+
+        } catch (ApiException ex) {
+            log.error("webhook(GH v4): credit failed for ref='{}' — {}", txRef, ex.getMessage(), ex);
+            return ResponseEntity.status(400).body("Credit error: " + ex.getMessage());
+        } catch (Exception ex) {
+            log.error("webhook(GH v4): unexpected error crediting ref='{}' — will retry", txRef, ex);
+            return ResponseEntity.status(500).body("Processing error");
+        }
+    }
+
+    // =========================================================================
+    // SIGNATURE VERIFICATION
+    //
+    // Identical algorithm to FlutterwaveNgBankV4DepositController.
+    // Extracted into its own method here (not shared via base class) so each
+    // controller is self-contained and not affected by base class changes.
+    // =========================================================================
+
+    /**
+     * Verifies a Flutterwave webhook signature.
+     *
+     * Official v4 algorithm (developer.flutterwave.com/docs/webhooks):
+     *   computed = Base64(HMAC-SHA256(key=secretHash, data=rawBody))
+     *   valid    = (computed == flutterwave-signature header)
+     */
+    private boolean verifyFlutterwaveSignature(byte[] rawBody, String signatureHeader) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(
+                    webhookSecretHash.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] computed       = mac.doFinal(rawBody);
+            String computedBase64 = Base64.getEncoder().encodeToString(computed);
+
+            boolean match = MessageDigest.isEqual(
+                    computedBase64.getBytes(StandardCharsets.UTF_8),
+                    signatureHeader.getBytes(StandardCharsets.UTF_8));
+
+            if (!match) {
+                log.debug("webhook(GH v4) signature mismatch: computed='{}' received='{}'",
+                        computedBase64, signatureHeader);
+            }
+            return match;
+        } catch (Exception ex) {
+            log.error("webhook(GH v4): signature computation failed", ex);
+            return false;
+        }
+    }
+
+    // =========================================================================
+    // Private — request body builder
+    // =========================================================================
+
+    /**
+     * Orchestrator body for Ghana Mobile Money.
+     *
+     * Confirmed v4 shape:
+     *   payment_method.type                  = "mobile_money"
+     *   payment_method.mobile_money.network  = "MTN" | "AIRTELTIGO" | "VODAFONE"
+     *   payment_method.mobile_money.phone    = { country_code, number }
+     *
+     * No redirect_url needed for MoMo — it is a push-notification flow.
+     */
+    private static Map<String, Object> buildMomoBody(
+            BigDecimal amount, User user, String phoneNumber, String network, String txRef) {
+
+        Map<String, Object> phone = new LinkedHashMap<>();
+        phone.put("country_code", "233");
+        phone.put("number",       normalizeGhPhone(phoneNumber));
+
+        Map<String, Object> mobileMoney = new LinkedHashMap<>();
+        mobileMoney.put("network", network);
+        mobileMoney.put("phone",   phone);
+
+        Map<String, Object> paymentMethod = new LinkedHashMap<>();
+        paymentMethod.put("type",         "mobile_money");
+        paymentMethod.put("mobile_money", mobileMoney);
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("amount",         amount);
+        body.put("currency",       EXPECTED_CURRENCY);
+        body.put("reference",      txRef);
+        body.put("payment_method", paymentMethod);
+        body.put("customer",       buildCustomer(user));
+        return body;
+    }
+
+    private static Map<String, Object> buildCustomer(User user) {
+        Map<String, Object> name = new LinkedHashMap<>();
+        name.put("first", firstName(user));
+        name.put("last",  lastName(user));
+
+        Map<String, Object> customer = new LinkedHashMap<>();
+        customer.put("email", user.getEmail());
+        customer.put("name",  name);
+        return customer;
+    }
+
+    // =========================================================================
+    // Private — response extraction
+    // =========================================================================
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> unwrapData(
+            Map<String, Object> response, String txRef, String method) {
+
+        if (response == null) {
+            throw ApiException.badRequest("No response from payment provider. Please try again.");
+        }
+        Object dataObj = response.get("data");
+        if (!(dataObj instanceof Map)) {
+            log.error("unwrapData({}): missing data for ref='{}' — response: {}", method, txRef, response);
+            throw ApiException.badRequest("Payment initiation failed — no charge data returned.");
+        }
+        Map<String, Object> data = (Map<String, Object>) dataObj;
+        if (data.get("id") == null) {
+            log.error("unwrapData({}): data.id null for ref='{}' — data: {}", method, txRef, data);
+            throw ApiException.badRequest("Payment initiation failed — charge id missing.");
+        }
+        return data;
     }
 
     /**
-     * Maps an accepted frontend network value onto the name Flutterwave's
-     * live API actually recognizes (confirmed via GET /mobile-networks?country=GH):
-     * MTN, AIRTELTIGO, VODAFONE.
+     * Extracts the customer-facing instruction from the charge response.
      *
-     * "TIGO"/"AIRTEL" (pre-merger legacy) and "TELECEL" (sent by a previous,
-     * incorrect revision) are accepted purely for backward compatibility with
-     * un-updated clients and mapped onto their correct equivalents.
+     * For MoMo the relevant field is usually:
+     *   data.next_action.type = "payment_instruction"
+     *   data.next_action.payment_instruction.note = "Approve on your phone..."
      */
-    private static String resolveNetwork(String rawNetwork) {
-        return switch (rawNetwork.toUpperCase()) {
-            case "TIGO", "AIRTEL", "AIRTELTIGO" -> "AIRTELTIGO";
-            case "TELECEL", "VODAFONE" -> "VODAFONE";
-            default -> "MTN";
-        };
+    @SuppressWarnings("unchecked")
+    private static String extractInstruction(Map<String, Object> data) {
+        Object naObj = data.get("next_action");
+        if (!(naObj instanceof Map)) return null;
+
+        Map<String, Object> na = (Map<String, Object>) naObj;
+
+        Object piObj = na.get("payment_instruction");
+        if (piObj instanceof Map) {
+            Object note = ((Map<String, Object>) piObj).get("note");
+            if (note != null) return note.toString();
+        }
+
+        // Fallback: message field at the charge level
+        Object msg = data.get("message");
+        return msg != null ? msg.toString() : null;
     }
 
-    /** Strips a leading "233"/"+233"/"0" prefix, since the country code is sent separately. */
-    private static String normalizeLocalPhone(String phone) {
-        var trimmed = phone.trim();
+    // =========================================================================
+    // Private — misc utilities
+    // =========================================================================
+
+    private BigDecimal parseAmount(Map<String, Object> req) {
+        Object val = req.get("amount");
+        if (val == null) throw ApiException.badRequest("'amount' is required");
+        try { return new BigDecimal(val.toString()); }
+        catch (NumberFormatException e) { throw ApiException.badRequest("'amount' must be a valid number"); }
+    }
+
+    private void validateMin(BigDecimal amount) {
+        if (amount.compareTo(minDeposit) < 0) {
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit.toPlainString());
+        }
+    }
+
+    /**
+     * Strips Ghana country prefix so the number component is sent separately.
+     * Ghana country_code is "233"; number is the local 9-digit form.
+     * Examples: +233241234567 → 241234567 | 0241234567 → 241234567
+     */
+    private static String normalizeGhPhone(String phone) {
+        String trimmed = phone.replaceAll("\\s+", "");
         if (trimmed.startsWith("+233")) return trimmed.substring(4);
         if (trimmed.startsWith("233"))  return trimmed.substring(3);
         if (trimmed.startsWith("0"))    return trimmed.substring(1);
         return trimmed;
     }
 
+    private static String randomHex() {
+        return UUID.randomUUID().toString().replace("-", "");
+    }
+
     private static String firstName(User user) {
-        var first = user.getFirstName();
+        String first = user.getFirstName();
         if (first != null && !first.isBlank()) return first;
-        var email = user.getEmail();
+        String email = user.getEmail();
         return email != null ? email.split("@")[0] : "Customer";
     }
 
     private static String lastName(User user) {
-        var last = user.getLastName();
-        return last != null ? last : "";
+        String last = user.getLastName();
+        return (last != null && !last.isBlank()) ? last : "User";
     }
 }

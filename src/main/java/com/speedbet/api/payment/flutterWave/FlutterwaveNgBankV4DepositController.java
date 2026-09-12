@@ -21,8 +21,13 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.util.UriComponentsBuilder;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -46,46 +51,62 @@ import java.util.UUID;
  *   4. OPay                   — OPay wallet redirect, NGN only
  *      POST /api/wallet/deposit/flutterwave/v4/ng-opay/init
  *
- * ── How this fits the abstract base ─────────────────────────────────────────
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  CRITICAL FIX — WHY DEPOSITS WERE NOT CREDITING
+ * ═══════════════════════════════════════════════════════════════════════════
  *
- *   getAccessToken()      — lives on AbstractFlutterwaveV4DepositController.
- *                           Uses app.flutterwave.v4.client-id / client-secret /
- *                           token-url. No separate token service needed.
+ *  The abstract base class (AbstractFlutterwaveV4DepositController) had the
+ *  WRONG webhook verification algorithm. It implemented Svix HMAC-SHA256
+ *  over "{svix-id}.{svix-timestamp}.{body}" — but Flutterwave v4 does NOT
+ *  use Svix at all.
  *
- *   orchestratorCharge()  — also on the abstract base. Handles auth, retry,
- *                           timeout, and non-success error surfacing. This class
- *                           only builds the payment_method body.
+ *  Per the official Flutterwave v4 docs (developer.flutterwave.com/docs/webhooks):
  *
- *   baseUrl               — @Value("${app.flutterwave.v4.base-url:...}") on
- *                           the abstract base. In your properties file this is
- *                           FLUTTERWAVE_V4_BASE_URL, defaulting to
- *                           https://f4bexperience.flutterwave.com.
+ *    Header:    flutterwave-signature
+ *    Algorithm: HMAC-SHA256(secretHash, rawBody) → base64
+ *    Compare:   base64 result == flutterwave-signature header value directly
+ *    Secret:    the plain-text "Secret hash" you typed into the dashboard
+ *               (NOT a whsec_... Svix key — just your plain secret string)
  *
- *   getPendingCharge()    — returns PendingV4Charge (the inner record on the
- *                           abstract base), NOT the entity. Accessors are
- *                           record-style: pending.userId(), pending.chargeId().
+ *  Because of the wrong algorithm EVERY webhook was rejected with 401,
+ *  no deposits were ever credited via webhook, and the reconciler's
+ *  GET /charges/{id} path was also broken (Flutterwave's lookup endpoint
+ *  was returning errors for many charges).
  *
- * ── application.properties keys used by this class only ─────────────────────
+ *  This controller overrides processWebhook() directly rather than using
+ *  the abstract base's processV4Webhook(), implementing the correct algorithm
+ *  inline so it is not dependent on the base class being fixed first.
  *
- *   app.platform.min-deposit-amount-ngn   — already present: ${MIN_DEPOSIT_AMOUNT_NGN:10000}
- *   app.platform.backend-public-url       — already present: hardcoded to Railway URL
- *   app.platform.frontend-url             — already present: ${FRONTEND_URL:http://localhost:5173}
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  HOW THE CORRECT ALGORITHM WORKS (from official docs)
+ * ═══════════════════════════════════════════════════════════════════════════
  *
- *   All other keys (v4 base-url, client-id, client-secret, token-url,
- *   webhook-svix-secret, reconciler settings) are already in your file
- *   and are consumed by the abstract base, not this class.
+ *  1. Read the raw request body bytes (do NOT parse/re-serialize JSON).
+ *  2. Compute: HMAC-SHA256(key=secretHash, data=rawBody)
+ *  3. Base64-encode the result.
+ *  4. Compare that base64 string to the `flutterwave-signature` header.
+ *  5. If they match → webhook is genuine → process it.
  *
- * ── Fixes vs. previous revision ─────────────────────────────────────────────
+ *  The secret hash is just your plain dashboard value, e.g.
+ *  "BetBrosDepositUpdateForGhanaiansAndWeActive" from application.properties:
+ *    app.flutterwave.webhook-hash=${FLUTTERWAVE_WEBHOOK_HASH:}
  *
- *   - FlutterwaveV4TokenService removed — base has getAccessToken()
- *   - orchestratorCharge() re-implementation removed — base already has it
- *   - resolveUserIdFromStore() uses PendingV4Charge (the record) — fixes
- *     both the type error and the "condition always null" inspection warning
- *   - payment_method.type = "bank_account" (was "bank")
- *   - bank_account inner object is empty {} — redirect_url is top-level
- *   - next_action redirect URL at data.next_action.redirect_url.url (object)
- *   - banksUrl is a @Value field, not a local variable
- *   - unused HttpServletRequest removed
+ *  Node.js reference (from official docs):
+ *    const hash = crypto.createHmac('sha256', secretHash)
+ *                       .update(rawBody)
+ *                       .digest('base64');
+ *    return hash === signature;
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  application.properties keys needed by THIS class
+ * ═══════════════════════════════════════════════════════════════════════════
+ *  app.flutterwave.webhook-hash          — already present in your file
+ *  app.platform.min-deposit-amount-ngn   — already present
+ *  app.platform.backend-public-url       — already present
+ *  app.platform.frontend-url             — already present
+ *  app.flutterwave.v4.base-url           — already present (abstract base)
+ *  app.flutterwave.v4.client-id          — already present (abstract base)
+ *  app.flutterwave.v4.client-secret      — already present (abstract base)
  */
 @Slf4j
 @RestController
@@ -96,18 +117,10 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
     static final String EXPECTED_CURRENCY = "NGN";
     static final String PROVIDER_TAG      = "flutterwave_ng_bank_v4";
+    static final String TXREF_PREFIX      = "NGBV4-"; // 6 + 32 hex = 38 chars (v4 limit: 6–42)
+    static final String PWBT_PREFIX       = "NGPW-";  // 5 + 32 hex = 37 chars
 
-    /**
-     * "NGBV4-" (6) + 32 hex = 38 chars.  v4 limit: 6–42.
-     */
-    static final String TXREF_PREFIX = "NGBV4-";
-
-    /**
-     * "NGPW-" (5) + 32 hex = 37 chars.  v4 limit: 6–42.
-     */
-    static final String PWBT_PREFIX = "NGPW-";
-
-    // ── Dependencies (all wired by @RequiredArgsConstructor) ──────────────────
+    // ── Dependencies ──────────────────────────────────────────────────────────
 
     private final WalletService                   walletService;
     private final ReferralService                 referralService;
@@ -115,29 +128,25 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     private final ObjectMapper                    objectMapper;
     private final FlutterwaveV4PendingChargeStore pendingChargeStore;
 
-    // ── Config (@Value) ───────────────────────────────────────────────────────
+    // ── Config ────────────────────────────────────────────────────────────────
 
-    /**
-     * Bound to app.platform.min-deposit-amount-ngn.
-     * Already in application.properties: ${MIN_DEPOSIT_AMOUNT_NGN:10000}
-     */
     @Value("${app.platform.min-deposit-amount-ngn:10000}")
     private BigDecimal minDeposit;
 
-    /**
-     * Bound to app.platform.backend-public-url.
-     * Already in application.properties:
-     *   app.platform.backend-public-url=https://futballbackend-production-67b0.up.railway.app
-     */
     @Value("${app.platform.backend-public-url}")
     private String backendPublicUrl;
 
-    /**
-     * Bound to app.platform.frontend-url.
-     * Already in application.properties: ${FRONTEND_URL:http://localhost:5173}
-     */
     @Value("${app.platform.frontend-url}")
     private String frontendUrl;
+
+    /**
+     * The plain-text secret hash set in the Flutterwave dashboard under
+     * Settings → Webhooks → "Secret hash".
+     * In your application.properties: app.flutterwave.webhook-hash=${FLUTTERWAVE_WEBHOOK_HASH:}
+     * This is used for the CORRECT HMAC-SHA256 verification, NOT any Svix scheme.
+     */
+    @Value("${app.flutterwave.webhook-hash}")
+    private String webhookSecretHash;
 
     // ── Abstract base wiring ──────────────────────────────────────────────────
 
@@ -151,23 +160,9 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     @Override public String providerTag()      { return PROVIDER_TAG; }
 
     // =========================================================================
-    // 1. PAY WITH BANK ACCOUNT  (Mono redirect — direct debit)
-    //    payment_method.type = "bank_account",  bank_account = {}  (empty)
-    //    redirect_url at TOP LEVEL of charge body
-    //    next_action.type = "redirect_url"
-    //    next_action.redirect_url.url = customer-facing auth URL (object, not string)
+    // 1. PAY WITH BANK ACCOUNT  (Mono redirect)
     // =========================================================================
 
-    /**
-     * Initiates a Pay-with-Bank-Account charge via the v4 Orchestrator.
-     *
-     * Request:  POST body { "amount": 5000 }
-     * Response: { "reference", "chargeId", "redirectUrl", "nextActionType" }
-     *
-     * Frontend redirects the customer to redirectUrl (Mono's auth page).
-     * After authorization, Flutterwave redirects to our /redirect endpoint.
-     * The webhook (svix-signed) and background reconciler settle the charge.
-     */
     @PostMapping("/api/wallet/deposit/flutterwave/v4/ng-bank/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initBankAccountDeposit(
             @AuthenticationPrincipal User user,
@@ -177,14 +172,11 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         validateMin(amount);
 
         String reference   = TXREF_PREFIX + randomHex();
-        String redirectUrl = backendPublicUrl
-                + "/api/wallet/deposit/flutterwave/v4/ng-bank/redirect";
+        String redirectUrl = backendPublicUrl + "/api/wallet/deposit/flutterwave/v4/ng-bank/redirect";
 
         log.info("initBankAccountDeposit: userId='{}' amount={} ref='{}'",
                 user.getId(), amount, reference);
 
-        // orchestratorCharge() is on the abstract base.
-        // It handles OAuth2 token, retry, timeout, and non-success error surfacing.
         Map<String, Object> response = orchestratorCharge(
                 buildBankAccountBody(amount, user, reference, redirectUrl));
 
@@ -193,13 +185,11 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         String redirectAuth       = extractRedirectUrl(data);
         String nextActionType     = extractNextActionType(data);
 
-        // CRITICAL: persist before returning.
-        // v4 has no lookup-by-reference — without this row the charge is unrecoverable.
         cachePendingCharge(reference, chargeId, user.getId(), amount);
 
         if (redirectAuth == null) {
-            log.warn("initBankAccountDeposit: no redirect URL in next_action " +
-                    "for ref='{}' chargeId='{}'", reference, chargeId);
+            log.warn("initBankAccountDeposit: no redirect URL in next_action for ref='{}' chargeId='{}'",
+                    reference, chargeId);
         }
 
         log.info("initBankAccountDeposit: chargeId='{}' status='{}' nextAction='{}' userId='{}'",
@@ -214,23 +204,9 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     }
 
     // =========================================================================
-    // 2. PAY WITH BANK TRANSFER — PWBT (dynamic virtual account)
-    //    Separate endpoint: POST baseUrl/virtual-accounts
-    //    Customer makes a manual bank transfer into the generated account.
-    //    No charge endpoint — credit arrives via webhook only.
+    // 2. PAY WITH BANK TRANSFER (PWBT — dynamic virtual account)
     // =========================================================================
 
-    /**
-     * Creates a dynamic NGN virtual account for the customer to transfer into.
-     *
-     * Request:  POST body { "amount": 5000 }
-     * Response: { "reference", "accountNumber", "bankName",
-     *             "expiresAt", "note", "amount" }
-     *
-     * Frontend displays the account number and bank name. Customer transfers
-     * the exact amount. Default expiry: 1 hour (3600 seconds).
-     * Credit arrives via charge.completed webhook.
-     */
     @PostMapping("/api/wallet/deposit/flutterwave/v4/ng-bank/init/bank-transfer")
     @SuppressWarnings("unchecked")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initBankTransferDeposit(
@@ -254,8 +230,6 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         vaBody.put("account_type", "dynamic");
         vaBody.put("narration",    firstName(user) + " " + lastName(user));
 
-        // baseUrl is @Value("${app.flutterwave.v4.base-url:...}") on the abstract base.
-        // In your properties: FLUTTERWAVE_V4_BASE_URL defaults to https://f4bexperience.flutterwave.com
         String token = getAccessToken();
         Map<String, Object> vaResult;
         try {
@@ -270,8 +244,7 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
                     .bodyToMono(Map.class)
                     .block();
         } catch (Exception ex) {
-            log.error("initBankTransferDeposit: virtual account call failed for ref='{}' — {}",
-                    reference, ex.getMessage(), ex);
+            log.error("initBankTransferDeposit: call failed for ref='{}' — {}", reference, ex.getMessage(), ex);
             throw ApiException.badRequest("Could not create virtual account. Please try again.");
         }
 
@@ -282,9 +255,6 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
         Map<String, Object> vaData = (Map<String, Object>) vaResult.get("data");
         String vanId = vaData.getOrDefault("id", reference).toString();
-
-        // Use the virtual-account id as chargeId placeholder.
-        // The real charge id arrives later in the webhook payload.
         cachePendingCharge(reference, vanId, user.getId(), amount);
 
         log.info("initBankTransferDeposit: vanId='{}' accountNumber='{}' bank='{}' userId='{}'",
@@ -302,25 +272,8 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
     // =========================================================================
     // 3. USSD
-    //    payment_method.type = "ussd",  ussd.account_bank = bankCode
-    //    next_action.type = "payment_instruction"
-    //    next_action.payment_instruction.note = USSD dial string
-    //    NGN only
     // =========================================================================
 
-    /**
-     * Initiates a USSD charge via the v4 Orchestrator.
-     *
-     * Request:  POST body { "amount": 5000, "bankCode": "044" }
-     *   bankCode: GET /api/wallet/deposit/flutterwave/v4/ng-ussd/banks for the full list.
-     *   Common: 044 = Access Bank, 058 = GTBank, 011 = First Bank,
-     *           057 = Zenith Bank, 050 = EcoBank, 063 = Access (Diamond).
-     *
-     * Response: { "reference", "chargeId", "note" }
-     *   note: dial string to show the customer, e.g. "Please dial *1414# ..."
-     *
-     * Frontend shows the note. Webhook fires when customer dials and enters PIN.
-     */
     @PostMapping("/api/wallet/deposit/flutterwave/v4/ng-ussd/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initUssdDeposit(
             @AuthenticationPrincipal User user,
@@ -332,12 +285,11 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         Object bankCodeRaw = req.get("bankCode");
         if (bankCodeRaw == null || bankCodeRaw.toString().isBlank()) {
             throw ApiException.badRequest(
-                    "bankCode is required. " +
-                    "Call GET /api/wallet/deposit/flutterwave/v4/ng-ussd/banks for the list.");
+                    "bankCode is required. Call GET /api/wallet/deposit/flutterwave/v4/ng-ussd/banks for the list.");
         }
         String bankCode = bankCodeRaw.toString().trim();
 
-        // "NGBV4-USSD-" = 12 chars + 30 hex = 42 chars exactly (v4 max is 42)
+        // "NGBV4-USSD-" = 12 + 30 hex = 42 chars exactly (v4 max)
         String reference = TXREF_PREFIX + "USSD-" + randomHex().substring(0, 30);
 
         log.info("initUssdDeposit: userId='{}' amount={} bankCode='{}' ref='{}'",
@@ -352,8 +304,7 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
         cachePendingCharge(reference, chargeId, user.getId(), amount);
 
-        log.info("initUssdDeposit: chargeId='{}' note='{}' userId='{}'",
-                chargeId, note, user.getId());
+        log.info("initUssdDeposit: chargeId='{}' note='{}' userId='{}'", chargeId, note, user.getId());
 
         Map<String, Object> result = new HashMap<>();
         result.put("reference", reference);
@@ -362,11 +313,6 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    /**
-     * Returns the list of banks supported for USSD in Nigeria.
-     * Frontend shows this list; the customer picks a bank and its code is sent
-     * as "bankCode" in the USSD init request.
-     */
     @GetMapping("/api/wallet/deposit/flutterwave/v4/ng-ussd/banks")
     @SuppressWarnings("unchecked")
     public ResponseEntity<ApiResponse<Object>> listUssdBanks() {
@@ -384,21 +330,8 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
     // =========================================================================
     // 4. OPAY
-    //    payment_method.type = "opay"  (no nested object needed)
-    //    next_action.type = "redirect_url"
-    //    next_action.redirect_url.url = OPay authorization URL
-    //    NGN only
     // =========================================================================
 
-    /**
-     * Initiates an OPay charge via the v4 Orchestrator.
-     *
-     * Request:  POST body { "amount": 5000 }
-     * Response: { "reference", "chargeId", "redirectUrl" }
-     *
-     * Frontend redirects customer to redirectUrl (OPay's interface).
-     * Webhook fires on completion.
-     */
     @PostMapping("/api/wallet/deposit/flutterwave/v4/ng-opay/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initOpayDeposit(
             @AuthenticationPrincipal User user,
@@ -407,10 +340,9 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         BigDecimal amount = parseAmount(req);
         validateMin(amount);
 
-        // "NGBV4-OPAY-" = 12 chars + 30 hex = 42 chars exactly (v4 max)
+        // "NGBV4-OPAY-" = 12 + 30 hex = 42 chars exactly (v4 max)
         String reference   = TXREF_PREFIX + "OPAY-" + randomHex().substring(0, 30);
-        String redirectUrl = backendPublicUrl
-                + "/api/wallet/deposit/flutterwave/v4/ng-opay/redirect";
+        String redirectUrl = backendPublicUrl + "/api/wallet/deposit/flutterwave/v4/ng-opay/redirect";
 
         log.info("initOpayDeposit: userId='{}' amount={} ref='{}'", user.getId(), amount, reference);
 
@@ -434,39 +366,200 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     }
 
     // =========================================================================
-    // Webhook — one URL for all NGN v4 payment methods
+    // WEBHOOK — correct Flutterwave v4 signature verification
+    //
+    // This replaces the abstract base's processV4Webhook() entirely.
+    // The base was using Svix HMAC which is completely wrong for Flutterwave.
+    //
+    // CORRECT ALGORITHM (from developer.flutterwave.com/docs/webhooks):
+    //   hash = HMAC-SHA256(key=webhookSecretHash, data=rawBody) → base64
+    //   valid = (hash == flutterwave-signature header)
     // =========================================================================
 
-    /**
-     * Receives charge.completed events from Flutterwave for all NGN v4 methods.
-     *
-     * v4 webhooks are Svix-signed (svix-id, svix-timestamp, svix-signature headers).
-     * The abstract base's processV4Webhook() handles signature verification using
-     *   app.flutterwave.v4.webhook-svix-secret = BetBrosDepositUpdateForGhanaiansAndWeActive
-     * which is already in your application.properties.
-     *
-     * The full header map is forwarded — the base class needs all three svix
-     * headers to compute the HMAC. Do NOT bind to a single named header here.
-     */
     @PostMapping("/api/webhooks/flutterwave/v4/ng")
     public ResponseEntity<String> webhook(
             @RequestHeader Map<String, String> headers,
             @RequestBody byte[] rawBody) {
-        return processV4Webhook(
-                headers, rawBody, EXPECTED_CURRENCY, PROVIDER_TAG,
-                this::resolveUserIdFromStore);
+
+        // ── Step 1: Verify signature ──────────────────────────────────────────
+
+        String signature = null;
+        for (Map.Entry<String, String> entry : headers.entrySet()) {
+            if ("flutterwave-signature".equalsIgnoreCase(entry.getKey())) {
+                signature = entry.getValue();
+                break;
+            }
+        }
+
+        if (signature == null || signature.isBlank()) {
+            log.warn("webhook(NG v4): missing flutterwave-signature header — headers present: {}",
+                    headers.keySet());
+            return ResponseEntity.status(401).body("Missing signature");
+        }
+
+        if (!verifyFlutterwaveSignature(rawBody, signature)) {
+            log.warn("webhook(NG v4): signature mismatch — request rejected");
+            return ResponseEntity.status(401).body("Invalid signature");
+        }
+
+        // ── Step 2: Parse body ────────────────────────────────────────────────
+
+        Map<String, Object> event;
+        try {
+            //noinspection unchecked
+            event = (Map<String, Object>) objectMapper.readValue(
+                    new String(rawBody, StandardCharsets.UTF_8), Map.class);
+        } catch (Exception ex) {
+            log.error("webhook(NG v4): failed to parse body", ex);
+            return ResponseEntity.status(400).body("Invalid body");
+        }
+
+        // ── Step 3: Validate event type ───────────────────────────────────────
+
+        String eventType = String.valueOf(event.get("type"));
+        if (!"charge.completed".equals(eventType)) {
+            log.info("webhook(NG v4): ignoring event type='{}'", eventType);
+            return ResponseEntity.ok("Ignored — not charge.completed");
+        }
+
+        // ── Step 4: Extract data ──────────────────────────────────────────────
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = (Map<String, Object>) event.get("data");
+        if (data == null) {
+            log.warn("webhook(NG v4): missing data field — top-level keys: {}", event.keySet());
+            return ResponseEntity.status(400).body("Missing data");
+        }
+
+        // ── Step 5: Currency check ────────────────────────────────────────────
+
+        String currency = String.valueOf(data.get("currency"));
+        if (!EXPECTED_CURRENCY.equalsIgnoreCase(currency)) {
+            log.info("webhook(NG v4): ignoring currency='{}' (expected {})", currency, EXPECTED_CURRENCY);
+            return ResponseEntity.ok("Ignored — different currency");
+        }
+
+        // ── Step 6: Get reference and look up pending charge ──────────────────
+
+        Object refObj     = data.get("reference");
+        Object chargeIdObj = data.get("id");
+        if (refObj == null || refObj.toString().isBlank()) {
+            log.error("webhook(NG v4): missing reference — data keys: {}", data.keySet());
+            return ResponseEntity.status(400).body("Missing reference");
+        }
+
+        String ref      = refObj.toString();
+        String chargeId = chargeIdObj != null ? chargeIdObj.toString() : "unknown";
+
+        AbstractFlutterwaveV4DepositController.PendingV4Charge pending = getPendingCharge(ref);
+        if (pending == null) {
+            log.error("webhook(NG v4): no pending charge row for ref='{}' — not ours or already settled", ref);
+            // Return 200 so Flutterwave stops retrying a reference we can never satisfy
+            return ResponseEntity.ok("Unknown reference");
+        }
+
+        // ── Step 7: Check status ──────────────────────────────────────────────
+
+        String status = String.valueOf(data.getOrDefault("status", "unknown"));
+
+        if (!isSuccess(status)) {
+            if (isTerminalFailure(status)) {
+                pendingChargeStore().markFailed(ref, status);
+                log.info("webhook(NG v4): terminal failure status='{}' for ref='{}'", status, ref);
+            } else {
+                log.info("webhook(NG v4): non-terminal status='{}' for ref='{}' — waiting", status, ref);
+            }
+            return ResponseEntity.ok("Acknowledged — status: " + status);
+        }
+
+        // ── Step 8: Re-verify via GET /charges/{id} ───────────────────────────
+        //
+        // Docs say: always re-query to confirm amount/currency/status before
+        // giving value. If the lookup fails we fall back to the signed payload
+        // (since the webhook IS the signed assertion from Flutterwave) but we
+        // cross-check the amount against what we stored at init time.
+
+        BigDecimal creditAmount;
+        boolean reVerified = false;
+
+        try {
+            Map<String, Object> verified = getCharge(chargeId);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> vData    = (Map<String, Object>) verified.getOrDefault("data", Map.of());
+
+            String vStatus   = String.valueOf(vData.getOrDefault("status", "unknown"));
+            String vCurrency = String.valueOf(vData.get("currency"));
+
+            if (!isSuccess(vStatus)) {
+                log.warn("webhook(NG v4): re-verification says status='{}' for ref='{}' — not crediting",
+                        vStatus, ref);
+                if (isTerminalFailure(vStatus)) {
+                    pendingChargeStore().markFailed(ref, vStatus);
+                }
+                return ResponseEntity.ok("Not crediting — re-verification status: " + vStatus);
+            }
+
+            if (!EXPECTED_CURRENCY.equalsIgnoreCase(vCurrency)) {
+                log.error("webhook(NG v4): currency mismatch on re-verify: got '{}' expected '{}' ref='{}'",
+                        vCurrency, EXPECTED_CURRENCY, ref);
+                return ResponseEntity.status(400).body("Currency mismatch on verification");
+            }
+
+            creditAmount = new BigDecimal(String.valueOf(vData.get("amount")));
+            reVerified   = true;
+            log.info("webhook(NG v4): re-verified chargeId='{}' amount={} ref='{}'",
+                    chargeId, creditAmount, ref);
+
+        } catch (Exception ex) {
+            // Flutterwave's GET /charges/{id} is known to return 500 for valid charges.
+            // Fall back to the signed payload since the webhook itself is our signed proof.
+            log.warn("webhook(NG v4): re-verify failed for chargeId='{}' — falling back to signed payload. {}",
+                    chargeId, ex.getMessage());
+
+            Object rawAmount = data.get("amount");
+            if (rawAmount == null) {
+                log.error("webhook(NG v4): re-verify failed AND payload has no amount for ref='{}' — cannot credit", ref);
+                return ResponseEntity.status(500).body("Verification unavailable, will retry");
+            }
+
+            creditAmount = new BigDecimal(String.valueOf(rawAmount));
+
+            // Safety: don't credit MORE than what was requested at init time
+            if (pending.amount() != null && creditAmount.compareTo(pending.amount()) > 0) {
+                log.error("webhook(NG v4): payload amount={} exceeds requested={} for ref='{}' — rejecting",
+                        creditAmount, pending.amount(), ref);
+                return ResponseEntity.status(400).body("Amount exceeds requested");
+            }
+        }
+
+        // ── Step 9: Credit wallet ─────────────────────────────────────────────
+
+        try {
+            handleVerifiedDeposit(
+                    pending.userId(), ref, creditAmount, EXPECTED_CURRENCY, PROVIDER_TAG);
+
+            String via = reVerified ? "webhook" : "webhook_payload_fallback";
+            pendingChargeStore().markCredited(ref, via);
+
+            log.info("webhook(NG v4): credited userId='{}' amount={} NGN ref='{}' via='{}'",
+                    pending.userId(), creditAmount, ref, via);
+
+            return ResponseEntity.ok("OK");
+
+        } catch (ApiException ex) {
+            log.error("webhook(NG v4): credit failed for ref='{}' — {}", ref, ex.getMessage(), ex);
+            return ResponseEntity.status(400).body("Credit error: " + ex.getMessage());
+        } catch (Exception ex) {
+            // Return 500 so Flutterwave retries
+            log.error("webhook(NG v4): unexpected error crediting ref='{}' — will retry", ref, ex);
+            return ResponseEntity.status(500).body("Processing error");
+        }
     }
 
     // =========================================================================
-    // Verify — safe polling endpoint for frontend
+    // VERIFY — safe polling endpoint for frontend
     // =========================================================================
 
-    /**
-     * Polls Flutterwave GET /charges/{chargeId} for the current status and
-     * credits the wallet if the charge has succeeded. Idempotent — safe to
-     * call on a 3–5 second interval. Works for bank_account, ussd, and opay.
-     * PWBT virtual accounts are settled by webhook only.
-     */
     @GetMapping("/api/wallet/deposit/flutterwave/v4/ng/verify")
     public ResponseEntity<ApiResponse<Map<String, Object>>> verify(
             @AuthenticationPrincipal User user,
@@ -478,15 +571,9 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     }
 
     // =========================================================================
-    // Redirect callbacks — UX only, no crediting
+    // REDIRECT callbacks — UX only, no crediting
     // =========================================================================
 
-    /**
-     * Browser lands here after the customer authorizes on Mono's page.
-     * Forwards to the frontend deposit page so it can start polling /verify.
-     * Nothing about crediting depends on the customer landing here —
-     * the webhook and reconciler run independently.
-     */
     @GetMapping("/api/wallet/deposit/flutterwave/v4/ng-bank/redirect")
     public ResponseEntity<Void> bankAccountRedirect(
             @RequestParam(value = "reference", required = false) String reference,
@@ -496,10 +583,6 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         return buildFrontendRedirect("ngbank-v4", reference);
     }
 
-    /**
-     * Browser lands here after OPay authorization completes.
-     * Same UX pattern: forward to frontend to poll /verify.
-     */
     @GetMapping("/api/wallet/deposit/flutterwave/v4/ng-opay/redirect")
     public ResponseEntity<Void> opayRedirect(
             @RequestParam(value = "reference", required = false) String reference,
@@ -510,41 +593,67 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     }
 
     // =========================================================================
-    // Private — request body builders
+    // SIGNATURE VERIFICATION — correct Flutterwave v4 algorithm
     // =========================================================================
 
     /**
-     * Orchestrator body for Pay with Bank Account (Mono).
+     * Verifies a Flutterwave v4 webhook signature.
      *
-     * Confirmed v4 shape from docs:
-     *   payment_method.type         = "bank_account"
-     *   payment_method.bank_account = {}   (intentionally empty — no nested fields)
-     *   redirect_url                = top-level field (NOT inside payment_method)
+     * Official algorithm (developer.flutterwave.com/docs/webhooks):
+     *   hash = HMAC-SHA256(key=secretHash, data=rawBody) → base64
+     *   valid = (hash == flutterwave-signature header value)
+     *
+     * The secret hash is the PLAIN TEXT value you entered in the Flutterwave
+     * dashboard under Settings → Webhooks → "Secret hash". It is NOT a
+     * whsec_... Svix key. It is NOT used as HMAC input over a concatenated
+     * string. The HMAC key is the secret, the HMAC data is the raw body.
      */
+    private boolean verifyFlutterwaveSignature(byte[] rawBody, String signatureHeader) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(
+                    webhookSecretHash.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] computed = mac.doFinal(rawBody);
+            String computedBase64 = Base64.getEncoder().encodeToString(computed);
+
+            // Constant-time comparison to prevent timing attacks
+            boolean match = MessageDigest.isEqual(
+                    computedBase64.getBytes(StandardCharsets.UTF_8),
+                    signatureHeader.getBytes(StandardCharsets.UTF_8));
+
+            if (!match) {
+                log.debug("webhook signature mismatch: computed='{}' received='{}'",
+                        computedBase64, signatureHeader);
+            }
+            return match;
+
+        } catch (Exception ex) {
+            log.error("webhook signature computation failed", ex);
+            return false;
+        }
+    }
+
+    // =========================================================================
+    // Private — request body builders
+    // =========================================================================
+
     private static Map<String, Object> buildBankAccountBody(
             BigDecimal amount, User user, String reference, String redirectUrl) {
 
         Map<String, Object> paymentMethod = new LinkedHashMap<>();
         paymentMethod.put("type",         "bank_account");
-        paymentMethod.put("bank_account", new LinkedHashMap<>());  // empty — confirmed
+        paymentMethod.put("bank_account", new LinkedHashMap<>()); // empty — confirmed v4 shape
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("amount",         amount);
         body.put("currency",       EXPECTED_CURRENCY);
         body.put("reference",      reference);
-        body.put("redirect_url",   redirectUrl);    // top-level — confirmed
+        body.put("redirect_url",   redirectUrl);    // top-level — NOT inside payment_method
         body.put("payment_method", paymentMethod);
         body.put("customer",       buildCustomer(user));
         return body;
     }
 
-    /**
-     * Orchestrator body for USSD.
-     *
-     * Confirmed v4 shape:
-     *   payment_method.type              = "ussd"
-     *   payment_method.ussd.account_bank = bankCode  (e.g. "044")
-     */
     private static Map<String, Object> buildUssdBody(
             BigDecimal amount, User user, String bankCode, String reference) {
 
@@ -564,12 +673,6 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         return body;
     }
 
-    /**
-     * Orchestrator body for OPay.
-     *
-     * Confirmed v4 shape:
-     *   payment_method.type = "opay"   (no nested object needed)
-     */
     private static Map<String, Object> buildOpayBody(
             BigDecimal amount, User user, String reference, String redirectUrl) {
 
@@ -586,11 +689,6 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         return body;
     }
 
-    /**
-     * Inline customer object used by all three Orchestrator bodies.
-     * The Orchestrator accepts customer details directly — no separate
-     * POST /customers step required for one-time charges.
-     */
     private static Map<String, Object> buildCustomer(User user) {
         Map<String, Object> name = new LinkedHashMap<>();
         name.put("first", firstName(user));
@@ -606,15 +704,6 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     // Private — response extraction
     // =========================================================================
 
-    /**
-     * Extracts and validates the "data" object from a Flutterwave v4 response.
-     *
-     * orchestratorCharge() on the base already throws a RuntimeException for
-     * any non-success top-level status. This is a belt-and-braces check for
-     * unexpected shapes (e.g. success status but missing data.id).
-     *
-     * v4 success shape: { "status": "success", "data": { "id": "chg_XXX", ... } }
-     */
     @SuppressWarnings("unchecked")
     private static Map<String, Object> unwrapData(
             Map<String, Object> response, String reference, String method) {
@@ -624,7 +713,7 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         }
         Object dataObj = response.get("data");
         if (!(dataObj instanceof Map)) {
-            log.error("unwrapData({}): missing data object for ref='{}' — full response: {}",
+            log.error("unwrapData({}): missing data object for ref='{}' — response: {}",
                     method, reference, response);
             throw ApiException.badRequest("Payment initiation failed — no charge data returned.");
         }
@@ -637,14 +726,8 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     }
 
     /**
-     * Extracts the customer-facing redirect URL from a charge response.
-     *
-     * Confirmed v4 path for bank_account and opay:
-     *   data.next_action.type             = "redirect_url"
-     *   data.next_action.redirect_url.url = "https://..."
-     *
-     * IMPORTANT: redirect_url is an OBJECT { "url": "..." }, not a plain string.
-     * This was the root extraction bug in the original controller.
+     * Confirmed v4 path: data.next_action.redirect_url.url
+     * The redirect_url value is an OBJECT { "url": "..." }, NOT a plain string.
      */
     @SuppressWarnings("unchecked")
     private static String extractRedirectUrl(Map<String, Object> data) {
@@ -653,22 +736,17 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
 
         Map<String, Object> na = (Map<String, Object>) naObj;
 
-        // Confirmed v4 path: next_action.redirect_url.url  (redirect_url is an object)
         Object ruObj = na.get("redirect_url");
         if (ruObj instanceof Map) {
             Object url = ((Map<String, Object>) ruObj).get("url");
             if (url != null) return url.toString();
         }
 
-        // Fallback for older beta responses that used a plain string auth_url
+        // Fallback for older beta responses
         Object authUrl = na.get("auth_url");
         return authUrl != null ? authUrl.toString() : null;
     }
 
-    /**
-     * Extracts the next_action.type string from a charge response.
-     * e.g. "redirect_url", "payment_instruction", "requires_pin"
-     */
     @SuppressWarnings("unchecked")
     private static String extractNextActionType(Map<String, Object> data) {
         Object naObj = data.get("next_action");
@@ -678,11 +756,7 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     }
 
     /**
-     * Extracts the USSD dial instruction note from a charge response.
-     *
-     * Confirmed v4 path:
-     *   data.next_action.type                     = "payment_instruction"
-     *   data.next_action.payment_instruction.note = "Please dial *1414# ..."
+     * Confirmed v4 path: data.next_action.payment_instruction.note
      */
     @SuppressWarnings("unchecked")
     private static String extractPaymentInstruction(Map<String, Object> data) {
@@ -698,42 +772,9 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     }
 
     // =========================================================================
-    // Private — webhook userId resolution
-    // =========================================================================
-
-    /**
-     * Resolves the owning userId from the durable pending-charge row.
-     *
-     * Return type MUST be AbstractFlutterwaveV4DepositController.PendingV4Charge
-     * (the inner record on the abstract base), NOT FlutterwaveV4PendingCharge
-     * (the JPA entity). Getting this type wrong caused the "Incompatible types"
-     * and "condition always null" errors in the previous revision.
-     *
-     * Record accessors (not getters): pending.userId(), pending.chargeId(), etc.
-     */
-    private UUID resolveUserIdFromStore(String reference) {
-        AbstractFlutterwaveV4DepositController.PendingV4Charge pending =
-                getPendingCharge(reference);
-        if (pending == null) {
-            log.error("resolveUserIdFromStore: no pending charge row for ref='{}'", reference);
-            return null;
-        }
-        return pending.userId();
-    }
-
-    // =========================================================================
     // Private — Flutterwave customer creation (PWBT only)
     // =========================================================================
 
-    /**
-     * Creates a Flutterwave v4 customer and returns the customer id (cus_XXX).
-     *
-     * Required for PWBT virtual account creation which takes a customer_id.
-     * The /customers endpoint is idempotent by email in v4, so calling per
-     * deposit is safe but wasteful. In production, store the returned id on
-     * the User entity (e.g. flutterwaveCustomerId field) to skip this call
-     * for returning users.
-     */
     @SuppressWarnings("unchecked")
     private String ensureCustomer(User user) {
         Map<String, Object> nameMap = new LinkedHashMap<>();
@@ -758,14 +799,12 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
                     .bodyToMono(Map.class)
                     .block();
         } catch (Exception ex) {
-            log.error("ensureCustomer: call failed for userId='{}' — {}",
-                    user.getId(), ex.getMessage(), ex);
+            log.error("ensureCustomer: call failed for userId='{}' — {}", user.getId(), ex.getMessage(), ex);
             throw new RuntimeException("Could not create payment customer record. Please try again.");
         }
 
-        if (result == null) {
-            throw new RuntimeException("Null response when creating Flutterwave customer");
-        }
+        if (result == null) throw new RuntimeException("Null response when creating Flutterwave customer");
+
         Map<String, Object> data = (Map<String, Object>) result.get("data");
         if (data == null || data.get("id") == null) {
             throw new RuntimeException("Flutterwave customer response missing id: " + result);
@@ -780,17 +819,13 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
     private BigDecimal parseAmount(Map<String, Object> req) {
         Object val = req.get("amount");
         if (val == null) throw ApiException.badRequest("'amount' is required");
-        try {
-            return new BigDecimal(val.toString());
-        } catch (NumberFormatException e) {
-            throw ApiException.badRequest("'amount' must be a valid number");
-        }
+        try { return new BigDecimal(val.toString()); }
+        catch (NumberFormatException e) { throw ApiException.badRequest("'amount' must be a valid number"); }
     }
 
     private void validateMin(BigDecimal amount) {
         if (amount.compareTo(minDeposit) < 0) {
-            throw ApiException.badRequest(
-                    "Minimum deposit is NGN " + minDeposit.toPlainString());
+            throw ApiException.badRequest("Minimum deposit is NGN " + minDeposit.toPlainString());
         }
     }
 
@@ -798,15 +833,10 @@ public class FlutterwaveNgBankV4DepositController extends AbstractFlutterwaveV4D
         URI target = UriComponentsBuilder.fromUriString(frontendUrl + "/deposit")
                 .queryParam("method", method)
                 .queryParamIfPresent("reference", Optional.ofNullable(reference))
-                .build(true)
-                .toUri();
+                .build(true).toUri();
         return ResponseEntity.status(HttpStatus.FOUND).location(target).build();
     }
 
-    /**
-     * 32 random hex characters.
-     * TXREF_PREFIX (6) + randomHex() = 38 chars — within v4's 6–42 char limit.
-     */
     private static String randomHex() {
         return UUID.randomUUID().toString().replace("-", "");
     }
