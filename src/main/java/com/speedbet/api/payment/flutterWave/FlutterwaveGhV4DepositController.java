@@ -471,23 +471,32 @@ public class FlutterwaveGhV4DepositController extends AbstractFlutterwaveV4Depos
     /**
      * Orchestrator body for Ghana Mobile Money.
      *
-     * Confirmed v4 shape:
-     *   payment_method.type                  = "mobile_money"
-     *   payment_method.mobile_money.network  = "MTN" | "AIRTELTIGO" | "VODAFONE"
-     *   payment_method.mobile_money.phone    = { country_code, number }
+     * CONFIRMED v4 shape from official docs
+     * (developer.flutterwave.com/docs/payment-orchestrator-flow):
      *
-     * No redirect_url needed for MoMo — it is a push-notification flow.
+     *   "payment_method": {
+     *     "type": "mobile_money",
+     *     "mobile_money": {
+     *       "country_code":  "233",
+     *       "network":       "MTN",
+     *       "phone_number":  "9012345678"
+     *     }
+     *   }
+     *
+     * The previous shape nested phone inside a phone:{} object, which was
+     * WRONG and caused a 500 from the Flutterwave orchestrator on every
+     * GHS charge. country_code and phone_number are flat fields directly
+     * on mobile_money — no nesting.
+     *
+     * No redirect_url needed — MoMo is a push-notification flow.
      */
     private static Map<String, Object> buildMomoBody(
             BigDecimal amount, User user, String phoneNumber, String network, String txRef) {
 
-        Map<String, Object> phone = new LinkedHashMap<>();
-        phone.put("country_code", "233");
-        phone.put("number",       normalizeGhPhone(phoneNumber));
-
         Map<String, Object> mobileMoney = new LinkedHashMap<>();
-        mobileMoney.put("network", network);
-        mobileMoney.put("phone",   phone);
+        mobileMoney.put("country_code",  "233");
+        mobileMoney.put("network",       network);
+        mobileMoney.put("phone_number",  normalizeGhPhone(phoneNumber));
 
         Map<String, Object> paymentMethod = new LinkedHashMap<>();
         paymentMethod.put("type",         "mobile_money");
