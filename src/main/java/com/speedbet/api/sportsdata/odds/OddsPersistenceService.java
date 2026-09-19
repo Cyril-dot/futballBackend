@@ -28,6 +28,9 @@ import java.util.function.Supplier;
 @Slf4j
 public class OddsPersistenceService {
 
+    /** Market name exactly as stored in the DB by normalizeMarket(). */
+    private static final String MARKET_1X2 = "1X2";
+
     private final OddsRepository          oddsRepository;
     private final OddsGeneratorService     preMatchGenerator;
     private final LiveOddsGeneratorService liveGenerator;
@@ -71,7 +74,8 @@ public class OddsPersistenceService {
         if (entities.isEmpty()) {
             log.warn("generateAndSaveAllOdds: matchId={} produced 0 valid rows — forcing 1X2 fallback", matchId);
             entities = toEntities(
-                    preMatchGenerator.generatePreMatchOdds(home, away, league),
+                    safeGenerate("1x2-fallback", matchId,
+                            () -> preMatchGenerator.generatePreMatchOdds(home, away, league)),
                     matchId, home, away);
         }
 
@@ -91,17 +95,23 @@ public class OddsPersistenceService {
     }
 
     /**
-     * Generates odds ONLY if the match has none yet. Cheap to call repeatedly
-     * (e.g. after every fixture sync) — matches that already have odds are skipped.
+     * Generates odds ONLY if the match has no 1X2 odds yet. Cheap to call
+     * repeatedly (e.g. on every fixture save) — matches that already have
+     * 1X2 odds are skipped with a single EXISTS query.
      *
      * @return true if odds were generated, false if the match already had odds
      */
     @Transactional
     public boolean ensureOddsForMatch(Match match) {
+        // A match that hasn't been persisted has no id to attach odds to
+        if (match == null || match.getId() == null) {
+            log.warn("ensureOddsForMatch: match is null or has no id yet — skipping");
+            return false;
+        }
         if (hasOdds(match.getId())) {
             return false;
         }
-        log.info("ensureOddsForMatch: matchId={} {} vs {} has no odds — generating",
+        log.info("ensureOddsForMatch: matchId={} {} vs {} has no 1X2 odds — generating",
                 match.getId(), match.getHomeTeam(), match.getAwayTeam());
         generateAndSaveAllOdds(match);
         return true;
@@ -156,7 +166,7 @@ public class OddsPersistenceService {
             return;
         }
 
-        oddsRepository.deleteByMatchIdAndMarketIn(matchId, List.of("1X2", "asian_handicap"));
+        oddsRepository.deleteByMatchIdAndMarketIn(matchId, List.of(MARKET_1X2, "asian_handicap"));
         oddsRepository.flush();
         oddsRepository.saveAll(entities);
 
@@ -185,9 +195,14 @@ public class OddsPersistenceService {
         }
     }
 
-    /** True if the match already has at least one odds row. */
+    /**
+     * True if the match already has 1X2 odds stored. 1X2 is the core market:
+     * a match with only half-time or correct-score rows still counts as
+     * "no odds" and gets its full set regenerated.
+     * Uses an EXISTS query, so no rows are loaded.
+     */
     private boolean hasOdds(UUID matchId) {
-        return !oddsRepository.findByMatchId(matchId).isEmpty();
+        return oddsRepository.existsByMatchIdAndMarket(matchId, MARKET_1X2);
     }
 
     private int extractMinute(Match match) {
@@ -317,7 +332,7 @@ public class OddsPersistenceService {
     private String normalizeMarket(String market) {
         if (market == null) return "UNKNOWN";
         return switch (market.toLowerCase()) {
-            case "1x2", "match_result" -> "1X2";
+            case "1x2", "match_result" -> MARKET_1X2;
             case "half_time"           -> "half_time";
             case "asian_handicap"      -> "asian_handicap";
             case "correct_score"       -> "correct_score";

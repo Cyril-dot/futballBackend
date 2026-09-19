@@ -15,6 +15,12 @@ public interface OddsRepository extends JpaRepository<Odds, UUID> {
 
     List<Odds> findByMatchIdAndMarket(UUID matchId, String market);
 
+    // Cheap existence checks: no rows are loaded. Used by OddsPersistenceService
+    // to decide whether a match still needs odds generated.
+    boolean existsByMatchId(UUID matchId);
+
+    boolean existsByMatchIdAndMarket(UUID matchId, String market);
+
     // findFirst instead of findBy — prevents NonUniqueResultException if duplicates
     // ever exist. The unique constraint on (match_id, market, selection) ensures
     // there is always at most one row, but findFirst is defensive insurance.
