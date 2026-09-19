@@ -25,6 +25,14 @@ public class EspnFootballDataService {
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
     private static final DateTimeFormatter ESPN_DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
+    /**
+     * Private key stamped onto every event at fetch time. Holds the real competition
+     * name (e.g. "Championship"). Needed because ESPN's event.name is the FIXTURE
+     * ("Away at Home"), and the league name lives at response.leagues[0].name, which
+     * is otherwise discarded when only the events list is extracted.
+     */
+    public static final String COMPETITION_NAME_KEY = "_competitionName";
+
     public static final String STATE_PRE  = "pre";
     public static final String STATE_IN   = "in";
     public static final String STATE_POST = "post";
@@ -247,7 +255,7 @@ public class EspnFootballDataService {
         return cachedStd(cacheKey, () -> {
             log.info("ESPN getScoreboard({}): fetching today's scoreboard", league.displayName());
             Map<String, Object> raw = fetch(league.slug() + "/scoreboard");
-            List<Map<String, Object>> events = extractEvents(raw);
+            List<Map<String, Object>> events = extractEvents(raw, league.displayName());
             log.info("ESPN getScoreboard({}): {} event(s) returned", league.displayName(), events.size());
             return events;
         });
@@ -258,7 +266,7 @@ public class EspnFootballDataService {
         return cachedStd(cacheKey, () -> {
             log.info("ESPN getScoreboardByDate({}, {}): fetching", league.displayName(), yyyymmdd);
             Map<String, Object> raw = fetch(league.slug() + "/scoreboard?dates=" + yyyymmdd);
-            List<Map<String, Object>> events = extractEvents(raw);
+            List<Map<String, Object>> events = extractEvents(raw, league.displayName());
             log.info("ESPN getScoreboardByDate({}, {}): {} event(s)", league.displayName(), yyyymmdd, events.size());
             return events;
         });
@@ -269,7 +277,7 @@ public class EspnFootballDataService {
         return cachedLive(cacheKey, () -> {
             // Fetch fresh from ESPN — never read from stdCache for live state
             Map<String, Object> raw = fetch(league.slug() + "/scoreboard");
-            List<Map<String, Object>> all = extractEvents(raw);
+            List<Map<String, Object>> all = extractEvents(raw, league.displayName());
             List<Map<String, Object>> live = all.stream()
                     .filter(EspnFootballDataService::isLive)
                     .collect(Collectors.toList());
@@ -373,7 +381,8 @@ public class EspnFootballDataService {
             for (EspnLeague league : EspnLeague.values()) {
                 try {
                     // Always hit ESPN directly for live — never read stdCache
-                    List<Map<String, Object>> events = extractEvents(fetch(league.slug() + "/scoreboard"));
+                    List<Map<String, Object>> events =
+                            extractEvents(fetch(league.slug() + "/scoreboard"), league.displayName());
                     for (Map<String, Object> e : events) {
                         if (isLive(e)) all.add(e);
                     }
@@ -386,7 +395,8 @@ public class EspnFootballDataService {
             // tournaments, continental club comps, preseason/club friendlies, etc.) for live matches
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
-                    List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
+                    List<Map<String, Object>> events =
+                            extractEvents(fetch(cup.slug() + "/scoreboard"), cup.displayName());
                     for (Map<String, Object> e : events) {
                         if (isLive(e)) all.add(e);
                     }
@@ -408,7 +418,8 @@ public class EspnFootballDataService {
 
             for (EspnLeague league : EspnLeague.values()) {
                 try {
-                    List<Map<String, Object>> events = extractEvents(fetch(league.slug() + "/scoreboard"));
+                    List<Map<String, Object>> events =
+                            extractEvents(fetch(league.slug() + "/scoreboard"), league.displayName());
                     for (Map<String, Object> e : events) {
                         if (isUpcoming(e)) all.add(e);
                     }
@@ -421,7 +432,8 @@ public class EspnFootballDataService {
             // tournaments, continental club comps, preseason/club friendlies) for upcoming today
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
-                    List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
+                    List<Map<String, Object>> events =
+                            extractEvents(fetch(cup.slug() + "/scoreboard"), cup.displayName());
                     for (Map<String, Object> e : events) {
                         if (isUpcoming(e)) all.add(e);
                     }
@@ -443,7 +455,8 @@ public class EspnFootballDataService {
 
             for (EspnLeague league : EspnLeague.values()) {
                 try {
-                    List<Map<String, Object>> events = extractEvents(fetch(league.slug() + "/scoreboard"));
+                    List<Map<String, Object>> events =
+                            extractEvents(fetch(league.slug() + "/scoreboard"), league.displayName());
                     for (Map<String, Object> e : events) {
                         if (isFinished(e)) all.add(e);
                     }
@@ -457,7 +470,8 @@ public class EspnFootballDataService {
             // missing from this bucket even though the live/upcoming buckets included them.
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
-                    List<Map<String, Object>> events = extractEvents(fetch(cup.slug() + "/scoreboard"));
+                    List<Map<String, Object>> events =
+                            extractEvents(fetch(cup.slug() + "/scoreboard"), cup.displayName());
                     for (Map<String, Object> e : events) {
                         if (isFinished(e)) all.add(e);
                     }
@@ -495,7 +509,8 @@ public class EspnFootballDataService {
 
             for (EspnLeague league : EspnLeague.values()) {
                 try {
-                    all.addAll(extractEvents(fetch(league.slug() + "/scoreboard?dates=" + yyyymmdd)));
+                    all.addAll(extractEvents(
+                            fetch(league.slug() + "/scoreboard?dates=" + yyyymmdd), league.displayName()));
                 } catch (Exception e) {
                     log.warn("ESPN getAllUpcomingFixturesByDate({}): error fetching {} — {}",
                             yyyymmdd, league.displayName(), e.getMessage());
@@ -508,7 +523,8 @@ public class EspnFootballDataService {
             // club friendlies, etc.
             for (EspnCup cup : EspnCup.allCups()) {
                 try {
-                    all.addAll(extractEvents(fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd)));
+                    all.addAll(extractEvents(
+                            fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd), cup.displayName()));
                 } catch (Exception e) {
                     log.warn("ESPN getAllUpcomingFixturesByDate({}): error fetching cup {} — {}",
                             yyyymmdd, cup.displayName(), e.getMessage());
@@ -577,7 +593,7 @@ public class EspnFootballDataService {
         return cachedStd(cacheKey, () -> {
             log.info("ESPN getCupScoreboard({}): fetching today", cup.displayName());
             Map<String, Object> raw = fetch(cup.slug() + "/scoreboard");
-            List<Map<String, Object>> events = extractEvents(raw);
+            List<Map<String, Object>> events = extractEvents(raw, cup.displayName());
             log.info("ESPN getCupScoreboard({}): {} event(s)", cup.displayName(), events.size());
             return events;
         });
@@ -588,7 +604,7 @@ public class EspnFootballDataService {
         return cachedStd(cacheKey, () -> {
             log.info("ESPN getCupScoreboardByDate({}, {}): fetching", cup.displayName(), yyyymmdd);
             Map<String, Object> raw = fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd);
-            List<Map<String, Object>> events = extractEvents(raw);
+            List<Map<String, Object>> events = extractEvents(raw, cup.displayName());
             log.info("ESPN getCupScoreboardByDate({}, {}): {} event(s)", cup.displayName(), yyyymmdd, events.size());
             return events;
         });
@@ -599,7 +615,7 @@ public class EspnFootballDataService {
         return cachedLive(cacheKey, () -> {
             // Always hit ESPN directly for live state
             Map<String, Object> raw = fetch(cup.slug() + "/scoreboard");
-            List<Map<String, Object>> live = extractEvents(raw).stream()
+            List<Map<String, Object>> live = extractEvents(raw, cup.displayName()).stream()
                     .filter(EspnFootballDataService::isLive)
                     .collect(Collectors.toList());
             log.info("ESPN getCupLiveMatches({}): {} live", cup.displayName(), live.size());
@@ -1144,18 +1160,38 @@ public class EspnFootballDataService {
         return dateObj != null ? dateObj.toString() : null;
     }
 
+    /**
+     * Returns the real competition/league name for an event (e.g. "Championship").
+     *
+     * Resolution order:
+     *   1. The name stamped onto the event at fetch time (see extractEvents) — reliable,
+     *      and matches our EspnLeague/EspnCup display names used by downstream filters.
+     *   2. A league object nested inside the competition, if ESPN supplies one.
+     *   3. Empty string.
+     *
+     * Deliberately does NOT fall back to event.get("name"): that is the FIXTURE name
+     * ("Coventry City at Nottingham Forest"), and using it as the league poisoned every
+     * league filter, resolveEspnLeague lookup, and top-6 validation downstream.
+     * Returning "" is safe: the persistence layer only overwrites league when the
+     * incoming value is non-blank, so a blank can never clobber a good value.
+     */
     @SuppressWarnings("unchecked")
     public static String extractCompetitionName(Map<String, Object> event) {
         try {
+            // 1. Stamped at fetch time
+            Object stamped = event.get(COMPETITION_NAME_KEY);
+            if (stamped != null && !stamped.toString().isBlank()) return stamped.toString();
+
+            // 2. ESPN sometimes nests league info inside the competition
             Map<String, Object> comp = getFirstCompetition(event);
-            if (comp == null) return "";
-            Object leagues = comp.get("league");
-            if (leagues instanceof Map<?, ?> lMap) {
-                Object name = ((Map<String, Object>) lMap).get("name");
-                if (name != null && !name.toString().isBlank()) return name.toString();
+            if (comp != null) {
+                Object leagues = comp.get("league");
+                if (leagues instanceof Map<?, ?> lMap) {
+                    Object name = ((Map<String, Object>) lMap).get("name");
+                    if (name != null && !name.toString().isBlank()) return name.toString();
+                }
             }
-            Object name = event.get("name");
-            return name != null ? name.toString() : "";
+            return "";
         } catch (Exception e) {
             return "";
         }
@@ -1275,14 +1311,48 @@ public class EspnFootballDataService {
 
     // ── PRIVATE: RESPONSE EXTRACTION HELPERS ─────────────────────────────
 
+    /**
+     * Extracts events and stamps each one with the competition name so the real
+     * league survives downstream.
+     *
+     * ESPN puts the league name at response.leagues[0].name, NOT inside each event,
+     * and event.name is the fixture ("Away at Home"). Returning only the events list
+     * (as this method previously did) threw the league name away, so the poller had
+     * no way to recover it and fell back to the fixture name.
+     *
+     * OUR display name is preferred over ESPN's so the stored league always matches
+     * the EspnLeague/EspnCup display names that resolveEspnLeague, leagueIn and the
+     * top-6 validators compare against (ESPN says "English Premier League"; we say
+     * "Premier League").
+     *
+     * @param response     raw ESPN scoreboard response (may be null)
+     * @param displayName  our display name for the league/cup we requested (may be null)
+     */
     @SuppressWarnings("unchecked")
-    private List<Map<String, Object>> extractEvents(Map<String, Object> response) {
+    private List<Map<String, Object>> extractEvents(Map<String, Object> response, String displayName) {
         if (response == null) return Collections.emptyList();
         Object events = response.get("events");
-        if (events instanceof List<?> list && !list.isEmpty()) {
-            return (List<Map<String, Object>>) list;
+        if (!(events instanceof List<?> list) || list.isEmpty()) return Collections.emptyList();
+
+        // Prefer OUR display name; fall back to ESPN's own leagues[0].name
+        String competitionName = (displayName != null && !displayName.isBlank()) ? displayName : null;
+        if (competitionName == null) {
+            Object leagues = response.get("leagues");
+            if (leagues instanceof List<?> lList && !lList.isEmpty()
+                    && lList.get(0) instanceof Map<?, ?> lMap) {
+                Object n = ((Map<String, Object>) lMap).get("name");
+                if (n != null && !n.toString().isBlank()) competitionName = n.toString();
+            }
         }
-        return Collections.emptyList();
+
+        List<Map<String, Object>> out = (List<Map<String, Object>>) list;
+        if (competitionName != null) {
+            for (Map<String, Object> e : out) {
+                // Private key: never collides with ESPN's own fields
+                e.put(COMPETITION_NAME_KEY, competitionName);
+            }
+        }
+        return out;
     }
 
     @SuppressWarnings("unchecked")
