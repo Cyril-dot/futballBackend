@@ -15,11 +15,13 @@ import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 @Service
 @RequiredArgsConstructor
@@ -36,6 +38,12 @@ public class OddsPersistenceService {
 
     // ── Pre-match: saves all markets (1X2, HT, handicap, correct score) ──
 
+    /**
+     * Generates and saves all pre-match markets for a match.
+     * GUARANTEE: every match ends up with at least the 1X2 market. If any
+     * secondary generator fails, the others still save. If 1X2 itself
+     * produces nothing usable, it is regenerated with safe fallbacks.
+     */
     @Transactional
     public void generateAndSaveAllOdds(Match match) {
         String home    = match.getHomeTeam();
@@ -44,12 +52,35 @@ public class OddsPersistenceService {
         UUID   matchId = match.getId();
 
         List<Map<String, Object>> allOdds = new ArrayList<>();
-        allOdds.addAll(preMatchGenerator.generatePreMatchOdds(home, away, league));
-        allOdds.addAll(halfTimeGenerator.generateHalfTimeOdds(home, away, league));
-        allOdds.addAll(handicapGenerator.generateHandicapOdds(home, away, league));
-        allOdds.addAll(correctScoreGenerator.generateCorrectScoreOdds(home, away, league));
+
+        // 1X2 is the core market — always attempt it first
+        allOdds.addAll(safeGenerate("1x2", matchId,
+                () -> preMatchGenerator.generatePreMatchOdds(home, away, league)));
+
+        // Secondary markets — isolated so one failure doesn't lose the rest
+        allOdds.addAll(safeGenerate("half_time", matchId,
+                () -> halfTimeGenerator.generateHalfTimeOdds(home, away, league)));
+        allOdds.addAll(safeGenerate("handicap", matchId,
+                () -> handicapGenerator.generateHandicapOdds(home, away, league)));
+        allOdds.addAll(safeGenerate("correct_score", matchId,
+                () -> correctScoreGenerator.generateCorrectScoreOdds(home, away, league)));
 
         List<Odds> entities = toEntities(allOdds, matchId, home, away);
+
+        // Last-resort safety net: if nothing valid came out, force 1X2 again
+        if (entities.isEmpty()) {
+            log.warn("generateAndSaveAllOdds: matchId={} produced 0 valid rows — forcing 1X2 fallback", matchId);
+            entities = toEntities(
+                    preMatchGenerator.generatePreMatchOdds(home, away, league),
+                    matchId, home, away);
+        }
+
+        // Never wipe existing odds if we somehow still have nothing to replace them with
+        if (entities.isEmpty()) {
+            log.error("generateAndSaveAllOdds: matchId={} {} vs {} — could not generate any odds; keeping existing rows",
+                    matchId, home, away);
+            return;
+        }
 
         oddsRepository.deleteByMatchId(matchId);
         oddsRepository.flush();
@@ -57,6 +88,45 @@ public class OddsPersistenceService {
 
         log.info("generateAndSaveAllOdds: matchId={} {} vs {} — saved {} odds rows",
                 matchId, home, away, entities.size());
+    }
+
+    /**
+     * Generates odds ONLY if the match has none yet. Cheap to call repeatedly
+     * (e.g. after every fixture sync) — matches that already have odds are skipped.
+     *
+     * @return true if odds were generated, false if the match already had odds
+     */
+    @Transactional
+    public boolean ensureOddsForMatch(Match match) {
+        if (hasOdds(match.getId())) {
+            return false;
+        }
+        log.info("ensureOddsForMatch: matchId={} {} vs {} has no odds — generating",
+                match.getId(), match.getHomeTeam(), match.getAwayTeam());
+        generateAndSaveAllOdds(match);
+        return true;
+    }
+
+    /**
+     * Backfills odds for every match in the collection that has none.
+     * Call this after fetching/syncing fixtures so no game is left out.
+     * One bad match never stops the rest.
+     *
+     * @return number of matches that had odds generated
+     */
+    public int ensureOddsForAll(Collection<Match> matches) {
+        if (matches == null || matches.isEmpty()) return 0;
+
+        int generated = 0;
+        for (Match match : matches) {
+            try {
+                if (ensureOddsForMatch(match)) generated++;
+            } catch (Exception e) {
+                log.error("ensureOddsForAll: matchId={} failed — {}", match.getId(), e.getMessage(), e);
+            }
+        }
+        log.info("ensureOddsForAll: checked {} matches, generated odds for {}", matches.size(), generated);
+        return generated;
     }
 
     // ── Live: replaces only 1X2 + asian_handicap rows ────────────────────
@@ -71,10 +141,20 @@ public class OddsPersistenceService {
         UUID   matchId   = match.getId();
 
         List<Map<String, Object>> liveOdds = new ArrayList<>();
-        liveOdds.addAll(liveGenerator.generateLiveOdds(home, away, scoreHome, scoreAway, minute));
-        liveOdds.addAll(handicapGenerator.generateLiveHandicapOdds(home, away, scoreHome, scoreAway, minute));
+        liveOdds.addAll(safeGenerate("live_1x2", matchId,
+                () -> liveGenerator.generateLiveOdds(home, away, scoreHome, scoreAway, minute)));
+        liveOdds.addAll(safeGenerate("live_handicap", matchId,
+                () -> handicapGenerator.generateLiveHandicapOdds(home, away, scoreHome, scoreAway, minute)));
 
         List<Odds> entities = toEntities(liveOdds, matchId, home, away);
+
+        // Don't delete the existing live odds if we have nothing to replace them with
+        if (entities.isEmpty()) {
+            log.error("generateAndSaveLiveOdds: matchId={} — generated 0 rows; keeping existing odds", matchId);
+            // But make sure the match isn't left with NO odds at all
+            ensureOddsForMatch(match);
+            return;
+        }
 
         oddsRepository.deleteByMatchIdAndMarketIn(matchId, List.of("1X2", "asian_handicap"));
         oddsRepository.flush();
@@ -87,6 +167,28 @@ public class OddsPersistenceService {
     // ══════════════════════════════════════════════════════════════════════
     // HELPERS
     // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Runs a generator and never lets it throw or return null.
+     * A failing generator logs an error and contributes nothing, so the
+     * other markets still get saved.
+     */
+    private List<Map<String, Object>> safeGenerate(String label, UUID matchId,
+                                                   Supplier<List<Map<String, Object>>> generator) {
+        try {
+            List<Map<String, Object>> result = generator.get();
+            return result != null ? result : List.of();
+        } catch (Exception e) {
+            log.error("safeGenerate: matchId={} generator '{}' failed — {}",
+                    matchId, label, e.getMessage(), e);
+            return List.of();
+        }
+    }
+
+    /** True if the match already has at least one odds row. */
+    private boolean hasOdds(UUID matchId) {
+        return !oddsRepository.findByMatchId(matchId).isEmpty();
+    }
 
     private int extractMinute(Match match) {
         if (match.getMetadata() != null) {

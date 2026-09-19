@@ -24,6 +24,7 @@ import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -44,6 +45,9 @@ public class MatchService {
     private final HalfTimeOddsService         halfTimeOddsService;
     private final HandicapOddsService         handicapOddsService;
 
+    // ── Odds persistence (guarantees every saved game has odds in the DB) ─
+    private final OddsPersistenceService      oddsPersistenceService;
+
     // ── Live odds TTL ─────────────────────────────────────────────────────
     private static final long LIVE_ODDS_TTL_MS      = 2 * 60_000L;
     private static final int  LIVE_ODDS_MAX_ENTRIES  = 100;
@@ -51,6 +55,8 @@ public class MatchService {
     private static final int  PRE_MATCH_TTL_MINUTES  = 60;
 
     // ── Max matches to process in withOdds/withAllOdds ────────────────────
+    // NOTE: matches beyond this cap are NOT returned. Raise it (or remove the
+    // .limit(...) calls) if you want no game dropped from bundled responses.
     private static final int  MAX_ODDS_BUNDLE_SIZE   = 50;
 
     // ── Live odds caches (Caffeine — bounded + TTL) ───────────────────────
@@ -150,6 +156,93 @@ public class MatchService {
     private void clearCache(String name) {
         org.springframework.cache.Cache c = cacheManager.getCache(name);
         if (c != null) c.clear();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // NEVER-EMPTY ODDS HELPERS
+    // Every match, whatever its status, must always get odds.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Returns the list if non-empty, otherwise the fallback. */
+    private static List<Map<String, Object>> orElseGenerate(
+            List<Map<String, Object>> value,
+            Supplier<List<Map<String, Object>>> fallback) {
+        return (value != null && !value.isEmpty()) ? value : fallback.get();
+    }
+
+    /** Pre-match 1X2 — cached, never empty (generator itself is null-safe). */
+    private List<Map<String, Object>> preMatch1X2(Match match) {
+        return preMatchOddsCache.get(match.getId(), id -> orElseGenerate(
+                null,
+                () -> oddsGeneratorService.generatePreMatchOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague())));
+    }
+
+    /** Pre-match handicap — cached, exceptions never propagate. */
+    private List<Map<String, Object>> preMatchHandicap(Match match) {
+        return preMatchHandicapCache.get(match.getId(), id -> {
+            List<Map<String, Object>> h = null;
+            try {
+                h = handicapOddsService.generateHandicapOdds(
+                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+            } catch (Exception e) {
+                log.warn("preMatchHandicap: matchId={} failed — {}", match.getId(), e.getMessage());
+            }
+            return h != null ? h : List.of();
+        });
+    }
+
+    /**
+     * Live 1X2 that is never empty: cache → live generator → pre-match generator.
+     * An empty result is never cached.
+     */
+    private List<Map<String, Object>> live1X2(Match match) {
+        OddsCacheEntry cached = liveOddsCache.getIfPresent(match.getId());
+        if (cached != null && cached.isValid() && !cached.odds().isEmpty()) return cached.odds();
+
+        int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
+        int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
+        int minute    = extractMinute(match);
+
+        List<Map<String, Object>> live = null;
+        try {
+            live = liveOddsGeneratorService.generateLiveOdds(
+                    match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
+        } catch (Exception e) {
+            log.warn("live1X2: matchId={} live generator failed — {}", match.getId(), e.getMessage());
+        }
+        if (live != null && !live.isEmpty()) {
+            cacheLiveOdds(match.getId(), live);
+            return live;
+        }
+        // Fall back to pre-match odds (deliberately not cached as live)
+        return oddsGeneratorService.generatePreMatchOdds(
+                match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+    }
+
+    /** Live handicap — never cached empty, falls back to pre-match handicap. */
+    private List<Map<String, Object>> liveHandicap(Match match) {
+        OddsCacheEntry cached = liveHandicapCache.getIfPresent(match.getId());
+        if (cached != null && cached.isValid() && !cached.odds().isEmpty()) return cached.odds();
+
+        int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
+        int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
+        int minute    = extractMinute(match);
+
+        List<Map<String, Object>> live = null;
+        try {
+            live = handicapOddsService.generateLiveHandicapOdds(
+                    match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
+        } catch (Exception e) {
+            log.warn("liveHandicap: matchId={} live generator failed — {}", match.getId(), e.getMessage());
+        }
+        if (live != null && !live.isEmpty()) {
+            cacheLiveHandicapOdds(match.getId(), live);
+            return live;
+        }
+        List<Map<String, Object>> fallback = handicapOddsService.generateHandicapOdds(
+                match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
+        return fallback != null ? fallback : List.of();
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -533,6 +626,7 @@ public class MatchService {
 
     // ══════════════════════════════════════════════════════════════════════
     // LIST + ODDS BUNDLES
+    // Every match in the bundle ALWAYS gets odds, regardless of status.
     // ══════════════════════════════════════════════════════════════════════
 
     public List<Map<String, Object>> withOdds(List<Match> matches) {
@@ -541,28 +635,17 @@ public class MatchService {
                 .sorted(LOGO_THEN_KICKOFF)
                 .limit(MAX_ODDS_BUNDLE_SIZE)
                 .toList();
+        if (matches.size() > MAX_ODDS_BUNDLE_SIZE) {
+            log.warn("withOdds: input has {} matches but cap is {} — {} match(es) NOT returned",
+                    matches.size(), MAX_ODDS_BUNDLE_SIZE, matches.size() - MAX_ODDS_BUNDLE_SIZE);
+        }
         log.debug("withOdds: bundling odds for {} match(es) (input={}, cap={})",
                 sorted.size(), matches.size(), MAX_ODDS_BUNDLE_SIZE);
         List<Map<String, Object>> out = new ArrayList<>(sorted.size());
         for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("match", match);
-            String status = match.getStatus();
-            if ("LIVE".equals(status)) {
-                OddsCacheEntry cached = liveOddsCache.getIfPresent(match.getId());
-                if (cached != null && cached.isValid()) {
-                    entry.put("odds", cached.odds());
-                } else {
-                    entry.put("odds", oddsGeneratorService.generatePreMatchOdds(
-                            match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-                }
-            } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-                entry.put("odds", preMatchOddsCache.get(match.getId(), id ->
-                        oddsGeneratorService.generatePreMatchOdds(
-                                match.getHomeTeam(), match.getAwayTeam(), match.getLeague())));
-            } else {
-                entry.put("odds", List.of());
-            }
+            entry.put("odds", "LIVE".equals(match.getStatus()) ? live1X2(match) : preMatch1X2(match));
             out.add(entry);
         }
         log.debug("withOdds: bundled {} entries", out.size());
@@ -575,39 +658,19 @@ public class MatchService {
                 .sorted(LOGO_THEN_KICKOFF)
                 .limit(MAX_ODDS_BUNDLE_SIZE)
                 .toList();
+        if (matches.size() > MAX_ODDS_BUNDLE_SIZE) {
+            log.warn("withAllOdds: input has {} matches but cap is {} — {} match(es) NOT returned",
+                    matches.size(), MAX_ODDS_BUNDLE_SIZE, matches.size() - MAX_ODDS_BUNDLE_SIZE);
+        }
         log.debug("withAllOdds: bundling all markets for {} match(es) (input={}, cap={})",
                 sorted.size(), matches.size(), MAX_ODDS_BUNDLE_SIZE);
         List<Map<String, Object>> out = new ArrayList<>(sorted.size());
         for (Match match : sorted) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("match", match);
-            String status = match.getStatus();
-            if ("LIVE".equals(status)) {
-                OddsCacheEntry oddsEntry     = liveOddsCache.getIfPresent(match.getId());
-                OddsCacheEntry handicapEntry = liveHandicapCache.getIfPresent(match.getId());
-                List<Map<String, Object>> matchResult = (oddsEntry != null && oddsEntry.isValid())
-                        ? oddsEntry.odds()
-                        : oddsGeneratorService.generatePreMatchOdds(
-                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
-                List<Map<String, Object>> asianHandicap = (handicapEntry != null && handicapEntry.isValid())
-                        ? handicapEntry.odds()
-                        : handicapOddsService.generateHandicapOdds(
-                        match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
-                entry.put("match_result",   matchResult);
-                entry.put("asian_handicap", asianHandicap);
-            } else if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-                List<Map<String, Object>> matchResult = preMatchOddsCache.get(
-                        match.getId(), id -> oddsGeneratorService.generatePreMatchOdds(
-                                match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-                List<Map<String, Object>> asianHandicap = preMatchHandicapCache.get(
-                        match.getId(), id -> handicapOddsService.generateHandicapOdds(
-                                match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-                entry.put("match_result",   matchResult);
-                entry.put("asian_handicap", asianHandicap);
-            } else {
-                entry.put("match_result",   List.of());
-                entry.put("asian_handicap", List.of());
-            }
+            boolean live = "LIVE".equals(match.getStatus());
+            entry.put("match_result",   live ? live1X2(match)      : preMatch1X2(match));
+            entry.put("asian_handicap", live ? liveHandicap(match) : preMatchHandicap(match));
             out.add(entry);
         }
         log.debug("withAllOdds: bundled {} entries", out.size());
@@ -628,16 +691,25 @@ public class MatchService {
             try {
                 List<Map<String, Object>> liveOdds = liveOddsGeneratorService.generateLiveOdds(
                         match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
-                cacheLiveOdds(match.getId(), liveOdds);
-                refreshed1X2++;
+                // Never cache an empty list — live1X2() will fall back to pre-match odds instead
+                if (liveOdds != null && !liveOdds.isEmpty()) {
+                    cacheLiveOdds(match.getId(), liveOdds);
+                    refreshed1X2++;
+                } else {
+                    log.warn("refreshLiveOddsCache [1X2]: matchId={} generator returned empty — not caching", match.getId());
+                }
             } catch (Exception e) {
                 log.warn("refreshLiveOddsCache [1X2]: matchId={} failed — {}", match.getId(), e.getMessage());
             }
             try {
                 List<Map<String, Object>> liveHandicap = handicapOddsService.generateLiveHandicapOdds(
                         match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
-                cacheLiveHandicapOdds(match.getId(), liveHandicap);
-                refreshedHandicap++;
+                if (liveHandicap != null && !liveHandicap.isEmpty()) {
+                    cacheLiveHandicapOdds(match.getId(), liveHandicap);
+                    refreshedHandicap++;
+                } else {
+                    log.warn("refreshLiveOddsCache [Handicap]: matchId={} generator returned empty — not caching", match.getId());
+                }
             } catch (Exception e) {
                 log.warn("refreshLiveOddsCache [Handicap]: matchId={} failed — {}", match.getId(), e.getMessage());
             }
@@ -666,24 +738,7 @@ public class MatchService {
 
     public List<Map<String, Object>> getMatchOdds(String id) {
         Match match = getById(id);
-        String status = match.getStatus();
-        if ("LIVE".equals(status)) {
-            OddsCacheEntry cached = liveOddsCache.getIfPresent(match.getId());
-            if (cached != null && cached.isValid()) return cached.odds();
-            int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
-            int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
-            int minute    = extractMinute(match);
-            List<Map<String, Object>> generated = liveOddsGeneratorService.generateLiveOdds(
-                    match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
-            cacheLiveOdds(match.getId(), generated);
-            return generated;
-        }
-        if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-            return preMatchOddsCache.get(match.getId(), id2 ->
-                    oddsGeneratorService.generatePreMatchOdds(
-                            match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-        }
-        return List.of();
+        return "LIVE".equals(match.getStatus()) ? live1X2(match) : preMatch1X2(match);
     }
 
     public List<Map<String, Object>> getCorrectScoreOdds(String id) {
@@ -700,7 +755,7 @@ public class MatchService {
             int minute    = extractMinute(match);
             List<Map<String, Object>> liveHt = halfTimeOddsService.generateLiveHalfTimeOdds(
                     match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
-            if (!liveHt.isEmpty()) return liveHt;
+            if (liveHt != null && !liveHt.isEmpty()) return liveHt;
         }
         return halfTimeOddsService.generateHalfTimeOdds(
                 match.getHomeTeam(), match.getAwayTeam(), match.getLeague());
@@ -708,24 +763,7 @@ public class MatchService {
 
     public List<Map<String, Object>> getHandicapOdds(String id) {
         Match match = getById(id);
-        String status = match.getStatus();
-        if ("LIVE".equals(status)) {
-            OddsCacheEntry cached = liveHandicapCache.getIfPresent(match.getId());
-            if (cached != null && cached.isValid()) return cached.odds();
-            int scoreHome = match.getScoreHome() != null ? match.getScoreHome() : 0;
-            int scoreAway = match.getScoreAway() != null ? match.getScoreAway() : 0;
-            int minute    = extractMinute(match);
-            List<Map<String, Object>> generated = handicapOddsService.generateLiveHandicapOdds(
-                    match.getHomeTeam(), match.getAwayTeam(), scoreHome, scoreAway, minute);
-            cacheLiveHandicapOdds(match.getId(), generated);
-            return generated;
-        }
-        if ("UPCOMING".equals(status) || "SCHEDULED".equals(status)) {
-            return preMatchHandicapCache.get(match.getId(), id2 ->
-                    handicapOddsService.generateHandicapOdds(
-                            match.getHomeTeam(), match.getAwayTeam(), match.getLeague()));
-        }
-        return List.of();
+        return "LIVE".equals(match.getStatus()) ? liveHandicap(match) : preMatchHandicap(match);
     }
 
     public Map<String, Object> getAllOddsForMatch(String id) {
@@ -737,8 +775,15 @@ public class MatchService {
         return result;
     }
 
+    /**
+     * Returns stored odds rows for a match. If the match has no 1X2 row yet,
+     * odds are generated and persisted first, so a game is never returned bare.
+     */
+    @Transactional
     public List<Odds> getOddsForMatch(String id) {
-        return oddsRepo.findByMatchId(toUuid(id));
+        Match match = getById(id);
+        oddsPersistenceService.ensureOddsForMatch(match); // no-op if 1X2 already stored
+        return oddsRepo.findByMatchId(match.getId());
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -1043,12 +1088,9 @@ public class MatchService {
         return schedule;
     }
 
-
-
     public List<Match> getSettledFinished() {
         return matchRepo.findSettledFinished();
     }
-
 
     // ══════════════════════════════════════════════════════════════════════
     // STANDINGS / SCORERS
@@ -1192,6 +1234,16 @@ public class MatchService {
         boolean evictFeatured = match.isFeatured(); // FIX: was getFeatured() — Lombok generates isFeatured() for boolean
 
         Match saved = doSaveOrUpdate(match);
+
+        // Guarantee: every saved game has odds in the DB.
+        // ensureOddsForMatch is a cheap no-op when the match already has 1X2 odds.
+        try {
+            oddsPersistenceService.ensureOddsForMatch(saved);
+        } catch (Exception e) {
+            // Never let an odds problem block saving the match itself
+            log.error("saveOrUpdate: odds backfill failed for matchId={} — {}",
+                    saved.getId(), e.getMessage(), e);
+        }
 
         if (evictToday || evictFeatured) {
             log.debug("saveOrUpdate: evicting relevant caches for matchId={} today={} featured={}",
