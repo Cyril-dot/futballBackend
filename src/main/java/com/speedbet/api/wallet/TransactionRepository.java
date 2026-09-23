@@ -113,6 +113,28 @@ public interface TransactionRepository
         """)
     List<DepositRow> findDepositsByAdminSince(@Param("adminId") UUID adminId, @Param("since") Instant since);
 
+    @Query("""
+        SELECT new com.speedbet.api.wallet.AdminDepositRow(
+            t.createdAt, u.id, u.email, u.firstName, u.lastName, u.country, t.amount
+        )
+        FROM Transaction t, Wallet w, com.speedbet.api.user.User u,
+             com.speedbet.api.referral.Referral r, com.speedbet.api.referral.ReferralLink rl
+        WHERE t.walletId = w.id
+          AND w.userId = u.id
+          AND r.userId = u.id
+          AND rl.id = r.linkId
+          AND rl.adminId = :adminId
+          AND t.kind = com.speedbet.api.wallet.TxKind.DEPOSIT
+          AND t.status = 'COMPLETED'
+          AND t.createdAt >= :since
+          AND t.createdAt < :until
+        ORDER BY t.createdAt ASC
+        """)
+    List<AdminDepositRow> findAdminDepositsBetween(
+            @Param("adminId") UUID adminId,
+            @Param("since") Instant since,
+            @Param("until") Instant until);
+
     // ── NEW: added for daily total-deposit-volume admin dashboard stat ─────────
     //
     // Covers every deposit source in one query: BankDeposit and BinanceDeposit

@@ -6,7 +6,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
+import java.util.UUID;
 import java.util.List;
+import org.springframework.format.annotation.DateTimeFormat;
 
 /**
  * Mapped under both the hyphenated path the frontend uses and the legacy
@@ -23,6 +26,39 @@ public class SuperAdminCommissionController {
 
     private final SuperAdminCommissionService commissionService;
     private final SuperAdminCountryReportService countryReportService;
+    private final SuperAdminCommissionOperationsService operationsService;
+
+    /**
+     * Daily commission and referred-deposit detail. If adminId is supplied,
+     * the response contains only that admin; otherwise it contains all admins.
+     * Date is UTC and defaults to today.
+     */
+    @GetMapping("/daily")
+    public ResponseEntity<ApiResponse<List<SuperAdminCommissionOperationsDtos.DailyAdminCommissionDto>>> daily(
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam(required = false) UUID adminId) {
+        return ResponseEntity.ok(ApiResponse.ok(operationsService.daily(date, adminId)));
+    }
+
+    @GetMapping("/daily/{adminId}")
+    public ResponseEntity<ApiResponse<List<SuperAdminCommissionOperationsDtos.DailyAdminCommissionDto>>> dailyForAdmin(
+            @PathVariable UUID adminId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return ResponseEntity.ok(ApiResponse.ok(operationsService.daily(date, adminId)));
+    }
+
+    /** Mark the admin's current commission balance as paid, without requiring an admin request. */
+    @PostMapping("/admins/{adminId}/pay")
+    public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.CommissionPayoutDto>> markPaid(
+            @PathVariable UUID adminId) {
+        return ResponseEntity.ok(ApiResponse.ok(operationsService.markPaid(adminId), "Commission marked as paid"));
+    }
+
+    /** Sweep every positive commission balance to zero after external payout. */
+    @PostMapping("/clear")
+    public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.ClearCommissionResult>> clearAll() {
+        return ResponseEntity.ok(ApiResponse.ok(operationsService.clearAll(), "All commission balances cleared"));
+    }
 
     // ─── Per-admin (legacy shape) ───────────────────────────────────────────
 
