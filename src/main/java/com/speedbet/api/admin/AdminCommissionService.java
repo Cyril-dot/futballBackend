@@ -46,7 +46,7 @@ public class AdminCommissionService {
         Instant until = reportDate.plusDays(1).atStartOfDay(REPORT_ZONE).toInstant();
 
         var ledger = ledgerRepo.findByAdminIdSince(adminId, from).stream()
-                .filter(e -> e.getCreatedAt() != null && e.getCreatedAt().isBefore(until)).toList();
+                .filter(e -> e.getCreatedAt() != null && e.getCreatedAt().isBefore(until) && e.getPaidAt() == null).toList();
         BigDecimal commission = ledger.stream().map(CommissionLedgerEntry::getAmount)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
         String currency = ledger.stream().map(CommissionLedgerEntry::getCurrency)

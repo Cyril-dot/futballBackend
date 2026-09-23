@@ -65,7 +65,8 @@ public class SuperAdminCommissionOperationsService {
                     .filter(d -> d.createdAt() != null && !d.createdAt().isBefore(from) && d.createdAt().isBefore(to))
                     .toList();
             List<CommissionLedgerEntry> ledger = ledgerRepo.findByAdminIdSince(admin.getId(), from).stream()
-                    .filter(e -> e.getCreatedAt() != null && !e.getCreatedAt().isBefore(from) && e.getCreatedAt().isBefore(to))
+                    .filter(e -> e.getCreatedAt() != null && !e.getCreatedAt().isBefore(from)
+                            && e.getCreatedAt().isBefore(to) && e.getPaidAt() == null)
                     .toList();
             AffiliateCommissionBalance balance = balances.get(admin.getId());
             String currency = ledger.stream().map(CommissionLedgerEntry::getCurrency).filter(Objects::nonNull)
@@ -84,51 +85,69 @@ public class SuperAdminCommissionOperationsService {
     }
 
     @Transactional
-    public SuperAdminCommissionOperationsDtos.CommissionPayoutDto markPaid(UUID adminId) {
-        User admin = getAdmin(adminId);
-        AffiliateCommissionBalance balance = balanceRepo.findByUserIdForUpdate(adminId)
-                .orElseThrow(() -> new IllegalArgumentException("Commission balance not found for admin: " + adminId));
-        BigDecimal amount = balance.getBalance();
-        if (amount.compareTo(BigDecimal.ZERO) <= 0)
-            throw new IllegalArgumentException("Admin has no unpaid commission balance");
-
-        BigDecimal paid = commissionService.sweepCommissionBalance(adminId);
-        String reference = "MANUAL-COMM-PAYOUT-" + adminId.toString().substring(0, 8).toUpperCase(Locale.ROOT)
-                + "-" + Instant.now().toEpochMilli();
-        AffiliateWithdrawalRequest payout = withdrawalRepo.save(AffiliateWithdrawalRequest.builder()
-                .userId(adminId).amount(paid).currency(balance.getCurrency())
-                .status(AffiliateWithdrawalStatus.PROCESSED).reference(reference)
-                .requestedAt(Instant.now()).processedAt(Instant.now()).build());
-        walletService.recordExternalDebit(adminId, paid, TxKind.AFFILIATE_COMMISSION_PAYOUT, reference,
-                Map.of("type", "manual_affiliate_commission_payout", "paidBy", "SUPER_ADMIN",
-                        "withdrawalRequestId", payout.getId().toString()));
-        return new SuperAdminCommissionOperationsDtos.CommissionPayoutDto(
-                payout.getId(), adminId, admin.getEmail(), paid, balance.getCurrency(), reference,
-                payout.getStatus().name(), payout.getProcessedAt());
+    public SuperAdminCommissionOperationsDtos.CommissionPayoutDto markPaid(UUID adminId, LocalDate date) {
+        return settleOne(getAdmin(adminId), date == null ? LocalDate.now(REPORT_ZONE) : date);
     }
 
     @Transactional
-    public SuperAdminCommissionOperationsDtos.ClearCommissionResult clearAll() {
+    public SuperAdminCommissionOperationsDtos.ClearCommissionResult clearAll(LocalDate date) {
+        LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;
         Instant clearedAt = Instant.now();
-        List<AffiliateCommissionBalance> balances = balanceRepo.findAllWithPositiveBalance();
         BigDecimal total = BigDecimal.ZERO;
         List<UUID> ids = new ArrayList<>();
-        for (AffiliateCommissionBalance balance : balances) {
-            BigDecimal paid = balance.getBalance();
-            total = total.add(paid);
-            ids.add(balance.getUserId());
-            commissionService.sweepCommissionBalance(balance.getUserId());
-            String reference = "MANUAL-COMM-CLEAR-" + balance.getUserId().toString().substring(0, 8).toUpperCase(Locale.ROOT)
-                    + "-" + clearedAt.toEpochMilli();
-            AffiliateWithdrawalRequest payout = withdrawalRepo.save(AffiliateWithdrawalRequest.builder()
-                    .userId(balance.getUserId()).amount(paid).currency(balance.getCurrency())
-                    .status(AffiliateWithdrawalStatus.PROCESSED).reference(reference)
-                    .requestedAt(clearedAt).processedAt(clearedAt).build());
-            walletService.recordExternalDebit(balance.getUserId(), paid, TxKind.AFFILIATE_COMMISSION_PAYOUT,
-                    reference, Map.of("type", "manual_affiliate_commission_clear", "paidBy", "SUPER_ADMIN",
-                            "withdrawalRequestId", payout.getId().toString()));
+        for (User admin : userRepo.findAllByRole(UserRole.ADMIN)) {
+            List<CommissionLedgerEntry> unpaid = unpaidEntries(admin.getId(), reportDate);
+            BigDecimal amount = sum(unpaid);
+            if (amount.compareTo(BigDecimal.ZERO) <= 0) continue;
+            settleOne(admin, reportDate);
+            total = total.add(amount);
+            ids.add(admin.getId());
         }
         return new SuperAdminCommissionOperationsDtos.ClearCommissionResult(ids.size(), total, ids, clearedAt);
+    }
+
+    private SuperAdminCommissionOperationsDtos.CommissionPayoutDto settleOne(User admin, LocalDate reportDate) {
+        List<CommissionLedgerEntry> entries = unpaidEntries(admin.getId(), reportDate);
+        BigDecimal amount = sum(entries);
+        if (amount.compareTo(BigDecimal.ZERO) <= 0)
+            throw new IllegalArgumentException("Admin has no unpaid commission for " + reportDate);
+
+        AffiliateCommissionBalance balance = balanceRepo.findByUserIdForUpdate(admin.getId())
+                .orElseThrow(() -> new IllegalArgumentException("Commission balance not found for admin: " + admin.getId()));
+        if (balance.getBalance().compareTo(amount) < 0)
+            throw new IllegalStateException("Commission balance is lower than the selected day's unpaid commission");
+
+        Instant paidAt = Instant.now();
+        entries.forEach(entry -> entry.setPaidAt(paidAt));
+        ledgerRepo.saveAll(entries);
+        balance.setBalance(balance.getBalance().subtract(amount));
+        balance.setTotalPaidOutLifetime(balance.getTotalPaidOutLifetime().add(amount));
+        balance.setLastPayoutAt(paidAt);
+        balanceRepo.save(balance);
+
+        String reference = "MANUAL-COMM-PAYOUT-" + admin.getId().toString().substring(0, 8).toUpperCase(Locale.ROOT)
+                + "-" + reportDate + "-" + paidAt.toEpochMilli();
+        AffiliateWithdrawalRequest payout = withdrawalRepo.save(AffiliateWithdrawalRequest.builder()
+                .userId(admin.getId()).amount(amount).currency(balance.getCurrency())
+                .status(AffiliateWithdrawalStatus.PROCESSED).reference(reference)
+                .requestedAt(paidAt).processedAt(paidAt).build());
+        walletService.recordExternalDebit(admin.getId(), amount, TxKind.AFFILIATE_COMMISSION_PAYOUT, reference,
+                Map.of("type", "manual_affiliate_commission_payout", "paidBy", "SUPER_ADMIN",
+                        "commissionDate", reportDate.toString(), "withdrawalRequestId", payout.getId().toString()));
+        return new SuperAdminCommissionOperationsDtos.CommissionPayoutDto(
+                payout.getId(), admin.getId(), admin.getEmail(), amount, balance.getCurrency(), reference,
+                payout.getStatus().name(), payout.getProcessedAt());
+    }
+
+    private List<CommissionLedgerEntry> unpaidEntries(UUID adminId, LocalDate date) {
+        Instant from = date.atStartOfDay(REPORT_ZONE).toInstant();
+        Instant to = date.plusDays(1).atStartOfDay(REPORT_ZONE).toInstant();
+        return ledgerRepo.findUnpaidByAdminIdBetween(adminId, from, to);
+    }
+
+    private BigDecimal sum(List<CommissionLedgerEntry> entries) {
+        return entries.stream().map(CommissionLedgerEntry::getAmount).filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
     private User getAdmin(UUID adminId) {

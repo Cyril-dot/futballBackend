@@ -47,17 +47,19 @@ public class SuperAdminCommissionController {
         return ResponseEntity.ok(ApiResponse.ok(operationsService.daily(date, adminId)));
     }
 
-    /** Mark the admin's current commission balance as paid, without requiring an admin request. */
+    /** Mark one UTC commission day as paid, without requiring an admin request. */
     @PostMapping("/admins/{adminId}/pay")
     public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.CommissionPayoutDto>> markPaid(
-            @PathVariable UUID adminId) {
-        return ResponseEntity.ok(ApiResponse.ok(operationsService.markPaid(adminId), "Commission marked as paid"));
+            @PathVariable UUID adminId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return ResponseEntity.ok(ApiResponse.ok(operationsService.markPaid(adminId, date), "Commission day marked as paid"));
     }
 
-    /** Sweep every positive commission balance to zero after external payout. */
+    /** Pay and clear unpaid commission entries for one UTC day across all admins. */
     @PostMapping("/clear")
-    public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.ClearCommissionResult>> clearAll() {
-        return ResponseEntity.ok(ApiResponse.ok(operationsService.clearAll(), "All commission balances cleared"));
+    public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.ClearCommissionResult>> clearAll(
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        return ResponseEntity.ok(ApiResponse.ok(operationsService.clearAll(date), "Commission day cleared"));
     }
 
     // ─── Per-admin (legacy shape) ───────────────────────────────────────────
