@@ -16,6 +16,7 @@ import com.speedbet.api.user.UserRole;
 import com.speedbet.api.wallet.DepositRow;
 import com.speedbet.api.wallet.TransactionRepository;
 import com.speedbet.api.wallet.TxKind;
+import com.speedbet.api.wallet.WalletRepository;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -39,6 +40,7 @@ public class SuperAdminCommissionOperationsService {
     private final AffiliateCommissionService commissionService;
     private final AffiliateWithdrawalRepository withdrawalRepo;
     private final TransactionRepository transactionRepo;
+    private final WalletRepository walletRepo;
     private final WalletService walletService;
     private final CommissionLedgerEntryRepository ledgerRepo;
 
@@ -131,9 +133,11 @@ public class SuperAdminCommissionOperationsService {
                 .userId(admin.getId()).amount(amount).currency(balance.getCurrency())
                 .status(AffiliateWithdrawalStatus.PROCESSED).reference(reference)
                 .requestedAt(paidAt).processedAt(paidAt).build());
-        walletService.recordExternalDebit(admin.getId(), amount, TxKind.AFFILIATE_COMMISSION_PAYOUT, reference,
-                Map.of("type", "manual_affiliate_commission_payout", "paidBy", "SUPER_ADMIN",
-                        "commissionDate", reportDate.toString(), "withdrawalRequestId", payout.getId().toString()));
+        if (walletRepo.findByUserId(admin.getId()).isPresent()) {
+            walletService.recordExternalDebit(admin.getId(), amount, TxKind.AFFILIATE_COMMISSION_PAYOUT, reference,
+                    Map.of("type", "manual_affiliate_commission_payout", "paidBy", "SUPER_ADMIN",
+                            "commissionDate", reportDate.toString(), "withdrawalRequestId", payout.getId().toString()));
+        }
         return new SuperAdminCommissionOperationsDtos.CommissionPayoutDto(
                 payout.getId(), admin.getId(), admin.getEmail(), amount, balance.getCurrency(), reference,
                 payout.getStatus().name(), payout.getProcessedAt());
