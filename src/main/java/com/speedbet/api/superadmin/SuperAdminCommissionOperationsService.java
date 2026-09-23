@@ -19,6 +19,7 @@ import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletRepository;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,6 +32,7 @@ import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class SuperAdminCommissionOperationsService {
     private static final ZoneOffset REPORT_ZONE = ZoneOffset.UTC;
 
@@ -88,34 +90,50 @@ public class SuperAdminCommissionOperationsService {
 
     @Transactional
     public SuperAdminCommissionOperationsDtos.CommissionPayoutDto markPaid(UUID adminId, LocalDate date) {
-        return settleOne(getAdmin(adminId), date == null ? LocalDate.now(REPORT_ZONE) : date);
+        LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;
+        String operationId = UUID.randomUUID().toString();
+        log.info("commission.pay.start operationId={} adminId={} date={}", operationId, adminId, reportDate);
+        try {
+            var result = settleOne(getAdmin(adminId), reportDate, operationId);
+            log.info("commission.pay.success operationId={} adminId={} date={} amount={}", operationId, adminId, reportDate, result.amount());
+            return result;
+        } catch (RuntimeException ex) {
+            log.error("commission.pay.failed operationId={} adminId={} date={} type={} message={}", operationId, adminId, reportDate, ex.getClass().getSimpleName(), ex.getMessage(), ex);
+            throw ex;
+        }
     }
 
     @Transactional
     public SuperAdminCommissionOperationsDtos.ClearCommissionResult clearAll(LocalDate date) {
         LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;
         Instant clearedAt = Instant.now();
+        String operationId = UUID.randomUUID().toString();
+        log.info("commission.clear.start operationId={} date={}", operationId, reportDate);
         BigDecimal total = BigDecimal.ZERO;
         List<UUID> ids = new ArrayList<>();
         for (User admin : userRepo.findAllByRole(UserRole.ADMIN)) {
             List<CommissionLedgerEntry> unpaid = unpaidEntries(admin.getId(), reportDate);
             BigDecimal amount = sum(unpaid);
             if (amount.compareTo(BigDecimal.ZERO) <= 0) continue;
-            settleOne(admin, reportDate);
+            settleOne(admin, reportDate, operationId);
+            log.info("commission.clear.admin-success operationId={} adminId={} date={} amount={}", operationId, admin.getId(), reportDate, amount);
             total = total.add(amount);
             ids.add(admin.getId());
         }
+        log.info("commission.clear.success operationId={} date={} admins={} amount={}", operationId, reportDate, ids.size(), total);
         return new SuperAdminCommissionOperationsDtos.ClearCommissionResult(ids.size(), total, ids, clearedAt);
     }
 
-    private SuperAdminCommissionOperationsDtos.CommissionPayoutDto settleOne(User admin, LocalDate reportDate) {
+    private SuperAdminCommissionOperationsDtos.CommissionPayoutDto settleOne(User admin, LocalDate reportDate, String operationId) {
         List<CommissionLedgerEntry> entries = unpaidEntries(admin.getId(), reportDate);
         BigDecimal amount = sum(entries);
+        log.info("commission.settle.inspect operationId={} adminId={} date={} entries={} amount={}", operationId, admin.getId(), reportDate, entries.size(), amount);
         if (amount.compareTo(BigDecimal.ZERO) <= 0)
             throw new IllegalArgumentException("Admin has no unpaid commission for " + reportDate);
 
         AffiliateCommissionBalance balance = balanceRepo.findByUserIdForUpdate(admin.getId())
                 .orElseThrow(() -> new IllegalArgumentException("Commission balance not found for admin: " + admin.getId()));
+        log.info("commission.settle.balance operationId={} adminId={} balance={} selectedAmount={} walletPresent={}", operationId, admin.getId(), balance.getBalance(), amount, walletRepo.findByUserId(admin.getId()).isPresent());
         if (balance.getBalance().compareTo(amount) < 0)
             throw new IllegalStateException("Commission balance is lower than the selected day's unpaid commission");
 

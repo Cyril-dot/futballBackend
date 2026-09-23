@@ -2,6 +2,8 @@ package com.speedbet.api.superadmin;
 
 import com.speedbet.api.common.ApiResponse;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
@@ -22,6 +24,7 @@ import org.springframework.format.annotation.DateTimeFormat;
 })
 @PreAuthorize("hasRole('SUPER_ADMIN')")
 @RequiredArgsConstructor
+@Slf4j
 public class SuperAdminCommissionController {
 
     private final SuperAdminCommissionService commissionService;
@@ -52,14 +55,33 @@ public class SuperAdminCommissionController {
     public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.CommissionPayoutDto>> markPaid(
             @PathVariable UUID adminId,
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
-        return ResponseEntity.ok(ApiResponse.ok(operationsService.markPaid(adminId, date), "Commission day marked as paid"));
+        String operationId = UUID.randomUUID().toString();
+        try {
+            return ResponseEntity.ok(ApiResponse.ok(operationsService.markPaid(adminId, date), "Commission day marked as paid"));
+        } catch (RuntimeException ex) {
+            log.error("commission.pay.http-failed operationId={} adminId={} date={} type={} message={}", operationId, adminId, date, ex.getClass().getSimpleName(), ex.getMessage(), ex);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(ApiResponse.error("Commission payout failed. operationId=" + operationId + " reason=" + safeMessage(ex)));
+        }
     }
 
     /** Pay and clear unpaid commission entries for one UTC day across all admins. */
     @PostMapping("/clear")
     public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.ClearCommissionResult>> clearAll(
             @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
-        return ResponseEntity.ok(ApiResponse.ok(operationsService.clearAll(date), "Commission day cleared"));
+        String operationId = UUID.randomUUID().toString();
+        try {
+            return ResponseEntity.ok(ApiResponse.ok(operationsService.clearAll(date), "Commission day cleared"));
+        } catch (RuntimeException ex) {
+            log.error("commission.clear.http-failed operationId={} date={} type={} message={}", operationId, date, ex.getClass().getSimpleName(), ex.getMessage(), ex);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(ApiResponse.error("Commission clear failed. operationId=" + operationId + " reason=" + safeMessage(ex)));
+        }
+    }
+
+    private String safeMessage(RuntimeException ex) {
+        String message = ex.getMessage();
+        return message == null || message.isBlank() ? ex.getClass().getSimpleName() : message;
     }
 
     // ─── Per-admin (legacy shape) ───────────────────────────────────────────
