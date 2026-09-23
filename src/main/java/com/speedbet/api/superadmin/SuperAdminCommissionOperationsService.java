@@ -114,10 +114,11 @@ public class SuperAdminCommissionOperationsService {
         for (User admin : userRepo.findAllByRole(UserRole.ADMIN)) {
             List<CommissionLedgerEntry> unpaid = unpaidEntries(admin.getId(), reportDate);
             BigDecimal amount = sum(unpaid);
-            if (amount.compareTo(BigDecimal.ZERO) <= 0) continue;
-            settleOne(admin, reportDate, operationId);
-            log.info("commission.clear.admin-success operationId={} adminId={} date={} amount={}", operationId, admin.getId(), reportDate, amount);
-            total = total.add(amount);
+            BigDecimal available = balanceRepo.findByUserId(admin.getId()).map(AffiliateCommissionBalance::getBalance).orElse(BigDecimal.ZERO);
+            if (amount.compareTo(BigDecimal.ZERO) <= 0 || available.compareTo(BigDecimal.ZERO) <= 0) continue;
+            var payout = settleOne(admin, reportDate, operationId);
+            log.info("commission.clear.admin-success operationId={} adminId={} date={} amount={}", operationId, admin.getId(), reportDate, payout.amount());
+            total = total.add(payout.amount());
             ids.add(admin.getId());
         }
         log.info("commission.clear.success operationId={} date={} admins={} amount={}", operationId, reportDate, ids.size(), total);
@@ -134,30 +135,33 @@ public class SuperAdminCommissionOperationsService {
         AffiliateCommissionBalance balance = balanceRepo.findByUserIdForUpdate(admin.getId())
                 .orElseThrow(() -> new IllegalArgumentException("Commission balance not found for admin: " + admin.getId()));
         log.info("commission.settle.balance operationId={} adminId={} balance={} selectedAmount={} walletPresent={}", operationId, admin.getId(), balance.getBalance(), amount, walletRepo.findByUserId(admin.getId()).isPresent());
-        if (balance.getBalance().compareTo(amount) < 0)
-            throw new IllegalStateException("Commission balance is lower than the selected day's unpaid commission");
+        BigDecimal payable = balance.getBalance().min(amount);
+        if (balance.getBalance().compareTo(amount) < 0) {
+            log.warn("commission.settle.balance-mismatch operationId={} adminId={} date={} ledgerAmount={} balance={} payable={}",
+                    operationId, admin.getId(), reportDate, amount, balance.getBalance(), payable);
+        }
 
         Instant paidAt = Instant.now();
         entries.forEach(entry -> entry.setPaidAt(paidAt));
         ledgerRepo.saveAll(entries);
-        balance.setBalance(balance.getBalance().subtract(amount));
-        balance.setTotalPaidOutLifetime(balance.getTotalPaidOutLifetime().add(amount));
+        balance.setBalance(balance.getBalance().subtract(payable));
+        balance.setTotalPaidOutLifetime(balance.getTotalPaidOutLifetime().add(payable));
         balance.setLastPayoutAt(paidAt);
         balanceRepo.save(balance);
 
         String reference = "MANUAL-COMM-PAYOUT-" + admin.getId().toString().substring(0, 8).toUpperCase(Locale.ROOT)
                 + "-" + reportDate + "-" + paidAt.toEpochMilli();
         AffiliateWithdrawalRequest payout = withdrawalRepo.save(AffiliateWithdrawalRequest.builder()
-                .userId(admin.getId()).amount(amount).currency(balance.getCurrency())
+                .userId(admin.getId()).amount(payable).currency(balance.getCurrency())
                 .status(AffiliateWithdrawalStatus.PROCESSED).reference(reference)
                 .requestedAt(paidAt).processedAt(paidAt).build());
         if (walletRepo.findByUserId(admin.getId()).isPresent()) {
-            walletService.recordExternalDebit(admin.getId(), amount, TxKind.AFFILIATE_COMMISSION_PAYOUT, reference,
+            walletService.recordExternalDebit(admin.getId(), payable, TxKind.AFFILIATE_COMMISSION_PAYOUT, reference,
                     Map.of("type", "manual_affiliate_commission_payout", "paidBy", "SUPER_ADMIN",
                             "commissionDate", reportDate.toString(), "withdrawalRequestId", payout.getId().toString()));
         }
         return new SuperAdminCommissionOperationsDtos.CommissionPayoutDto(
-                payout.getId(), admin.getId(), admin.getEmail(), amount, balance.getCurrency(), reference,
+                payout.getId(), admin.getId(), admin.getEmail(), payable, balance.getCurrency(), reference,
                 payout.getStatus().name(), payout.getProcessedAt());
     }
 
