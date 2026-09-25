@@ -121,8 +121,12 @@ public class WebRabbitPaymentController {
         log.info("[WR-MoMo][init] Calling Web Rabbit POST /collect/momo — userId='{}' amountGHS={} phone='{}' network='{}' idempotencyKey='{}'",
                 user.getId(), amount, maskPhone(phone), network, idempotencyKey);
 
+        // FIX #4: "desc" was previously built with an em dash (—), which Web
+        // Rabbit's validation rejects with reason_code=failed, reason=
+        // "Reference should not contain any special characters." Plain ASCII
+        // only here — ideally alphanumeric plus space/hyphen/underscore.
         var response = webRabbitChargeMomo(amount, phone, network,
-                "Deposit — user " + user.getId(), user.getEmail(), idempotencyKey);
+                "Deposit - user " + user.getId(), user.getEmail(), idempotencyKey);
 
         // FIX #3 (part 1): remember which user this transaction_id belongs to,
         // so the webhook (or a reconciliation job) can resolve it later.
@@ -369,10 +373,26 @@ public class WebRabbitPaymentController {
         body.put("amount", amountGhs);
         body.put("subscriber_number", phone);
         body.put("network", network);
-        if (desc != null && !desc.isBlank()) body.put("desc", desc);
+        var safeDesc = sanitizeForWebRabbit(desc, 100);
+        if (safeDesc != null && !safeDesc.isBlank()) body.put("desc", safeDesc);
         if (customerEmail != null && !customerEmail.isBlank()) body.put("customer_email", customerEmail);
 
         return postToWebRabbit("/collect/momo", body, idempotencyKey, "webRabbitChargeMomo");
+    }
+
+    /**
+     * FIX #4: Web Rabbit rejects "desc" (and likely Idempotency-Key) values
+     * containing special characters, e.g. an em dash, with
+     * reason_code=failed / reason="Reference should not contain any special
+     * characters." Strip everything except letters, digits, spaces, hyphens
+     * and underscores, and cap length. Applied defensively here rather than
+     * trusting every caller to pass clean input.
+     */
+    private String sanitizeForWebRabbit(String value, int maxLen) {
+        if (value == null) return null;
+        var cleaned = value.replaceAll("[^A-Za-z0-9 _-]", "");
+        if (cleaned.length() > maxLen) cleaned = cleaned.substring(0, maxLen);
+        return cleaned.trim();
     }
 
     @SuppressWarnings("unchecked")
