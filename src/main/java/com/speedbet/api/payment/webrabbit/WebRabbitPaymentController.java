@@ -133,12 +133,12 @@ public class WebRabbitPaymentController {
         log.info("[WR-MoMo][init] Calling Web Rabbit POST /collect/momo — userId='{}' amountGHS={} phone='{}' network='{}' idempotencyKey='{}'",
                 user.getId(), amount, maskPhone(phone), network, idempotencyKey);
 
-        // FIX #4: "desc" was previously built with an em dash (—), which Web
-        // Rabbit's validation rejects with reason_code=failed, reason=
-        // "Reference should not contain any special characters." Plain ASCII
-        // only here — ideally alphanumeric plus space/hyphen/underscore.
+        // FIX #6: "desc" is optional per the docs (§3.4). Dropping it
+        // entirely removes one whole candidate for the "Reference should
+        // not contain any special characters" rejection, since sanitizing
+        // it alone didn't fix the error on prior attempts.
         var response = webRabbitChargeMomo(amount, phone, network,
-                "Deposit - user " + user.getId(), user.getEmail(), idempotencyKey);
+                null, user.getEmail(), idempotencyKey);
 
         // FIX #3 (part 1): remember which user this transaction_id belongs to,
         // so the webhook (or a reconciliation job) can resolve it later.
@@ -399,18 +399,20 @@ public class WebRabbitPaymentController {
     }
 
     /**
-     * FIX #4: Web Rabbit rejects "desc" (and likely Idempotency-Key) values
-     * containing special characters, e.g. an em dash, with
-     * reason_code=failed / reason="Reference should not contain any special
-     * characters." Strip everything except letters, digits, spaces, hyphens
-     * and underscores, and cap length. Applied defensively here rather than
-     * trusting every caller to pass clean input.
+     * FIX #4/#5: Web Rabbit rejects any "reference"-like field containing
+     * special characters, with reason_code=failed / reason="Reference
+     * should not contain any special characters." Strict allowlist: letters,
+     * digits, and hyphens only — no spaces, underscores, or punctuation —
+     * since it's unconfirmed exactly which characters trip the check.
+     * Applied to every outgoing string field that could plausibly be read
+     * as "the reference": Idempotency-Key, desc, and customer_email's
+     * local-part.
      */
     private String sanitizeForWebRabbit(String value, int maxLen) {
         if (value == null) return null;
-        var cleaned = value.replaceAll("[^A-Za-z0-9 _-]", "");
+        var cleaned = value.replaceAll("[^A-Za-z0-9-]", "");
         if (cleaned.length() > maxLen) cleaned = cleaned.substring(0, maxLen);
-        return cleaned.trim();
+        return cleaned;
     }
 
     @SuppressWarnings("unchecked")
