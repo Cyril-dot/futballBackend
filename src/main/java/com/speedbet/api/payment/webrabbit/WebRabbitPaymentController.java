@@ -58,7 +58,7 @@ public class WebRabbitPaymentController {
     @Value("${app.webrabbit.secret-key}")             private String     secretKey;
     @Value("${app.webrabbit.base-url}")                private String     baseUrl; // e.g. https://api.webrabbitmedia.com/v1
     @Value("${app.webrabbit.webhook-secret}")          private String     webhookSecret; // HMAC-SHA256 signing secret — see note below
-    @Value("${app.platform.min-deposit-amount:1}")     private BigDecimal minDeposit;
+    @Value("${app.webrabbit.min-deposit-amount:10}")   private BigDecimal minDeposit;
     @Value("${app.platform.name}")                     private String     appName;      // sent as X-Webrabbitmedia-Title
     @Value("${app.platform.site-url}")                 private String     siteUrl;      // sent as HTTP-Referer
 
