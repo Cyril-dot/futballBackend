@@ -96,16 +96,23 @@ public class WebRabbitPaymentController {
 
         // Web Rabbit takes decimal GHS directly — no pesewa conversion needed
         // on the request (contrast with Paystack, which wants amount in pesewas).
-        var idempotencyKey = "wr-momo-" + user.getId() + "-" + UUID.randomUUID();
+        // Web Rabbit validates its reference/description as alphanumeric. Do
+        // not pass the old human-readable em-dash description or UUID hyphens
+        // through to the provider: it returns code 01 with
+        // "Reference should not contain any special characters."
+        var reference = "WRMOMO" + user.getId().toString().replace("-", "")
+                + UUID.randomUUID().toString().replace("-", "");
+        var idempotencyKey = reference;
 
         log.info("[WR-MoMo][init] Calling Web Rabbit POST /collect/momo — userId='{}' amountGHS={} phone='{}' network='{}' idempotencyKey='{}'",
                 user.getId(), amount, maskPhone(phone), network, idempotencyKey);
 
         var response = webRabbitChargeMomo(amount, phone, network,
-                "Deposit — user " + user.getId(), user.getEmail(), idempotencyKey);
+                reference, user.getEmail(), idempotencyKey);
 
-        log.info("[WR-MoMo][init] DONE — userId='{}' transactionId='{}' status='{}' reasonCode='{}'",
-                user.getId(), response.get("transaction_id"), response.get("status"), response.get("reason_code"));
+        log.info("[WR-MoMo][init] DONE — userId='{}' transactionId='{}' status='{}' reasonCode='{}' reason='{}' code='{}'",
+                user.getId(), response.get("transaction_id"), response.get("status"), response.get("reason_code"),
+                response.get("reason"), response.get("code"));
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
