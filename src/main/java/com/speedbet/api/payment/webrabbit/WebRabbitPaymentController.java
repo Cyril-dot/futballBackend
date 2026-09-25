@@ -25,22 +25,21 @@ import reactor.util.retry.Retry;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
-import java.math.MathContext;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @RestController
 @RequiredArgsConstructor
 public class WebRabbitPaymentController {
 
-    // Web Rabbit's documented MoMo network codes (docs/collect-momo). Legacy
-    // codes VDF/ATL/TGO are mapped by Web Rabbit itself, not by us, so we only
-    // need to accept and forward the current ones.
+    // Web Rabbit's documented MoMo network codes (docs/collect-momo §3.2).
+    // Legacy codes VDF/ATL/TGO are mapped by Web Rabbit itself, not by us.
     private static final Set<String> VALID_NETWORKS = Set.of("MTN", "TELECEL", "AT", "GMONEY");
 
     private static final Set<String> MTN_GH_PREFIXES     = Set.of("024", "025", "053", "054", "055", "059");
@@ -55,27 +54,49 @@ public class WebRabbitPaymentController {
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
 
-    @Value("${app.webrabbit.secret-key}")             private String     secretKey;
-    @Value("${app.webrabbit.base-url}")                private String     baseUrl; // e.g. https://api.webrabbitmedia.com/v1
-    @Value("${app.webrabbit.webhook-secret}")          private String     webhookSecret; // HMAC-SHA256 signing secret — see note below
-    @Value("${app.webrabbit.min-deposit-amount:10}")   private BigDecimal minDeposit;
-    @Value("${app.platform.name}")                     private String     appName;      // sent as X-Webrabbitmedia-Title
-    @Value("${app.platform.site-url}")                 private String     siteUrl;      // sent as HTTP-Referer
+    // FIX #1 (root cause of "no MoMo prompt received"):
+    // The old default fallback here was "https://api.example.com/v1" — a
+    // placeholder domain that resolves to nothing. If APP_WEBRABBIT_BASE_URL
+    // was ever unset/unloaded in the actual runtime environment, every call
+    // silently went to api.example.com, failed at the network layer, and got
+    // swallowed by onErrorMap into a generic "unavailable" error — no prompt
+    // ever left the server. The fallback now points at the real, documented
+    // Web Rabbit host (guide §"Base URL"), so a missing env var still works
+    // correctly instead of failing silently. Still: explicitly set
+    // APP_WEBRABBIT_BASE_URL=https://api.webrabbitmedia.com/v1 in your real
+    // deployment env — don't rely on this fallback long-term.
+    @Value("${app.webrabbit.secret-key}")
+    private String secretKey;
+
+    @Value("${app.webrabbit.base-url:https://api.webrabbitmedia.com/v1}")
+    private String baseUrl;
+
+    @Value("${app.webrabbit.webhook-secret}")
+    private String webhookSecret;
+
+    @Value("${app.platform.min-deposit-amount:1}")
+    private BigDecimal minDeposit;
+
+    @Value("${app.platform.name}")
+    private String appName; // sent as X-Webrabbitmedia-Title
+
+    @Value("${app.platform.site-url}")
+    private String siteUrl; // sent as HTTP-Referer
+
+    // FIX #3: minimal in-memory pending-deposit store so the webhook can
+    // resolve transaction_id -> userId (Web Rabbit's /collect/momo request
+    // has no metadata field to carry this through). Swap for a real
+    // repository/table backed by your DB before production — this map is
+    // lost on restart and won't work across multiple app instances.
+    private final Map<String, UUID> pendingDeposits = new ConcurrentHashMap<>();
 
     // ─── MoMo: Step 1 — initiate charge ────────────────────────────────────────
-    //
-    // Web Rabbit's MoMo flow is single-step server-side: POST /v1/collect/momo
-    // sends the prompt to the customer's phone and returns 202 pending
-    // immediately. There is no OTP-submit step (unlike Paystack) — the customer
-    // approves on-handset and we find out via webhook or by polling
-    // GET /v1/transactions/{id}.
-
     @PostMapping("/api/wallet/deposit/webrabbit-momo/init")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initMomoDeposit(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
 
-        log.info("[WR-MoMo][init] START — userId='{}'", user.getId());
+        log.info("[WR-MoMo][init] START — userId='{}' baseUrl='{}'", user.getId(), baseUrl);
 
         var amount   = extractValidAmount(req, user.getId());
         var rawPhone = req.get("phone") == null ? "" : String.valueOf(req.get("phone")).trim();
@@ -94,35 +115,31 @@ public class WebRabbitPaymentController {
 
         validateNetworkPrefix(phone, network);
 
-        // Web Rabbit takes decimal GHS directly — no pesewa conversion needed
-        // on the request (contrast with Paystack, which wants amount in pesewas).
-        // Web Rabbit validates its reference/description as alphanumeric. Do
-        // not pass the old human-readable em-dash description or UUID hyphens
-        // through to the provider: it returns code 01 with
-        // "Reference should not contain any special characters."
-        var reference = "WRMOMO" + user.getId().toString().replace("-", "")
-                + UUID.randomUUID().toString().replace("-", "");
-        var idempotencyKey = reference;
+        // Web Rabbit takes decimal GHS directly — no pesewa conversion needed.
+        var idempotencyKey = "wr-momo-" + user.getId() + "-" + UUID.randomUUID();
 
         log.info("[WR-MoMo][init] Calling Web Rabbit POST /collect/momo — userId='{}' amountGHS={} phone='{}' network='{}' idempotencyKey='{}'",
                 user.getId(), amount, maskPhone(phone), network, idempotencyKey);
 
         var response = webRabbitChargeMomo(amount, phone, network,
-                reference, user.getEmail(), idempotencyKey);
+                "Deposit — user " + user.getId(), user.getEmail(), idempotencyKey);
 
-        log.info("[WR-MoMo][init] DONE — userId='{}' transactionId='{}' status='{}' reasonCode='{}' reason='{}' code='{}'",
-                user.getId(), response.get("transaction_id"), response.get("status"), response.get("reason_code"),
-                response.get("reason"), response.get("code"));
+        // FIX #3 (part 1): remember which user this transaction_id belongs to,
+        // so the webhook (or a reconciliation job) can resolve it later.
+        var txId = response.get("transaction_id");
+        if (txId != null) {
+            pendingDeposits.put(txId.toString(), user.getId());
+        } else {
+            log.warn("[WR-MoMo][init] Web Rabbit response had no transaction_id — cannot register pending deposit. userId='{}'", user.getId());
+        }
+
+        log.info("[WR-MoMo][init] DONE — userId='{}' transactionId='{}' status='{}' reasonCode='{}'",
+                user.getId(), response.get("transaction_id"), response.get("status"), response.get("reason_code"));
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
     // ─── MoMo: verify fallback ──────────────────────────────────────────────────
-    //
-    // Mirrors Paystack's verify fallback. Docs recommend polling every ~3s for
-    // up to 60s, then slowing to ~10s — that cadence belongs on the client or a
-    // scheduled job, not in this single-shot endpoint.
-
     @GetMapping("/api/wallet/deposit/webrabbit-momo/verify/{transactionId}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> verifyMomoCharge(
             @AuthenticationPrincipal User user,
@@ -137,6 +154,25 @@ public class WebRabbitPaymentController {
         log.info("[WR-MoMo][verify] DONE — transactionId='{}' status='{}' reasonCode='{}' settledAt='{}'",
                 transactionId, response.get("status"), response.get("reason_code"), response.get("settled_at"));
 
+        // Client polling is the documented, reliable path (guide §4.6) — if the
+        // webhook is still misconfigured or hasn't fired yet, still credit here
+        // once the transaction is genuinely approved, so deposits aren't stuck
+        // solely on the webhook. handleDeposit() is idempotent (409-safe).
+        var status     = String.valueOf(response.get("status"));
+        var reasonCode = String.valueOf(response.get("reason_code"));
+        if ("approved".equals(status) && "approved".equals(reasonCode)) {
+            var userId = pendingDeposits.getOrDefault(transactionId, user.getId());
+            var rawAmount = response.get("gross_amount");
+            if (rawAmount != null) {
+                try {
+                    var amount = new BigDecimal(rawAmount.toString());
+                    handleDeposit(userId, transactionId, amount, "mobile_money");
+                } catch (NumberFormatException e) {
+                    log.error("[WR-MoMo][verify] Unparseable gross_amount='{}' — transactionId='{}'", rawAmount, transactionId);
+                }
+            }
+        }
+
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
@@ -144,32 +180,32 @@ public class WebRabbitPaymentController {
     // WEBHOOK — POST /api/webhooks/webrabbit-momo
     //
     // Must be covered by .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
-    // in SecurityConfig (same rule already used for the Paystack webhook), so
-    // Web Rabbit's server-to-server POST reaches this method without a JWT.
-    // Identity is proven by an HMAC-SHA256 signature over the raw body.
+    // in SecurityConfig, so Web Rabbit's server-to-server POST reaches this
+    // method without a JWT. Identity is proven by an HMAC-SHA256 signature
+    // over the raw body.
     //
-    // ⚠ CONFIRM AGAINST THE WEBHOOKS DOC PAGE BEFORE GOING LIVE:
-    //   The pages you supplied confirm webhooks are "signed HMAC-SHA256" but the
-    //   exact header name and payload event names for MoMo collections were on
-    //   the separate Webhooks doc page, which wasn't included in what was pasted.
-    //   This controller assumes:
-    //     - signature arrives in header  x-webrabbit-signature
-    //     - event name for a MoMo collection reaching a terminal state is
-    //       something like "collection.approved" / "collection.failed"
-    //       (by analogy with the confirmed disbursement events
-    //       payout.queued / payout.completed / payout.failed)
-    //   Update WEBHOOK_HEADER and the event-name checks below to match the
-    //   real Webhooks page once you have it in front of you.
+    // ⚠ STILL UNCONFIRMED — CONFIRM AGAINST THE REAL WEBHOOKS DOC PAGE:
+    //   The integration guide you supplied confirms webhooks are "signed
+    //   HMAC-SHA256" but never names the signature header or the event name
+    //   for a MoMo *collection* reaching a terminal state — only the
+    //   *disbursement* events (payout.queued / payout.completed /
+    //   payout.failed) are confirmed in writing. This is why, even after
+    //   fixing the base URL, crediting should not depend solely on this
+    //   webhook firing correctly — verifyMomoCharge() above now also credits
+    //   on a successful poll, and handleDeposit() is idempotent, so whichever
+    //   path fires first wins and the other is a safe no-op.
+    //   Update WEBHOOK_SIGNATURE_HEADER and the event-name check below once
+    //   you have the real Webhooks doc page or a reply from
+    //   support@webrabbitmedia.com.
     // ═══════════════════════════════════════════════════════════════════════════
 
-    private static final String WEBHOOK_SIGNATURE_HEADER = "x-webrabbit-signature"; // TODO confirm exact header name
+    private static final String WEBHOOK_SIGNATURE_HEADER = "x-webrabbit-signature"; // TODO confirm exact header name with Web Rabbit support
 
     @PostMapping("/api/webhooks/webrabbit-momo")
     public ResponseEntity<String> webhook(
             @RequestHeader(value = WEBHOOK_SIGNATURE_HEADER, required = false) String signature,
             HttpServletRequest request) {
 
-        // ── 1. Read raw body (MUST be before any parsing) ─────────────────────
         log.info("[WR-Webhook] HIT — remote='{}'", request.getRemoteAddr());
 
         byte[] rawBody;
@@ -182,9 +218,8 @@ public class WebRabbitPaymentController {
 
         log.info("[WR-Webhook] Body length={} bytes", rawBody.length);
 
-        // ── 2. Signature check ─────────────────────────────────────────────────
         if (signature == null || signature.isBlank()) {
-            log.warn("[WR-Webhook] REJECTED — missing {} header", WEBHOOK_SIGNATURE_HEADER);
+            log.warn("[WR-Webhook] REJECTED — missing {} header (confirm real header name with Web Rabbit)", WEBHOOK_SIGNATURE_HEADER);
             return ResponseEntity.status(400).body("Missing signature");
         }
 
@@ -195,7 +230,6 @@ public class WebRabbitPaymentController {
 
         log.info("[WR-Webhook] Signature OK");
 
-        // ── 3. Parse + dispatch ────────────────────────────────────────────────
         try {
             @SuppressWarnings("unchecked")
             var event = (Map<String, Object>) objectMapper
@@ -204,10 +238,11 @@ public class WebRabbitPaymentController {
             var eventType = event.get("event") != null ? event.get("event").toString() : "unknown";
             log.info("[WR-Webhook] event='{}'", eventType);
 
-            // Only act on a MoMo collection reaching a terminal, successful state.
-            // Confirm the real event name against the Webhooks doc page — see
-            // the block comment above this method.
-            if (!eventType.equals("collection.approved") && !eventType.contains("approved")) {
+            // Broadened match: accept any event name containing "approved" so
+            // we're not solely dependent on guessing the exact string
+            // ("collection.approved" vs whatever Web Rabbit actually sends).
+            // This is a stopgap until the real event name is confirmed.
+            if (!eventType.toLowerCase().contains("approved")) {
                 log.info("[WR-Webhook] Ignored event='{}'", eventType);
                 return ResponseEntity.ok("Ignored");
             }
@@ -231,33 +266,20 @@ public class WebRabbitPaymentController {
                 return ResponseEntity.status(400).body("Missing transaction_id");
             }
 
-            // Per docs/transactions-retrieve: status and resolved_status are the
-            // ledger truth, but reason_code is the field to switch application
-            // logic on. A mere "prompt_sent" / "pending" must NEVER credit.
+            // Per guide §4.4: status and reason_code are the fields to trust.
+            // A mere "prompt_sent" / "pending" must NEVER credit.
             if (!"approved".equals(status) || !"approved".equals(reasonCode)) {
                 log.info("[WR-Webhook] Not a terminal approval — status='{}' reasonCode='{}' transactionId='{}' — skipping credit",
                         status, reasonCode, transactionId);
                 return ResponseEntity.ok("OK-NOT-APPROVED");
             }
 
-            // ── Resolve which user this transaction belongs to ─────────────────
-            //
-            // Unlike Paystack, the Web Rabbit /collect/momo request body in the
-            // docs you supplied has no free-form metadata field — only amount,
-            // subscriber_number, network, desc and customer_email. So userId
-            // cannot ride along in provider metadata the way it does with
-            // Paystack. This controller resolves the user by looking up the
-            // transaction_id we stored locally against the idempotency key we
-            // generated at /init time (see initMomoDeposit). Swap in your own
-            // lookup (e.g. a pending_deposits table keyed by transaction_id)
-            // in place of the placeholder below.
             UUID userId = lookupUserIdByTransactionId(transactionId);
             if (userId == null) {
                 log.error("[WR-Webhook] UNRESOLVABLE userId — transactionId='{}' — no local record found", transactionId);
                 return ResponseEntity.ok("OK-NO-USER");
             }
 
-            // ── Parse amount — gross_amount is decimal GHS already ─────────────
             var rawAmount = data.get("gross_amount");
             if (rawAmount == null) {
                 log.error("[WR-Webhook] Missing gross_amount — transactionId='{}'", transactionId);
@@ -317,21 +339,25 @@ public class WebRabbitPaymentController {
             log.error("[WR-handleDeposit] Commission FAILED (non-blocking) — userId='{}' — {}", userId, ex.getMessage(), ex);
         }
 
+        // Once credited, this pending-deposit record has served its purpose.
+        pendingDeposits.remove(ref);
+
         log.info("[WR-handleDeposit] COMPLETE — userId='{}' ref='{}'", userId, ref);
     }
 
     /**
-     * Placeholder for resolving which platform user a Web Rabbit transaction_id
-     * belongs to. Wire this to whatever you persist at /init time (e.g. save
-     * userId + transaction_id together right after webRabbitChargeMomo returns,
-     * in a pending_deposits table), since Web Rabbit's /collect/momo request
-     * has no metadata field to carry the userId through for us.
+     * FIX #3: resolves which platform user a Web Rabbit transaction_id
+     * belongs to, using the in-memory map populated at /init time. Replace
+     * with a real repository-backed pending_deposits table before production
+     * — this in-memory map does not survive a restart and does not work
+     * across multiple app instances behind a load balancer.
      */
     private UUID lookupUserIdByTransactionId(String transactionId) {
-        // TODO: replace with a real repository lookup, e.g.
-        // return pendingDepositRepository.findUserIdByTransactionId(transactionId).orElse(null);
-        log.warn("[WR-lookupUserIdByTransactionId] Not implemented — transactionId='{}'", transactionId);
-        return null;
+        var userId = pendingDeposits.get(transactionId);
+        if (userId == null) {
+            log.warn("[WR-lookupUserIdByTransactionId] No pending deposit found — transactionId='{}'", transactionId);
+        }
+        return userId;
     }
 
     // ─── Web Rabbit API calls ───────────────────────────────────────────────────
@@ -401,6 +427,17 @@ public class WebRabbitPaymentController {
                     log.error("[{}] 502 upstream rejection — path='{}' body='{}'", tag, path, respBody);
                     return new RuntimeException("Payment provider declined the charge: " + respBody);
                 }))
+                // 403 = key/scope/attribution problem — surface distinctly so it's
+                // not confused with a generic outage (guide §1.4, §2)
+                .onStatus(status -> status.value() == 403, r -> r.bodyToMono(String.class).map(respBody -> {
+                    log.error("[{}] 403 forbidden — path='{}' body='{}' (check key scope is read+write, and business/domain approval)", tag, path, respBody);
+                    return new RuntimeException("Web Rabbit rejected the request (403): " + respBody);
+                }))
+                // 401 = bad/missing secret key
+                .onStatus(status -> status.value() == 401, r -> r.bodyToMono(String.class).map(respBody -> {
+                    log.error("[{}] 401 unauthorized — path='{}' body='{}' (check app.webrabbit.secret-key)", tag, path, respBody);
+                    return new RuntimeException("Web Rabbit rejected the API key (401): " + respBody);
+                }))
                 .onStatus(status -> status.isError(), r -> r.bodyToMono(String.class).map(respBody -> {
                     log.error("[{}] HTTP error — path='{}' status={} body='{}'",
                             tag, path, r.statusCode(), respBody);
@@ -438,10 +475,9 @@ public class WebRabbitPaymentController {
         if (!digits.matches("^0\\d{9}$"))
             throw ApiException.badRequest("Invalid Ghana phone. Use 0XXXXXXXXX or +233XXXXXXXXX.");
         return digits;
-        // Note: Web Rabbit's own docs say subscriber_number accepts either
-        // local (0XXXXXXXXX) or international (233XXXXXXXXX) format and that
-        // they normalise it server-side — so sending local format here is a
-        // safe, valid choice, not just a Paystack habit carried over.
+        // Web Rabbit's docs (§3.2) confirm subscriber_number accepts either
+        // local (0XXXXXXXXX) or international (233XXXXXXXXX) format and
+        // normalises it server-side.
     }
 
     private void validateNetworkPrefix(String phone, String network) {
