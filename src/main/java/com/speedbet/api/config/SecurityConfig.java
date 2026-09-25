@@ -425,7 +425,8 @@ public class SecurityConfig {
                 "https://www.omegahbet.com",
                 "https://omegabet-sub-admin.vercel.app",
                 "https://hotbet-teal.vercel.app",
-                "https://www.superrbett.com"
+                "https://www.superrbett.com",
+                "https://lucky-stake-orcin.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
