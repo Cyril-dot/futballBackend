@@ -116,7 +116,19 @@ public class WebRabbitPaymentController {
         validateNetworkPrefix(phone, network);
 
         // Web Rabbit takes decimal GHS directly — no pesewa conversion needed.
-        var idempotencyKey = "wr-momo-" + user.getId() + "-" + UUID.randomUUID();
+        // FIX #5: Web Rabbit's error "Reference should not contain any
+        // special characters" persisted even after cleaning up "desc" —
+        // the more likely target is the Idempotency-Key header itself,
+        // which Web Rabbit's docs describe as "your own reference" for the
+        // request. UUID.randomUUID() is safe (hex + hyphens), but
+        // user.getId() is interpolated in raw and its actual type/format is
+        // unverified from this file alone — if it's ever anything other than
+        // a plain UUID (e.g. a Mongo ObjectId, a prefixed id, anything with
+        // an underscore-adjacent framework quirk), that could be the
+        // offending value. Build the key from parts we can guarantee are
+        // clean instead of trusting getId()'s toString() blindly.
+        var idempotencyKey = "wr-momo-" + sanitizeForWebRabbit(String.valueOf(user.getId()), 60)
+                + "-" + UUID.randomUUID();
 
         log.info("[WR-MoMo][init] Calling Web Rabbit POST /collect/momo — userId='{}' amountGHS={} phone='{}' network='{}' idempotencyKey='{}'",
                 user.getId(), amount, maskPhone(phone), network, idempotencyKey);
@@ -375,7 +387,13 @@ public class WebRabbitPaymentController {
         body.put("network", network);
         var safeDesc = sanitizeForWebRabbit(desc, 100);
         if (safeDesc != null && !safeDesc.isBlank()) body.put("desc", safeDesc);
-        if (customerEmail != null && !customerEmail.isBlank()) body.put("customer_email", customerEmail);
+        if (customerEmail != null && !customerEmail.isBlank()) body.put("customer_email", customerEmail.trim());
+
+        // FIX #5 (diagnostic): log the exact outgoing body and idempotency
+        // key so if Web Rabbit rejects again with the same "special
+        // characters" reason, we can see precisely which value it objected
+        // to instead of guessing between desc/idempotency-key/email again.
+        log.info("[webRabbitChargeMomo] Outgoing body={} idempotencyKey='{}'", body, idempotencyKey);
 
         return postToWebRabbit("/collect/momo", body, idempotencyKey, "webRabbitChargeMomo");
     }
