@@ -49,4 +49,8 @@ public class CommissionLedgerEntry {
     @Builder.Default
     @Column(name = "created_at", updatable = false)
     private Instant createdAt = Instant.now();
+
+    /** Set when a super admin settles this ledger entry for its commission day. */
+    @Column(name = "paid_at")
+    private Instant paidAt;
 }

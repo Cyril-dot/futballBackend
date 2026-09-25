@@ -8,6 +8,8 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
+import java.util.UUID;
 import java.util.List;
 
 /**
@@ -25,6 +27,23 @@ import java.util.List;
 public class AdminCommissionController {
 
     private final AdminCommissionService adminCommissionService;
+
+    /** One UTC day: commission earned plus every referred user's deposit count and total. */
+    @GetMapping("/daily-summary")
+    public ResponseEntity<ApiResponse<AdminCommissionDtos.DailyCommissionDto>> getDailySummary(
+            @AuthenticationPrincipal User admin,
+            @RequestParam(required = false) LocalDate date) {
+        return ResponseEntity.ok(ApiResponse.ok(
+                adminCommissionService.getDailyCommission(admin.getId(), date)));
+    }
+
+    /** Poll this endpoint after payout processing to show the admin a paid notification. */
+    @GetMapping("/payout-notification")
+    public ResponseEntity<ApiResponse<AdminCommissionDtos.CommissionPayoutNotificationDto>> getPayoutNotification(
+            @AuthenticationPrincipal User admin) {
+        return ResponseEntity.ok(ApiResponse.ok(
+                adminCommissionService.latestPaidPayout(admin.getId())));
+    }
 
     @GetMapping("/daily")
     public ResponseEntity<ApiResponse<List<AffiliateCommissionPeriodDTO>>> getDailyCommission(
