@@ -11,7 +11,9 @@ public record ReferredUserDTO(
         String email,
         LocalDateTime joinedAt,
         BigDecimal lifetimeStake,
-        BigDecimal lifetimeCommission
+        BigDecimal lifetimeCommission,
+        Long depositCount,
+        BigDecimal totalDeposited
 ) {
     public String fullName() {
         return (firstName + " " + lastName).trim();

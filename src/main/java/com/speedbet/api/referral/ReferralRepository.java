@@ -32,7 +32,19 @@ public interface ReferralRepository extends JpaRepository<Referral, UUID> {
             u.email,
             u.createdAt,
             r.lifetimeStake,
-            r.lifetimeCommission
+            r.lifetimeCommission,
+            (SELECT COUNT(t.id)
+             FROM com.speedbet.api.wallet.Transaction t, com.speedbet.api.wallet.Wallet w
+             WHERE t.walletId = w.id
+               AND w.userId = u.id
+               AND t.kind = com.speedbet.api.wallet.TxKind.DEPOSIT
+               AND t.status = 'COMPLETED'),
+            (SELECT COALESCE(SUM(t.amount), 0)
+             FROM com.speedbet.api.wallet.Transaction t, com.speedbet.api.wallet.Wallet w
+             WHERE t.walletId = w.id
+               AND w.userId = u.id
+               AND t.kind = com.speedbet.api.wallet.TxKind.DEPOSIT
+               AND t.status = 'COMPLETED')
         )
         FROM Referral r
         JOIN com.speedbet.api.user.User u ON u.id = r.userId
