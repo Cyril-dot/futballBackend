@@ -18,7 +18,7 @@ public class BankDepositDtos {
         private String transferReference;
 
         @NotNull(message = "Amount sent is required")
-        @DecimalMin(value = "200.00", message = "Minimum deposit is GH₵200")
+        @DecimalMin(value = "50.00", message = "Minimum deposit is GHS 50")
         private BigDecimal ngnAmountSent;
 
         @NotNull(message = "Expected credit amount is required")
