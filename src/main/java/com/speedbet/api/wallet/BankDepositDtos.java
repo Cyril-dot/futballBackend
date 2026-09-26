@@ -62,6 +62,7 @@ public class BankDepositDtos {
     public static class DepositResponse {
         private UUID          id;
         private UUID          userId;
+        private String        userEmail;
         private String        transferReference;
         private BigDecimal    ngnAmountSent;
         private BigDecimal    expectedNgnCredit;
@@ -78,9 +79,13 @@ public class BankDepositDtos {
         private Instant       updatedAt;
 
         public static DepositResponse from(BankDeposit d) {
+            return from(d, null);
+        }
+        public static DepositResponse from(BankDeposit d, String userEmail) {
             return DepositResponse.builder()
                     .id(d.getId())
                     .userId(d.getUserId())
+                    .userEmail(userEmail)
                     .transferReference(d.getTransferReference())
                     .ngnAmountSent(d.getNgnAmountSent())
                     .expectedNgnCredit(d.getExpectedNgnCredit())

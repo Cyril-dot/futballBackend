@@ -16,4 +16,7 @@ public interface BankDepositRepository extends JpaRepository<BankDeposit, UUID> 
 
     /** Duplicate reference guard */
     boolean existsByTransferReference(String transferReference);
+    /** MoMo queue: manual proofs below GHS 30,000. */
+    Page<BankDeposit> findByNgnAmountSentLessThanOrderByCreatedAtDesc(java.math.BigDecimal maxAmount, Pageable pageable);
+    Page<BankDeposit> findByStatusAndNgnAmountSentLessThanOrderByCreatedAtAsc(BankDepositStatus status, java.math.BigDecimal maxAmount, Pageable pageable);
 }

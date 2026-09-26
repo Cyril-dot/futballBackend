@@ -67,7 +67,27 @@ public class BankDepositController {
             @RequestParam(defaultValue = "20") int size) {
 
         var result = service.getAll(PageRequest.of(page, size))
-                            .map(BankDepositDtos.DepositResponse::from);
+                            .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
+        return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
+    }
+
+    @GetMapping("/api/admin/momo-deposits")
+    @PreAuthorize("hasRole('SUPER_ADMIN')")
+    public ResponseEntity<ApiResponse<PageResponse<BankDepositDtos.DepositResponse>>> momoDeposits(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        var result = service.getMomo(PageRequest.of(page, size))
+                .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
+        return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
+    }
+
+    @GetMapping("/api/admin/momo-deposits/pending")
+    @PreAuthorize("hasRole('SUPER_ADMIN')")
+    public ResponseEntity<ApiResponse<PageResponse<BankDepositDtos.DepositResponse>>> pendingMomoDeposits(
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        var result = service.getPendingMomo(PageRequest.of(page, size))
+                .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
         return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
     }
 
@@ -78,7 +98,7 @@ public class BankDepositController {
             @RequestParam(defaultValue = "20") int size) {
 
         var result = service.getPending(PageRequest.of(page, size))
-                            .map(BankDepositDtos.DepositResponse::from);
+                            .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
         return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
     }
 
