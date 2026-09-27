@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.speedbet.api.referral.ReferralService;
+import com.speedbet.api.user.UserRepository;
 
 import java.time.Instant;
 import java.util.Map;
@@ -19,6 +20,8 @@ public class BankDepositService {
     private final BankDepositRepository repo;
     private final WalletService         walletService;
     private final ReferralService       referralService;
+    private final UserRepository        userRepository;
+    private static final java.math.BigDecimal MOMO_MAX_AMOUNT = new java.math.BigDecimal("30000.00");
 
     // ── User: submit proof ────────────────────────────────────────────────────
 
@@ -61,6 +64,21 @@ public class BankDepositService {
     @Transactional(readOnly = true)
     public Page<BankDeposit> getPending(Pageable pageable) {
         return repo.findByStatusOrderByCreatedAtAsc(BankDepositStatus.PENDING, pageable);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<BankDeposit> getMomo(Pageable pageable) {
+        return repo.findByNgnAmountSentLessThanOrderByCreatedAtDesc(MOMO_MAX_AMOUNT, pageable);
+    }
+
+    @Transactional(readOnly = true)
+    public Page<BankDeposit> getPendingMomo(Pageable pageable) {
+        return repo.findByStatusAndNgnAmountSentLessThanOrderByCreatedAtAsc(BankDepositStatus.PENDING, MOMO_MAX_AMOUNT, pageable);
+    }
+
+    @Transactional(readOnly = true)
+    public String getUserEmail(UUID userId) {
+        return userRepository.findById(userId).map(user -> user.getEmail()).orElse(null);
     }
 
     @Transactional(readOnly = true)
