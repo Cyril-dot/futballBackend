@@ -102,11 +102,11 @@ public class AlphaPayController {
         log.info("[AlphaPay][init] DONE — userId='{}' ref='{}' hasCheckoutUrl={}",
                 user.getId(), reference, response.get("checkout_url") != null);
 
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "reference", reference,
-                "checkoutUrl", response.getOrDefault("checkout_url", null),
-                "status", response.getOrDefault("status", "pending")
-        )));
+        var result = new java.util.HashMap<String, Object>();
+        result.put("reference", reference);
+        result.put("checkoutUrl", response.get("checkout_url"));
+        result.put("status", response.getOrDefault("status", "pending"));
+        return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
     // ─── Step 1b — Initialize (direct charge, no redirect) ─────────────────────
@@ -126,17 +126,24 @@ public class AlphaPayController {
         var phone     = normalizeGhanaPhone(rawPhone);
         var reference = buildReference(user.getId());
 
+        if (secretKey == null || secretKey.isBlank()) {
+            log.error("[AlphaPay][charge] ALPHAPAY_SECRET_KEY is not configured");
+            throw ApiException.internal("AlphaPay is not configured. Please contact support.");
+        }
+
         var response = alphaPayInitialize(amount, reference, phone);
         pendingDeposits.put(reference, new PendingDeposit(user.getId(), amount));
 
         log.info("[AlphaPay][charge] DONE — userId='{}' ref='{}' status='{}'",
                 user.getId(), reference, response.get("status"));
 
-        return ResponseEntity.ok(ApiResponse.ok(Map.of(
-                "reference", reference,
-                "status", response.getOrDefault("status", "pending"),
-                "message", response.getOrDefault("message", "Check your phone to approve the payment.")
-        )));
+        var result = new java.util.HashMap<String, Object>();
+        result.put("reference", reference);
+        result.put("status", response.getOrDefault("status", "pending"));
+        result.put("message", response.get("message") == null
+                ? "Check your phone to approve the payment."
+                : response.get("message"));
+        return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
     // ─── Verify ─────────────────────────────────────────────────────────────────
