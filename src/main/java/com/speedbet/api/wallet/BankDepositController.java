@@ -16,9 +16,8 @@ import java.util.UUID;
 /**
  * REST endpoints for Nigerian bank transfer deposit submissions and admin review.
  *
- * User-facing:
- *   POST  /api/wallet/bank-deposits           — submit proof
- *   GET   /api/wallet/bank-deposits           — user's own history
+ * Historical/admin review:
+ *   GET   /api/wallet/bank-deposits           — user's legacy history
  *
  * Admin-facing (ROLE_SUPER_ADMIN required):
  *   GET   /api/admin/bank-deposits            — all deposits
@@ -33,19 +32,7 @@ public class BankDepositController {
 
     private final BankDepositService service;
 
-    // ── User endpoints ────────────────────────────────────────────────────────
-
-    @PostMapping("/api/wallet/bank-deposits")
-    public ResponseEntity<ApiResponse<BankDepositDtos.DepositResponse>> submit(
-            @AuthenticationPrincipal User user,
-            @Valid @RequestBody BankDepositDtos.SubmitRequest req) {
-
-        var deposit = service.submit(user.getId(), req);
-        return ResponseEntity.ok(ApiResponse.ok(
-                BankDepositDtos.DepositResponse.from(deposit),
-                "Transfer proof submitted. An admin will verify and credit your wallet within 5–10 minutes."
-        ));
-    }
+    // ── Historical user endpoint ──────────────────────────────────────────────
 
     @GetMapping("/api/wallet/bank-deposits")
     public ResponseEntity<ApiResponse<PageResponse<BankDepositDtos.DepositResponse>>> myDeposits(

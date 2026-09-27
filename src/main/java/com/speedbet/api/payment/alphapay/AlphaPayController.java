@@ -89,6 +89,7 @@ public class AlphaPayController {
     private final Map<String, PendingDeposit> pendingDeposits = new ConcurrentHashMap<>();
 
     private record PendingDeposit(UUID userId, BigDecimal amount) {}
+<<<<<<< HEAD
 
     /**
      * Thrown when AlphaPay itself responds with an error — either a 4xx
@@ -104,6 +105,8 @@ public class AlphaPayController {
             this.upstreamUnavailable = upstreamUnavailable;
         }
     }
+=======
+>>>>>>> 5ff4300e029724f9cf5918392d17d23144549262
 
     @Value("${app.alphapay.secret-key}")               private String     secretKey;
     @Value("${app.alphapay.base-url}")                 private String     baseUrl;
@@ -158,6 +161,7 @@ public class AlphaPayController {
         var phone     = normalizeGhanaPhone(rawPhone);
         var reference = buildReference(user.getId());
 
+<<<<<<< HEAD
         requireConfigured();
 
         Map<String, Object> response;
@@ -166,6 +170,14 @@ public class AlphaPayController {
         } catch (AlphaPayApiException e) {
             return alphaPayErrorResponse(e, "charge");
         }
+=======
+        if (secretKey == null || secretKey.isBlank()) {
+            log.error("[AlphaPay][charge] ALPHAPAY_SECRET_KEY is not configured");
+            throw ApiException.internal("AlphaPay is not configured. Please contact support.");
+        }
+
+        var response = alphaPayInitialize(amount, reference, phone);
+>>>>>>> 5ff4300e029724f9cf5918392d17d23144549262
         pendingDeposits.put(reference, new PendingDeposit(user.getId(), amount));
 
         log.info("[AlphaPay][charge] DONE — userId='{}' ref='{}' status='{}'",
@@ -193,6 +205,7 @@ public class AlphaPayController {
         var owner = extractUserIdFromReference(reference);
         if (owner == null || !user.getId().toString().equals(owner))
             throw ApiException.badRequest("This payment does not belong to the signed-in user.");
+<<<<<<< HEAD
 
         log.info("[AlphaPay][verify] userId='{}' ref='{}'", user.getId(), reference);
 
@@ -219,6 +232,27 @@ public class AlphaPayController {
         }
         log.info("[AlphaPay][verify] DONE — ref='{}' status='{}' credited={}", reference, status, credited);
 
+=======
+
+        log.info("[AlphaPay][verify] userId='{}' ref='{}'", user.getId(), reference);
+        var response = alphaPayVerify(reference);
+        var status = paymentStatus(response);
+        var credited = false;
+        if (CREDITABLE_STATUSES.contains(status)) {
+            var pending = pendingDeposits.get(reference);
+            var amount = extractAmount(response);
+            if (amount == null && pending != null) amount = pending.amount();
+            if (amount == null || amount.signum() <= 0)
+                throw ApiException.badRequest("AlphaPay did not return a valid payment amount.");
+            if (pending != null && amount.compareTo(pending.amount()) != 0)
+                throw ApiException.badRequest("The verified amount does not match the requested deposit.");
+            handleDeposit(user.getId(), reference, amount);
+            pendingDeposits.remove(reference);
+            credited = true;
+        }
+        log.info("[AlphaPay][verify] DONE — ref='{}' status='{}' credited={}", reference, status, credited);
+
+>>>>>>> 5ff4300e029724f9cf5918392d17d23144549262
         var result = new java.util.HashMap<String, Object>(response);
         result.put("status", status);
         result.put("credited", credited);
