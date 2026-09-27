@@ -1,24 +1,57 @@
-# Ignore environment files
+# Environment Variables (NEVER commit secrets!)
 .env
+.env.local
+.env.production
+.env.*.local
 
-# Ignore compiled Java files
-*.class
-*.jar
-
-# Ignore Maven target folder
-/target/
-
-# Ignore logs
-/logs/
-/*.log
-
-# Ignore IDE files (Eclipse/IntelliJ/VSCode)
-*.iml
-*.ipr
-*.iws
+# IDE
 .idea/
 .vscode/
-
-# Ignore OS files
+*.swp
+*.swo
+*~
+*.iml
 .DS_Store
+
+# Build
+target/
+build/
+*.class
+*.jar
+*.war
+
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
 Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Local development
+.gradle/
+.m2/
+*.pid
+.env.development
+
+# Uploads (optional - store separately)
+uploads/
+crash-cards/
+
+# Testing
+coverage/
+.coverage
+
+# Spring Boot
+spring-boot-devtools.properties
+application-local.properties
