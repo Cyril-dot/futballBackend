@@ -31,6 +31,7 @@ import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * AlphaPay mobile money integration.
@@ -66,7 +67,7 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class AlphaPayController {
 
-    private static final Set<String> CREDITABLE_STATUSES = Set.of("success");
+    private static final Set<String> CREDITABLE_STATUSES = Set.of("success", "succeeded", "completed", "paid");
 
     private final Duration alphaPayTimeout       = Duration.ofSeconds(10);
     private final long     alphaPayRetryAttempts = 2;
@@ -75,11 +76,14 @@ public class AlphaPayController {
     private final ReferralService   referralService;
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
+    private final Map<String, PendingDeposit> pendingDeposits = new ConcurrentHashMap<>();
+
+    private record PendingDeposit(UUID userId, BigDecimal amount) {}
 
     @Value("${app.alphapay.secret-key}")               private String     secretKey;
     @Value("${app.alphapay.base-url}")                 private String     baseUrl;
     @Value("${app.alphapay.domain}")                   private String     whitelistedDomain;
-    @Value("${app.platform.min-deposit-amount:1}")     private BigDecimal minDeposit;
+    @Value("${app.platform.min-deposit-amount-ghs:1}") private BigDecimal minDeposit;
 
     // ─── Step 1a — Initialize (hosted redirect) ────────────────────────────────
 
@@ -123,6 +127,7 @@ public class AlphaPayController {
         var reference = buildReference(user.getId());
 
         var response = alphaPayInitialize(amount, reference, phone);
+        pendingDeposits.put(reference, new PendingDeposit(user.getId(), amount));
 
         log.info("[AlphaPay][charge] DONE — userId='{}' ref='{}' status='{}'",
                 user.getId(), reference, response.get("status"));
@@ -144,11 +149,32 @@ public class AlphaPayController {
         if (reference == null || reference.isBlank())
             throw ApiException.badRequest("reference is required.");
 
+        var owner = extractUserIdFromReference(reference);
+        if (owner == null || !user.getId().toString().equals(owner))
+            throw ApiException.badRequest("This payment does not belong to the signed-in user.");
+
         log.info("[AlphaPay][verify] userId='{}' ref='{}'", user.getId(), reference);
         var response = alphaPayVerify(reference);
-        log.info("[AlphaPay][verify] DONE — ref='{}' status='{}'", reference, response.get("status"));
+        var status = paymentStatus(response);
+        var credited = false;
+        if (CREDITABLE_STATUSES.contains(status)) {
+            var pending = pendingDeposits.get(reference);
+            var amount = extractAmount(response);
+            if (amount == null && pending != null) amount = pending.amount();
+            if (amount == null || amount.signum() <= 0)
+                throw ApiException.badRequest("AlphaPay did not return a valid payment amount.");
+            if (pending != null && amount.compareTo(pending.amount()) != 0)
+                throw ApiException.badRequest("The verified amount does not match the requested deposit.");
+            handleDeposit(user.getId(), reference, amount);
+            pendingDeposits.remove(reference);
+            credited = true;
+        }
+        log.info("[AlphaPay][verify] DONE — ref='{}' status='{}' credited={}", reference, status, credited);
 
-        return ResponseEntity.ok(ApiResponse.ok(response));
+        var result = new java.util.HashMap<String, Object>(response);
+        result.put("status", status);
+        result.put("credited", credited);
+        return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -298,6 +324,28 @@ public class AlphaPayController {
         }
 
         log.info("[AlphaPay][handleDeposit] COMPLETE — userId='{}' ref='{}'", userId, ref);
+    }
+
+    @SuppressWarnings("unchecked")
+    private String paymentStatus(Map<String, Object> response) {
+        Object raw = response.get("status");
+        if (raw == null) raw = response.get("payment_status");
+        if (raw == null && response.get("data") instanceof Map<?, ?> data) {
+            var nested = (Map<String, Object>) data;
+            raw = nested.get("status");
+            if (raw == null) raw = nested.get("payment_status");
+        }
+        return raw == null ? "unknown" : raw.toString().trim().toLowerCase();
+    }
+
+    @SuppressWarnings("unchecked")
+    private BigDecimal extractAmount(Map<String, Object> response) {
+        Object raw = response.get("amount");
+        if (raw == null && response.get("data") instanceof Map<?, ?> data)
+            raw = ((Map<String, Object>) data).get("amount");
+        if (raw == null) return null;
+        try { return new BigDecimal(raw.toString()); }
+        catch (NumberFormatException e) { return null; }
     }
 
     // ─── Reference / user correlation ──────────────────────────────────────────
