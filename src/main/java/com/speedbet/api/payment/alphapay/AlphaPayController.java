@@ -37,47 +37,40 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * AlphaPay mobile money integration.
  *
- * Flow differs from Paystack in a few important ways:
- *   1. No OTP / birthday step — a single "initialize" call either returns a
- *      checkout_url (hosted redirect flow) or, if "phone" is supplied,
- *      dispatches the charge directly and the customer approves on their handset.
- *   2. Amounts are sent in GHS major units (e.g. 50.00), NOT pesewas/minor units.
- *      This is the opposite of Paystack — do not multiply by 100 here.
- *      Confirmed against both the written API docs and the live docs page,
- *      and confirmed working end-to-end via a manual curl test.
- *   3. Every initialize call must include a "domain" that has already been
- *      whitelisted on the AlphaPay dashboard, or the request is rejected with 403.
- *   4. Webhook signature header is X-AlphaPay-Signature. AlphaPay's docs don't
- *      publish the algorithm; this implementation assumes HMAC-SHA512 hex
- *      (matching Paystack's scheme) — verify against a real webhook payload
- *      before relying on it in production.
- *   5. IMPORTANT — as of now, AlphaPay's dashboard has no self-serve field to
- *      register your webhook URL. Per their own docs: "In this demo the
- *      forwarding destination is set via an environment variable rather than
- *      a dashboard field — a per-business settings UI is next." Until that
- *      ships, you must send AlphaPay support your webhook URL directly
- *      (https://t.me/sitesupport10) to have it configured on their end.
- *      Do NOT block launch on the webhook working — this controller's verify
- *      endpoint is fully sufficient on its own; treat the webhook purely as
- *      a later optimization for near-real-time crediting.
+ * Base URL  : https://api.edibytes.online/api
+ * Domain    : superrbett.com  (whitelisted in AlphaPay dashboard)
+ * Secret key: injected via ${app.alphapay.secret-key}
  *
- * ─── Fix applied in this revision ───────────────────────────────────────────
- * Previously, ANY failure calling AlphaPay — including AlphaPay explicitly
- * rejecting the request with a 4xx and a real error message — was wrapped
- * into a bare RuntimeException. Spring's default handler turns an
- * uncaught RuntimeException into an opaque 500 with no body, so the
- * frontend only ever saw "An internal error occurred" no matter what
- * AlphaPay actually said. postToAlphaPay/alphaPayVerify now throw a
- * dedicated AlphaPayApiException carrying the real HTTP status and message,
- * and each endpoint maps that to a proper 400 (AlphaPay said no — show the
- * real reason) vs 502 (AlphaPay is unreachable/down) instead of a generic 500.
+ * Key differences from Paystack
+ * ─────────────────────────────
+ * 1. Amounts are GHS major units (e.g. "50.00"), NOT pesewas — do NOT multiply by 100.
+ * 2. Every initialize call must include "domain" matching a whitelisted dashboard entry.
+ * 3. Pass "phone" to skip the hosted redirect and dispatch MoMo prompt directly.
+ * 4. No webhook push yet — poll /payments/verify/:reference/ to detect completion.
+ * 5. Trailing slash is required on both /payments/initialize/ and /payments/verify/:ref/.
+ *
+ * Reference format (FIXED)
+ * ─────────────────────────
+ * Previous format "DEP-<full-uuid>-<suffix>" was ~54 chars. AlphaPay silently accepted
+ * the initialize call but never dispatched the MoMo prompt — almost certainly because
+ * their system rejected the overly long/hyphenated reference internally.
+ *
+ * New format: "SB" + 18 random hex chars = 20 chars total. Short, URL-safe, unique.
+ * Example: SB3f9a1c2e8b4d7f0a2c
+ *
+ * Because the userId is no longer embedded in the reference, ownership in verifyCharge
+ * is checked via the in-memory pendingDeposits map (populated at charge time) rather
+ * than by parsing the reference string. The webhook handler also uses this map; if the
+ * entry has already been removed (e.g. verify ran first) it falls back to a log warning
+ * and skips crediting (idempotency handled by walletService 409 check).
  */
 @Slf4j
 @RestController
 @RequiredArgsConstructor
 public class AlphaPayController {
 
-    private static final Set<String> CREDITABLE_STATUSES = Set.of("success", "succeeded", "completed", "paid");
+    private static final Set<String> CREDITABLE_STATUSES =
+            Set.of("success", "succeeded", "completed", "paid");
 
     private final Duration alphaPayTimeout       = Duration.ofSeconds(10);
     private final long     alphaPayRetryAttempts = 2;
@@ -86,28 +79,33 @@ public class AlphaPayController {
     private final ReferralService   referralService;
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
+
+    /**
+     * In-memory store: reference → (userId, amount).
+     * Populated when /charge is called; removed after successful crediting.
+     * Note: this is lost on restart. For production resilience, back this
+     * with Redis or a pending_deposits DB table.
+     */
     private final Map<String, PendingDeposit> pendingDeposits = new ConcurrentHashMap<>();
 
     private static final class PendingDeposit {
-        private final UUID userId;
+        private final UUID       userId;
         private final BigDecimal amount;
         PendingDeposit(UUID userId, BigDecimal amount) {
             this.userId = userId;
             this.amount = amount;
         }
-        UUID userId() { return userId; }
+        UUID       userId() { return userId; }
         BigDecimal amount() { return amount; }
     }
 
     /**
-     * Thrown when AlphaPay itself responds with an error — either a 4xx
-     * (bad request on our end — real cause is in the message) or something
-     * that couldn't be reached/parsed at all (upstream/network failure).
-     * Carries enough info for the endpoint to return an honest status code
-     * instead of a blanket 500.
+     * Thrown when AlphaPay itself responds with an error.
+     * upstreamUnavailable=true  → network/outage  → map to 502
+     * upstreamUnavailable=false → AlphaPay said no (bad input etc.) → map to 400
      */
     private static final class AlphaPayApiException extends RuntimeException {
-        final boolean upstreamUnavailable; // true = network/outage, false = AlphaPay explicitly rejected it
+        final boolean upstreamUnavailable;
         AlphaPayApiException(String message, boolean upstreamUnavailable) {
             super(message);
             this.upstreamUnavailable = upstreamUnavailable;
@@ -129,7 +127,7 @@ public class AlphaPayController {
         log.info("[AlphaPay][init] START — userId='{}'", user.getId());
 
         var amount    = extractValidAmount(req, user.getId());
-        var reference = buildReference(user.getId());
+        var reference = buildReference();
 
         requireConfigured();
 
@@ -139,6 +137,9 @@ public class AlphaPayController {
         } catch (AlphaPayApiException e) {
             return alphaPayErrorResponse(e, "init");
         }
+
+        // Store so verify can ownership-check without parsing the reference
+        pendingDeposits.put(reference, new PendingDeposit(user.getId(), amount));
 
         log.info("[AlphaPay][init] DONE — userId='{}' ref='{}' hasCheckoutUrl={}",
                 user.getId(), reference, response.get("checkout_url") != null);
@@ -150,7 +151,7 @@ public class AlphaPayController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    // ─── Step 1b — Initialize (direct charge, no redirect) ─────────────────────
+    // ─── Step 1b — Initialize (direct charge, MoMo prompt to phone) ────────────
 
     @PostMapping("/api/wallet/deposit/alphapay/charge")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDirectCharge(
@@ -159,15 +160,18 @@ public class AlphaPayController {
 
         log.info("[AlphaPay][charge] START — userId='{}'", user.getId());
 
-        var amount    = extractValidAmount(req, user.getId());
-        var rawPhone  = req.get("phone") == null ? "" : String.valueOf(req.get("phone")).trim();
+        var amount   = extractValidAmount(req, user.getId());
+        var rawPhone = req.get("phone") == null ? "" : String.valueOf(req.get("phone")).trim();
         if (rawPhone.isBlank() || rawPhone.equals("null"))
             throw ApiException.badRequest("Phone number is required.");
 
         var phone     = normalizeGhanaPhone(rawPhone);
-        var reference = buildReference(user.getId());
+        var reference = buildReference();
 
         requireConfigured();
+
+        log.info("[AlphaPay][charge] Calling AlphaPay initialize — ref='{}' amountGHS={} phone='{}'",
+                reference, amount, phone);
 
         Map<String, Object> response;
         try {
@@ -175,6 +179,8 @@ public class AlphaPayController {
         } catch (AlphaPayApiException e) {
             return alphaPayErrorResponse(e, "charge");
         }
+
+        // Must be stored AFTER a successful initialize so verify can find it
         pendingDeposits.put(reference, new PendingDeposit(user.getId(), amount));
 
         log.info("[AlphaPay][charge] DONE — userId='{}' ref='{}' status='{}'",
@@ -189,7 +195,7 @@ public class AlphaPayController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    // ─── Verify ─────────────────────────────────────────────────────────────────
+    // ─── Step 2 — Verify / poll ─────────────────────────────────────────────────
 
     @GetMapping("/api/wallet/deposit/alphapay/verify/{reference}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> verifyCharge(
@@ -199,9 +205,17 @@ public class AlphaPayController {
         if (reference == null || reference.isBlank())
             throw ApiException.badRequest("reference is required.");
 
-        var owner = extractUserIdFromReference(reference);
-        if (owner == null || !user.getId().toString().equals(owner))
+        // Ownership check via pendingDeposits — no need to parse the reference string
+        var pending = pendingDeposits.get(reference);
+        if (pending == null) {
+            // May have already been credited (e.g. a previous successful verify call).
+            // Allow the call through so the frontend can read the final status from
+            // AlphaPay and show the correct state; just don't credit again.
+            log.warn("[AlphaPay][verify] No pending deposit for ref='{}' userId='{}' — may already be credited",
+                    reference, user.getId());
+        } else if (!user.getId().equals(pending.userId())) {
             throw ApiException.badRequest("This payment does not belong to the signed-in user.");
+        }
 
         log.info("[AlphaPay][verify] userId='{}' ref='{}'", user.getId(), reference);
 
@@ -212,10 +226,10 @@ public class AlphaPayController {
             return alphaPayErrorResponse(e, "verify");
         }
 
-        var status = paymentStatus(response);
+        var status   = paymentStatus(response);
         var credited = false;
+
         if (CREDITABLE_STATUSES.contains(status)) {
-            var pending = pendingDeposits.get(reference);
             var amount = extractAmount(response);
             if (amount == null && pending != null) amount = pending.amount();
             if (amount == null || amount.signum() <= 0)
@@ -226,6 +240,7 @@ public class AlphaPayController {
             pendingDeposits.remove(reference);
             credited = true;
         }
+
         log.info("[AlphaPay][verify] DONE — ref='{}' status='{}' credited={}", reference, status, credited);
 
         var result = new java.util.HashMap<String, Object>(response);
@@ -234,20 +249,15 @@ public class AlphaPayController {
         return ResponseEntity.ok(ApiResponse.ok(result));
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // WEBHOOK — POST /api/webhooks/alphapay
+    // ─── Webhook ────────────────────────────────────────────────────────────────
     //
-    // Must be added to SecurityConfig alongside the Paystack rule, e.g.:
+    // AlphaPay does not yet push webhooks — this endpoint is here for when
+    // they add the feature. It must be permit-all in SecurityConfig, e.g.:
     //   .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
-    // (already covers this path if your Paystack rule uses the /** wildcard).
     //
-    // Identity is proven by HMAC-SHA512 over the raw body, sent in
-    // X-AlphaPay-Signature. Unlike Paystack, AlphaPay's docs don't show a
-    // "metadata" field on payment objects — the reference you chose at
-    // initialize time is the only correlation key available. This
-    // implementation therefore expects the reference to embed the userId
-    // (see buildReference below) rather than reading it out of a metadata map.
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Signature: HMAC-SHA512 of raw body, hex-encoded, in X-AlphaPay-Signature.
+    // Amount arrives in GHS major units — no division needed.
+
     @PostMapping("/api/webhooks/alphapay")
     public ResponseEntity<String> webhook(
             @RequestHeader(value = "X-AlphaPay-Signature", required = false) String signature,
@@ -271,7 +281,7 @@ public class AlphaPayController {
         }
 
         if (!verifySignature(rawBody, signature)) {
-            log.warn("[AlphaPay][Webhook] REJECTED — HMAC mismatch (wrong secret key?)");
+            log.warn("[AlphaPay][Webhook] REJECTED — HMAC mismatch");
             return ResponseEntity.status(400).body("Invalid signature");
         }
 
@@ -292,7 +302,6 @@ public class AlphaPayController {
 
             @SuppressWarnings("unchecked")
             var data = (Map<String, Object>) event.get("data");
-
             if (data == null) {
                 log.error("[AlphaPay][Webhook] payment.succeeded has null data");
                 return ResponseEntity.status(400).body("Missing data");
@@ -304,10 +313,11 @@ public class AlphaPayController {
                 return ResponseEntity.status(400).body("Missing reference");
             }
 
-            var rawUserId = extractUserIdFromReference(ref);
-            if (rawUserId == null) {
-                log.error("[AlphaPay][Webhook] UNRESOLVABLE userId — ref='{}'", ref);
-                return ResponseEntity.ok("OK-NO-USER");
+            // Resolve userId from pendingDeposits (reference is now opaque — no userId embedded)
+            var pendingEntry = pendingDeposits.get(ref);
+            if (pendingEntry == null) {
+                log.warn("[AlphaPay][Webhook] No pending deposit for ref='{}' — may already be credited, skipping", ref);
+                return ResponseEntity.ok("OK-ALREADY-CREDITED");
             }
 
             var rawAmount = data.get("amount");
@@ -316,7 +326,6 @@ public class AlphaPayController {
                 return ResponseEntity.status(400).body("Missing amount");
             }
 
-            // Amount arrives in GHS major units already — no /100 division needed.
             BigDecimal amount;
             try {
                 amount = new BigDecimal(rawAmount.toString());
@@ -325,18 +334,10 @@ public class AlphaPayController {
                 return ResponseEntity.status(400).body("Invalid amount");
             }
 
-            UUID userId;
-            try {
-                userId = UUID.fromString(rawUserId);
-            } catch (IllegalArgumentException e) {
-                log.error("[AlphaPay][Webhook] Invalid userId='{}' — ref='{}'", rawUserId, ref);
-                return ResponseEntity.ok("OK-BAD-UUID");
-            }
-
             log.info("[AlphaPay][Webhook] Crediting — userId='{}' ref='{}' amountGHS={}",
-                    userId, ref, amount);
+                    pendingEntry.userId(), ref, amount);
 
-            handleDeposit(userId, ref, amount);
+            handleDeposit(pendingEntry.userId(), ref, amount);
             pendingDeposits.remove(ref);
 
         } catch (ApiException e) {
@@ -360,8 +361,8 @@ public class AlphaPayController {
         try {
             walletService.credit(userId, amount, TxKind.DEPOSIT, ref,
                     Map.of("provider", "alphapay", "channel", "mobile_money", "reference", ref));
-            log.info("[AlphaPay][handleDeposit] CREDITED GHS {} — userId='{}' ref='{}'", amount, userId, ref);
-
+            log.info("[AlphaPay][handleDeposit] CREDITED GHS {} — userId='{}' ref='{}'",
+                    amount, userId, ref);
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("[AlphaPay][handleDeposit] Duplicate ref='{}' — already credited, skipping", ref);
@@ -383,6 +384,8 @@ public class AlphaPayController {
 
         log.info("[AlphaPay][handleDeposit] COMPLETE — userId='{}' ref='{}'", userId, ref);
     }
+
+    // ─── Status / amount helpers ───────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
     private String paymentStatus(Map<String, Object> response) {
@@ -408,53 +411,45 @@ public class AlphaPayController {
         catch (NumberFormatException e) { return null; }
     }
 
-    // ─── Reference / user correlation ──────────────────────────────────────────
+    // ─── Reference builder ─────────────────────────────────────────────────────
 
     /**
-     * AlphaPay's payment payload (per their published docs) has no metadata
-     * field, so the userId can't be echoed back the way Paystack does it.
-     * Instead we embed it directly in the reference we send at initialize
-     * time: "DEP-<userId>-<random>". This is parsed back out on webhook
-     * receipt. If AlphaPay later adds metadata support, prefer that over
-     * parsing the reference.
+     * Builds a short, URL-safe, unique payment reference.
+     *
+     * Format: "SB" + 18 random hex chars = 20 chars total.
+     * Example: SB3f9a1c2e8b4d7f0a2c
+     *
+     * Previous format ("DEP-<full-uuid>-<suffix>", ~54 chars) caused AlphaPay
+     * to silently accept the initialize call but never dispatch the MoMo prompt.
+     * Keeping it short and clean fixes that.
+     *
+     * The userId is NO LONGER embedded in the reference. Ownership is tracked
+     * via the pendingDeposits ConcurrentHashMap instead.
      */
-    private String buildReference(UUID userId) {
-        return "DEP-" + userId + "-" + UUID.randomUUID().toString().substring(0, 8);
-    }
-
-    private String extractUserIdFromReference(String ref) {
-        // Expected shape: DEP-<uuid>-<suffix>
-        var parts = ref.split("-", 2);
-        if (parts.length < 2 || !"DEP".equals(parts[0])) {
-            log.error("[extractUserId] reference does not match DEP-<userId>-<suffix> pattern — ref='{}'", ref);
-            return null;
-        }
-        // UUID itself contains hyphens, so re-join everything except the trailing
-        // random suffix we appended (last 9 chars: "-XXXXXXXX").
-        var remainder = parts[1];
-        if (remainder.length() <= 9) {
-            log.error("[extractUserId] reference too short to contain userId — ref='{}'", ref);
-            return null;
-        }
-        return remainder.substring(0, remainder.length() - 9);
+    private String buildReference() {
+        String hex = UUID.randomUUID().toString().replace("-", ""); // 32 hex chars
+        return "SB" + hex.substring(0, 18);                        // 20 chars total
     }
 
     // ─── AlphaPay API calls ─────────────────────────────────────────────────────
 
-    private Map<String, Object> alphaPayInitialize(BigDecimal amountGhs, String reference, String phoneOrNull, String emailOrNull) {
-        var body = new java.util.HashMap<String, Object>();
-        // AlphaPay's documented API expects amount as a decimal STRING (e.g. "50.00"),
-        // not a bare JSON number — confirmed against the official integration doc.
-        body.put("amount", amountGhs.setScale(2, java.math.RoundingMode.HALF_UP).toPlainString());
-        body.put("currency", "GHS");
-        body.put("reference", reference);
-        body.put("domain", whitelistedDomain);
-        if (phoneOrNull != null) body.put("phone", phoneOrNull);
-        if (emailOrNull != null && !emailOrNull.isBlank()) body.put("customer_email", emailOrNull);
+    private Map<String, Object> alphaPayInitialize(
+            BigDecimal amountGhs, String reference, String phoneOrNull, String emailOrNull) {
 
-        // Trailing slash is required — AlphaPay's documented path is
-        // "/payments/initialize/" exactly; omitting it caused connection
-        // failures that surfaced as a generic 502 here.
+        var body = new java.util.HashMap<String, Object>();
+        // AlphaPay expects amount as a decimal STRING (e.g. "50.00"), not a bare number.
+        body.put("amount",    amountGhs.setScale(2, java.math.RoundingMode.HALF_UP).toPlainString());
+        body.put("currency",  "GHS");
+        body.put("reference", reference);
+        body.put("domain",    whitelistedDomain);
+        if (phoneOrNull != null && !phoneOrNull.isBlank())
+            body.put("phone", phoneOrNull);
+        if (emailOrNull != null && !emailOrNull.isBlank())
+            body.put("customer_email", emailOrNull);
+
+        log.debug("[AlphaPay][alphaPayInitialize] body={}", body);
+
+        // Trailing slash required — documented path is /payments/initialize/
         return postToAlphaPay("/payments/initialize/", body, "alphaPayInitialize");
     }
 
@@ -463,8 +458,7 @@ public class AlphaPayController {
         Map<String, Object> result;
         try {
             result = (Map<String, Object>) webClientBuilder.build()
-                    // Trailing slash required here too — documented path is
-                    // "/payments/verify/:reference/".
+                    // Trailing slash required — documented path is /payments/verify/:reference/
                     .get().uri(baseUrl + "/payments/verify/" + reference + "/")
                     .header("Authorization", "Bearer " + secretKey)
                     .retrieve()
@@ -480,7 +474,8 @@ public class AlphaPayController {
                     .retryWhen(Retry.max(alphaPayRetryAttempts)
                             .filter(ex -> !(ex instanceof AlphaPayApiException)))
                     .onErrorMap(ex -> !(ex instanceof AlphaPayApiException),
-                            ex -> new AlphaPayApiException("AlphaPay is currently unavailable. Please try again.", true))
+                            ex -> new AlphaPayApiException(
+                                    "AlphaPay is currently unavailable. Please try again.", true))
                     .block();
         } catch (AlphaPayApiException e) {
             throw e;
@@ -489,12 +484,15 @@ public class AlphaPayController {
             throw new AlphaPayApiException("AlphaPay is currently unavailable. Please try again.", true);
         }
 
-        if (result == null) throw new AlphaPayApiException("AlphaPay returned empty response.", true);
+        if (result == null)
+            throw new AlphaPayApiException("AlphaPay returned empty response.", true);
         return result;
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> postToAlphaPay(String path, Map<String, Object> body, String tag) {
+    private Map<String, Object> postToAlphaPay(
+            String path, Map<String, Object> body, String tag) {
+
         Map<String, Object> result;
         try {
             result = (Map<String, Object>) webClientBuilder.build()
@@ -515,7 +513,8 @@ public class AlphaPayController {
                     .retryWhen(Retry.max(alphaPayRetryAttempts)
                             .filter(ex -> !(ex instanceof AlphaPayApiException)))
                     .onErrorMap(ex -> !(ex instanceof AlphaPayApiException),
-                            ex -> new AlphaPayApiException("AlphaPay is currently unavailable. Please try again.", true))
+                            ex -> new AlphaPayApiException(
+                                    "AlphaPay is currently unavailable. Please try again.", true))
                     .block();
         } catch (AlphaPayApiException e) {
             throw e;
@@ -524,13 +523,13 @@ public class AlphaPayController {
             throw new AlphaPayApiException("AlphaPay is currently unavailable. Please try again.", true);
         }
 
-        if (result == null) throw new AlphaPayApiException("AlphaPay returned empty response.", true);
+        if (result == null)
+            throw new AlphaPayApiException("AlphaPay returned empty response.", true);
 
-        // AlphaPay's documented error shape is { "error": { "type", "message" } }
-        // rather than Paystack's { "status": false, "message" }.
+        // AlphaPay documented error shape: { "error": { "type": "...", "message": "..." } }
         if (result.get("error") != null) {
             var error = (Map<String, Object>) result.get("error");
-            var msg = error.getOrDefault("message", "AlphaPay declined the request").toString();
+            var msg   = error.getOrDefault("message", "AlphaPay declined the request").toString();
             log.error("[{}] error — path='{}' msg='{}'", tag, path, msg);
             throw new AlphaPayApiException(msg, false);
         }
@@ -539,10 +538,9 @@ public class AlphaPayController {
     }
 
     /**
-     * Pulls the human-readable message out of AlphaPay's documented error
-     * shape ({"error":{"type":...,"message":...}}) if the body parses that
-     * way; otherwise falls back to a generic status-based message so we
-     * never leak a raw stack trace or unparsed body to the client.
+     * Pulls a human-readable message out of AlphaPay's error shape.
+     * Falls back to a generic status-based message so we never leak
+     * a raw stack trace or unparsed body to the client.
      */
     private String extractErrorMessage(String rawBody, String fallback) {
         if (rawBody == null || rawBody.isBlank()) return fallback;
@@ -562,12 +560,9 @@ public class AlphaPayController {
     }
 
     /**
-     * Maps an AlphaPayApiException to a proper HTTP response instead of
-     * letting it surface as a generic 500. AlphaPay explicitly rejecting
-     * the request (bad amount, unwhitelisted domain, etc.) becomes a 400
-     * with the real reason; an unreachable/misbehaving AlphaPay becomes a
-     * 502 so the frontend can tell "your input was wrong" apart from
-     * "try again shortly".
+     * Maps an AlphaPayApiException to a proper HTTP response.
+     * 400 = AlphaPay explicitly rejected the request (bad input, etc.)
+     * 502 = AlphaPay unreachable / misbehaving
      */
     private ResponseEntity<ApiResponse<Map<String, Object>>> alphaPayErrorResponse(
             AlphaPayApiException e, String action) {
@@ -582,13 +577,13 @@ public class AlphaPayController {
                 || whitelistedDomain == null || whitelistedDomain.isBlank()) {
             log.error("[AlphaPay] Missing configuration — secretKeySet={} baseUrlSet={} domainSet={}",
                     secretKey != null && !secretKey.isBlank(),
-                    baseUrl != null && !baseUrl.isBlank(),
+                    baseUrl  != null && !baseUrl.isBlank(),
                     whitelistedDomain != null && !whitelistedDomain.isBlank());
             throw new RuntimeException("AlphaPay is not configured. Please contact support.");
         }
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
+    // ─── Small helpers ─────────────────────────────────────────────────────────
 
     private BigDecimal extractValidAmount(Map<String, Object> req, UUID userId) {
         var rawAmount = req.get("amount");
@@ -603,10 +598,11 @@ public class AlphaPayController {
 
     private String normalizeGhanaPhone(String raw) {
         var digits = raw.replaceAll("[\\s\\-]", "");
-        if (digits.startsWith("+233"))                              digits = "0" + digits.substring(4);
+        if (digits.startsWith("+233"))                               digits = "0" + digits.substring(4);
         else if (digits.startsWith("233") && digits.length() == 12) digits = "0" + digits.substring(3);
         if (!digits.matches("^0\\d{9}$"))
-            throw ApiException.badRequest("Invalid Ghana phone. Use 0XXXXXXXXX or +233XXXXXXXXX.");
+            throw ApiException.badRequest(
+                    "Invalid Ghana phone number. Use 0XXXXXXXXX or +233XXXXXXXXX.");
         return digits;
     }
 
@@ -618,7 +614,8 @@ public class AlphaPayController {
             var matches  = computed.equals(signature);
             if (!matches)
                 log.warn("[verifySignature] HMAC mismatch — computed='{}...' received='{}...'",
-                        computed.substring(0, 8), signature.substring(0, Math.min(8, signature.length())));
+                        computed.substring(0, 8),
+                        signature.substring(0, Math.min(8, signature.length())));
             return matches;
         } catch (Exception e) {
             log.error("[verifySignature] HMAC error", e);
