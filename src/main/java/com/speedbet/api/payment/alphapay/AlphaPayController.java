@@ -135,7 +135,7 @@ public class AlphaPayController {
 
         Map<String, Object> response;
         try {
-            response = alphaPayInitialize(amount, reference, null);
+            response = alphaPayInitialize(amount, reference, null, user.getEmail());
         } catch (AlphaPayApiException e) {
             return alphaPayErrorResponse(e, "init");
         }
@@ -171,7 +171,7 @@ public class AlphaPayController {
 
         Map<String, Object> response;
         try {
-            response = alphaPayInitialize(amount, reference, phone);
+            response = alphaPayInitialize(amount, reference, phone, user.getEmail());
         } catch (AlphaPayApiException e) {
             return alphaPayErrorResponse(e, "charge");
         }
@@ -441,15 +441,21 @@ public class AlphaPayController {
 
     // ─── AlphaPay API calls ─────────────────────────────────────────────────────
 
-    private Map<String, Object> alphaPayInitialize(BigDecimal amountGhs, String reference, String phoneOrNull) {
+    private Map<String, Object> alphaPayInitialize(BigDecimal amountGhs, String reference, String phoneOrNull, String emailOrNull) {
         var body = new java.util.HashMap<String, Object>();
-        body.put("amount", amountGhs);       // GHS major units — do NOT convert to minor units
+        // AlphaPay's documented API expects amount as a decimal STRING (e.g. "50.00"),
+        // not a bare JSON number — confirmed against the official integration doc.
+        body.put("amount", amountGhs.setScale(2, java.math.RoundingMode.HALF_UP).toPlainString());
         body.put("currency", "GHS");
         body.put("reference", reference);
         body.put("domain", whitelistedDomain);
         if (phoneOrNull != null) body.put("phone", phoneOrNull);
+        if (emailOrNull != null && !emailOrNull.isBlank()) body.put("customer_email", emailOrNull);
 
-        return postToAlphaPay("/payments/initialize", body, "alphaPayInitialize");
+        // Trailing slash is required — AlphaPay's documented path is
+        // "/payments/initialize/" exactly; omitting it caused connection
+        // failures that surfaced as a generic 502 here.
+        return postToAlphaPay("/payments/initialize/", body, "alphaPayInitialize");
     }
 
     @SuppressWarnings("unchecked")
@@ -457,7 +463,9 @@ public class AlphaPayController {
         Map<String, Object> result;
         try {
             result = (Map<String, Object>) webClientBuilder.build()
-                    .get().uri(baseUrl + "/payments/verify/" + reference)
+                    // Trailing slash required here too — documented path is
+                    // "/payments/verify/:reference/".
+                    .get().uri(baseUrl + "/payments/verify/" + reference + "/")
                     .header("Authorization", "Bearer " + secretKey)
                     .retrieve()
                     .onStatus(status -> status.isError(), r -> r.bodyToMono(String.class).map(respBody -> {
