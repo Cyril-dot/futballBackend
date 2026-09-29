@@ -1,8 +1,10 @@
 package com.speedbet.api.wallet;
 
+import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.common.PageResponse;
 import com.speedbet.api.user.User;
+import com.speedbet.api.user.UserRole;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.ResponseEntity;
@@ -41,9 +43,26 @@ public class WalletController {
     public ResponseEntity<ApiResponse<Transaction>> withdraw(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
-        var amount = new BigDecimal(req.get("amount").toString());
+        if (user == null || (user.getRole() != UserRole.ADMIN && user.getRole() != UserRole.SUPER_ADMIN)) {
+            throw ApiException.forbidden("Admin access required for direct withdrawals");
+        }
+        Object amountValue = req.get("amount");
+        if (amountValue == null) {
+            throw ApiException.badRequest("Amount is required");
+        }
+        BigDecimal amount;
+        try {
+            amount = new BigDecimal(amountValue.toString());
+        } catch (NumberFormatException e) {
+            throw ApiException.badRequest("Amount must be a valid number");
+        }
+        if (amount.signum() <= 0) {
+            throw ApiException.badRequest("Amount must be greater than zero");
+        }
+        Object methodValue = req.get("method");
+        String method = methodValue instanceof String value && !value.isBlank() ? value : "direct";
         var tx = walletService.debit(user.getId(), amount, TxKind.WITHDRAW, null,
-            Map.of("type", "withdrawal", "method", req.getOrDefault("method", "mobile_money")));
-        return ResponseEntity.ok(ApiResponse.ok(tx, "Withdrawal requested"));
+            Map.of("type", "admin_direct_withdrawal", "method", method));
+        return ResponseEntity.ok(ApiResponse.ok(tx, "Withdrawal completed"));
     }
 }
