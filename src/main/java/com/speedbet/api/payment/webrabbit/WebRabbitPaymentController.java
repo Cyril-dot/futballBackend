@@ -176,9 +176,9 @@ public class WebRabbitPaymentController {
         // solely on the webhook. handleDeposit() is idempotent (409-safe).
         var status     = String.valueOf(response.get("status"));
         var reasonCode = String.valueOf(response.get("reason_code"));
-        if ("approved".equals(status) && "approved".equals(reasonCode)) {
+        if (isApproved(status, reasonCode)) {
             var userId = pendingDeposits.getOrDefault(transactionId, user.getId());
-            var rawAmount = response.get("gross_amount");
+            var rawAmount = firstPresent(response, "gross_amount", "grossAmount", "amount");
             if (rawAmount != null) {
                 try {
                     var amount = new BigDecimal(rawAmount.toString());
@@ -284,7 +284,7 @@ public class WebRabbitPaymentController {
 
             // Per guide §4.4: status and reason_code are the fields to trust.
             // A mere "prompt_sent" / "pending" must NEVER credit.
-            if (!"approved".equals(status) || !"approved".equals(reasonCode)) {
+            if (!isApproved(status, reasonCode)) {
                 log.info("[WR-Webhook] Not a terminal approval — status='{}' reasonCode='{}' transactionId='{}' — skipping credit",
                         status, reasonCode, transactionId);
                 return ResponseEntity.ok("OK-NOT-APPROVED");
@@ -296,7 +296,7 @@ public class WebRabbitPaymentController {
                 return ResponseEntity.ok("OK-NO-USER");
             }
 
-            var rawAmount = data.get("gross_amount");
+            var rawAmount = firstPresent(data, "gross_amount", "grossAmount", "amount");
             if (rawAmount == null) {
                 log.error("[WR-Webhook] Missing gross_amount — transactionId='{}'", transactionId);
                 return ResponseEntity.status(400).body("Missing gross_amount");
@@ -552,5 +552,18 @@ public class WebRabbitPaymentController {
     private String maskPhone(String phone) {
         if (phone == null || phone.length() < 7) return "***";
         return phone.substring(0, 3) + "****" + phone.substring(phone.length() - 3);
+    }
+
+    private boolean isApproved(String status, String reasonCode) {
+        return "approved".equalsIgnoreCase(status == null ? "" : status.trim())
+                && "approved".equalsIgnoreCase(reasonCode == null ? "" : reasonCode.trim());
+    }
+
+    private Object firstPresent(Map<String, Object> values, String... keys) {
+        for (String key : keys) {
+            Object value = values.get(key);
+            if (value != null && !value.toString().isBlank()) return value;
+        }
+        return null;
     }
 }
