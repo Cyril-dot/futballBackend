@@ -9,32 +9,6 @@ import java.util.UUID;
 
 public class BankDepositDtos {
 
-    // ── User submits proof ────────────────────────────────────────────────────
-    @Getter @Setter
-    public static class SubmitRequest {
-
-        @NotBlank(message = "Transfer reference / narration is required")
-        @Size(min = 3, max = 128, message = "Reference must be 3–128 characters")
-        private String transferReference;
-
-        @NotNull(message = "Amount sent is required")
-        @DecimalMin(value = "50.00", message = "Minimum deposit is GHS 50")
-        private BigDecimal ngnAmountSent;
-
-        @NotNull(message = "Expected credit amount is required")
-        @DecimalMin(value = "1.00", message = "Expected credit must be positive")
-        private BigDecimal expectedNgnCredit;
-
-        @Size(max = 256, message = "Sender account name must be ≤ 256 characters")
-        private String senderAccountName;   // optional
-
-        // Frontend sends the hosted ImgBB HTTPS URL; optional for legacy submissions.
-        private String screenshotUrl;       // optional
-
-        @Size(max = 1000, message = "Note must be ≤ 1,000 characters")
-        private String userNote;            // optional
-    }
-
     // ── Admin approves ────────────────────────────────────────────────────────
     @Getter @Setter
     public static class ApproveRequest {

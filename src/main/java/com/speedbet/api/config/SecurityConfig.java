@@ -230,6 +230,15 @@ public class SecurityConfig {
                                 "/api/user/upgrade-to-admin/rushpay/init"
                         ).authenticated()
 
+                        // ── Web Rabbit — Ghana Mobile Money deposit (authenticated) ─────
+                        // The webhook is covered by /api/webhooks/** above and uses HMAC.
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/wallet/deposit/webrabbit-momo/init"
+                        ).authenticated()
+                        .requestMatchers(HttpMethod.GET,
+                                "/api/wallet/deposit/webrabbit-momo/verify/**"
+                        ).authenticated()
+
                         // ── Admin & super-admin ───────────────────────────────────────────
                         .requestMatchers((superAdminPath + "/**")).hasRole("SUPER_ADMIN")
                         .requestMatchers("/api/super-admin/**").hasRole("SUPER_ADMIN")

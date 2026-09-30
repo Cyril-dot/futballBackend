@@ -74,7 +74,7 @@ public class WebRabbitPaymentController {
     @Value("${app.webrabbit.webhook-secret}")
     private String webhookSecret;
 
-    @Value("${app.platform.min-deposit-amount:1}")
+    @Value("${app.webrabbit.min-deposit-amount:50}")
     private BigDecimal minDeposit;
 
     @Value("${app.platform.name}")

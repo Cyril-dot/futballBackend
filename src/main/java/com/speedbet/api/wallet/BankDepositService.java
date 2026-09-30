@@ -23,30 +23,6 @@ public class BankDepositService {
     private final UserRepository        userRepository;
     private static final java.math.BigDecimal MOMO_MAX_AMOUNT = new java.math.BigDecimal("30000.00");
 
-    // ── User: submit proof ────────────────────────────────────────────────────
-
-    @Transactional
-    public BankDeposit submit(UUID userId, BankDepositDtos.SubmitRequest req) {
-
-        if (repo.existsByTransferReference(req.getTransferReference())) {
-            throw new IllegalArgumentException(
-                    "A deposit with this transfer reference already exists.");
-        }
-
-        BankDeposit deposit = BankDeposit.builder()
-                .userId(userId)
-                .transferReference(req.getTransferReference())
-                .ngnAmountSent(req.getNgnAmountSent())
-                .expectedNgnCredit(req.getExpectedNgnCredit())
-                .senderAccountName(req.getSenderAccountName())
-                .screenshotUrl(req.getScreenshotUrl())
-                .userNote(req.getUserNote())
-                .status(BankDepositStatus.PENDING)
-                .build();
-
-        return repo.save(deposit);
-    }
-
     // ── User: own history ─────────────────────────────────────────────────────
 
     @Transactional(readOnly = true)
