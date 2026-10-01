@@ -439,7 +439,8 @@ public class SecurityConfig {
                 "https://lucky-stake-orcin.vercel.app",
                 "https://megasport-bay.vercel.app",
                 "https://plus-bet.vercel.app",
-                "https://megasport-jet.vercel.app"
+                "https://megasport-jet.vercel.app",
+                "https://megasport-jet.vercel.app/"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
