@@ -443,7 +443,8 @@ public class SecurityConfig {
                 "https://megasport-jet.vercel.app/",
                 "https://plusbet.vercel.app",
                 "https://msport-clone.vercel.app",
-                "https://www.superrbett.xyz"
+                "https://www.superrbett.xyz",
+                "https://lucky-stake-mu.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
