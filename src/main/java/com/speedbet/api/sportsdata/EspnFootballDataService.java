@@ -47,14 +47,14 @@ public class EspnFootballDataService {
         EREDIVISIE          ("ned.1",  "Eredivisie",             false),
         PRIMEIRA_LIGA       ("por.1",  "Primeira Liga",          false),
         SCOTTISH_PREM       ("sco.1",  "Scottish Premiership",   false),
-        TURKISH_SUPER       ("tur.1",  "Turkish Süper Lig",      false),
+        TURKISH_SUPER       ("tur.1",  "Turkish SÃ¼per Lig",      false),
         MLS                 ("usa.1",  "MLS",                    false),
         LIGA_MX             ("mex.1",  "Liga MX",                false),
-        BRAZILIAN_SERIE_A   ("bra.1",  "Brazilian Série A",      false),
+        BRAZILIAN_SERIE_A   ("bra.1",  "Brazilian SÃ©rie A",      false),
         ARGENTINE_PRIMERA   ("arg.1",  "Argentine Primera",      false),
         SAUDI_PRO           ("ksa.1",  "Saudi Pro League",       false),
 
-        // ── AFRICA ────────────────────────────────────────────
+        // ââ AFRICA ââââââââââââââââââââââââââââââââââââââââââââ
         RSA_PREMIERSHIP     ("rsa.1",  "South African Premiership",        false),
         RSA_FIRST_DIVISION  ("rsa.2",  "South African First Division",     false),
         NIGERIAN_PL         ("nga.1",  "Nigerian Professional League",     false),
@@ -68,7 +68,7 @@ public class EspnFootballDataService {
         ALGERIAN_L1         ("alg.1",  "Algerian Ligue 1",                 false),
         TUNISIAN_L1         ("tun.1",  "Tunisian Ligue 1",                 false),
 
-        // ── ADDITIONAL EUROPE ──────────────────────────────────
+        // ââ ADDITIONAL EUROPE ââââââââââââââââââââââââââââââââââ
         BELGIAN_PRO         ("bel.1",  "Belgian Pro League",            false),
         RUSSIAN_PL          ("rus.1",  "Russian Premier League",        false),
         GREEK_SL            ("gre.1",  "Greek Super League",            false),
@@ -81,15 +81,15 @@ public class EspnFootballDataService {
         UKRAINIAN_PL        ("ukr.1",  "Ukrainian Premier League",      false),
         CZECH_FL            ("cze.1",  "Czech First League",            false),
 
-        // ── ADDITIONAL AMERICAS ────────────────────────────────
+        // ââ ADDITIONAL AMERICAS ââââââââââââââââââââââââââââââââ
         COLOMBIAN_LP        ("col.1",  "Colombian Liga BetPlay",        false),
-        CHILEAN_PD          ("chi.1",  "Chilean Primera División",      false),
+        CHILEAN_PD          ("chi.1",  "Chilean Primera DivisiÃ³n",      false),
         ECUADORIAN_PD       ("ecu.1",  "Ecuadorian LigaPro",            false),
         PARAGUAYAN_AP       ("par.1",  "Paraguayan Apertura",           false),
         PERUVIAN_PD         ("per.1",  "Peruvian Liga 1",               false),
-        URUGUAYAN_PD        ("uru.1",  "Uruguayan Primera División",    false),
+        URUGUAYAN_PD        ("uru.1",  "Uruguayan Primera DivisiÃ³n",    false),
 
-        // ── ASIA / MENA / OCEANIA ───────────────────────────────
+        // ââ ASIA / MENA / OCEANIA âââââââââââââââââââââââââââââââ
         CHINESE_SL          ("chn.1",  "Chinese Super League",          false),
         JAPANESE_J1         ("jpn.1",  "J1 League",                     false),
         KOREAN_KL           ("kor.1",  "Korean K League 1",             false),
@@ -134,22 +134,23 @@ public class EspnFootballDataService {
         EUROPA_LEAGUE    ("uefa.europa",             "UEFA Europa League",    true),
         CONFERENCE_LEAGUE("uefa.europa.conference", "UEFA Conference League",true),
 
-        // NOTE: FIFA World Cup removed — tournament has concluded, no longer polled.
+        // NOTE: FIFA World Cup removed â tournament has concluded, no longer polled.
 
-        // ── INTERNATIONAL TOURNAMENTS ────────────────────────────
+        // ââ INTERNATIONAL TOURNAMENTS ââââââââââââââââââââââââââââ
         UEFA_EURO             ("uefa.euro",              "UEFA European Championship", false),
-        COPA_AMERICA          ("conmebol.america",       "Copa América",               false),
+        COPA_AMERICA          ("conmebol.america",       "Copa AmÃ©rica",               false),
         AFCON                 ("caf.nations",            "Africa Cup of Nations",      false),
+        UEFA_NATIONS_LEAGUE   ("uefa.nations",           "UEFA Nations League",        false),
         FIFA_CLUB_WORLD_CUP   ("fifa.cwc",               "FIFA Club World Cup",        false),
 
-        // ── CONTINENTAL CLUB COMPETITIONS (NON-UEFA) ─────────────
+        // ââ CONTINENTAL CLUB COMPETITIONS (NON-UEFA) âââââââââââââ
         CAF_CHAMPIONS_LEAGUE     ("caf.champions",           "CAF Champions League",        false),
         CONCACAF_CHAMPIONS_CUP   ("concacaf.champions",      "CONCACAF Champions Cup",      false),
         COPA_LIBERTADORES        ("conmebol.libertadores",   "Copa Libertadores",           false),
         COPA_SUDAMERICANA        ("conmebol.sudamericana",   "Copa Sudamericana",           false),
 
-        // ── PRESEASON / CLUB FRIENDLIES ─────────────────────────
-        // Soccer has no discrete "preseason" the way American sports do — preseason
+        // ââ PRESEASON / CLUB FRIENDLIES âââââââââââââââââââââââââ
+        // Soccer has no discrete "preseason" the way American sports do â preseason
         // fixtures (summer tours, warm-up games) are published by ESPN under these
         // friendly / exhibition competition slugs instead.
         CLUB_FRIENDLY            ("club.friendly",         "Club Friendly",                false),
@@ -184,7 +185,7 @@ public class EspnFootballDataService {
             return Arrays.stream(values()).filter(EspnCup::isTop6Related).collect(Collectors.toList());
         }
 
-        /** International national-team tournaments (Euros, Copa América, AFCON, Club World Cup). */
+        /** International national-team tournaments (Euros, Copa AmÃ©rica, AFCON, Club World Cup). */
         public static List<EspnCup> internationalTournaments() {
             return List.of(UEFA_EURO, COPA_AMERICA, AFCON, FIFA_CLUB_WORLD_CUP);
         }
@@ -202,7 +203,7 @@ public class EspnFootballDataService {
             );
         }
 
-        /** All cups (domestic cups, UEFA club comps, international tournaments, continental club comps, preseason/friendlies) — used for upcoming fixture and live scanning. */
+        /** All cups (domestic cups, UEFA club comps, international tournaments, continental club comps, preseason/friendlies) â used for upcoming fixture and live scanning. */
         public static List<EspnCup> allCups() {
             return Arrays.asList(values());
         }
@@ -211,11 +212,11 @@ public class EspnFootballDataService {
     private final WebClient    client;
     private final ObjectMapper mapper = new ObjectMapper();
 
-    // ── THREE SEPARATE CAFFEINE CACHES WITH DIFFERENT TTLs ────────────────
+    // ââ THREE SEPARATE CAFFEINE CACHES WITH DIFFERENT TTLs ââââââââââââââââ
     //
-    //  liveCache    — 30 seconds  : in-progress match data (scores, minute, state)
-    //  stdCache     — 90 seconds  : scoreboard / upcoming / finished for today
-    //  staticCache  — 10 minutes  : standings, team lists, team schedules
+    //  liveCache    â 30 seconds  : in-progress match data (scores, minute, state)
+    //  stdCache     â 90 seconds  : scoreboard / upcoming / finished for today
+    //  staticCache  â 10 minutes  : standings, team lists, team schedules
     //
     // Previously everything shared one 5-minute cache, which caused finished
     // matches to linger as "live" or "in-progress" for up to 5 minutes after
@@ -244,11 +245,11 @@ public class EspnFootballDataService {
                 .baseUrl(BASE_URL)
                 .codecs(c -> c.defaultCodecs().maxInMemorySize(2 * 1024 * 1024))
                 .build();
-        log.info("EspnFootballDataService initialised — base URL: {}", BASE_URL);
-        log.info("Cache TTLs — live: 30s | std: 90s | static: 10m");
+        log.info("EspnFootballDataService initialised â base URL: {}", BASE_URL);
+        log.info("Cache TTLs â live: 30s | std: 90s | static: 10m");
     }
 
-    // ── SECTION 1: SCOREBOARD — LEAGUE ────────────────────────────────────
+    // ââ SECTION 1: SCOREBOARD â LEAGUE ââââââââââââââââââââââââââââââââââââ
 
     public List<Map<String, Object>> getScoreboard(EspnLeague league) {
         String cacheKey = "scoreboard:" + league.slug();
@@ -275,7 +276,7 @@ public class EspnFootballDataService {
     public List<Map<String, Object>> getLiveMatches(EspnLeague league) {
         String cacheKey = "live:league:" + league.slug();
         return cachedLive(cacheKey, () -> {
-            // Fetch fresh from ESPN — never read from stdCache for live state
+            // Fetch fresh from ESPN â never read from stdCache for live state
             Map<String, Object> raw = fetch(league.slug() + "/scoreboard");
             List<Map<String, Object>> all = extractEvents(raw, league.displayName());
             List<Map<String, Object>> live = all.stream()
@@ -361,15 +362,15 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 1B: ALL-LEAGUES TODAY — LIVE / UPCOMING / FINISHED ────────
+    // ââ SECTION 1B: ALL-LEAGUES TODAY â LIVE / UPCOMING / FINISHED ââââââââ
 
     /**
      * Scans EVERY league (all of {@link EspnLeague#values()}) plus every cup/competition
-     * (all of {@link EspnCup#allCups()} — domestic cups, UEFA club comps, international
-     * tournaments like the Euros/Copa América/AFCON/Club World Cup, continental club comps
+     * (all of {@link EspnCup#allCups()} â domestic cups, UEFA club comps, international
+     * tournaments like the Euros/Copa AmÃ©rica/AFCON/Club World Cup, continental club comps
      * like the CAF Champions League/CONCACAF Champions Cup/Copa Libertadores/Copa Sudamericana,
      * and preseason/friendlies) and returns every currently in-progress match.
-     * This is the canonical "all live games" entry point — nothing is restricted to
+     * This is the canonical "all live games" entry point â nothing is restricted to
      * top-6 or any subset here; it always hits ESPN directly (never the std/static
      * caches) so live state can never go stale beyond the 30s live-cache TTL.
      */
@@ -380,14 +381,14 @@ public class EspnFootballDataService {
 
             for (EspnLeague league : EspnLeague.values()) {
                 try {
-                    // Always hit ESPN directly for live — never read stdCache
+                    // Always hit ESPN directly for live â never read stdCache
                     List<Map<String, Object>> events =
                             extractEvents(fetch(league.slug() + "/scoreboard"), league.displayName());
                     for (Map<String, Object> e : events) {
                         if (isLive(e)) all.add(e);
                     }
                 } catch (Exception e) {
-                    log.warn("ESPN getAllLiveMatchesToday: error fetching {} — {}", league.displayName(), e.getMessage());
+                    log.warn("ESPN getAllLiveMatchesToday: error fetching {} â {}", league.displayName(), e.getMessage());
                 }
             }
 
@@ -401,7 +402,7 @@ public class EspnFootballDataService {
                         if (isLive(e)) all.add(e);
                     }
                 } catch (Exception e) {
-                    log.warn("ESPN getAllLiveMatchesToday: error fetching cup {} — {}", cup.displayName(), e.getMessage());
+                    log.warn("ESPN getAllLiveMatchesToday: error fetching cup {} â {}", cup.displayName(), e.getMessage());
                 }
             }
 
@@ -424,7 +425,7 @@ public class EspnFootballDataService {
                         if (isUpcoming(e)) all.add(e);
                     }
                 } catch (Exception e) {
-                    log.warn("ESPN getAllUpcomingMatchesToday: error fetching {} — {}", league.displayName(), e.getMessage());
+                    log.warn("ESPN getAllUpcomingMatchesToday: error fetching {} â {}", league.displayName(), e.getMessage());
                 }
             }
 
@@ -438,7 +439,7 @@ public class EspnFootballDataService {
                         if (isUpcoming(e)) all.add(e);
                     }
                 } catch (Exception e) {
-                    log.warn("ESPN getAllUpcomingMatchesToday: error fetching cup {} — {}", cup.displayName(), e.getMessage());
+                    log.warn("ESPN getAllUpcomingMatchesToday: error fetching cup {} â {}", cup.displayName(), e.getMessage());
                 }
             }
 
@@ -461,7 +462,7 @@ public class EspnFootballDataService {
                         if (isFinished(e)) all.add(e);
                     }
                 } catch (Exception e) {
-                    log.warn("ESPN getAllFinishedMatchesToday: error fetching {} — {}", league.displayName(), e.getMessage());
+                    log.warn("ESPN getAllFinishedMatchesToday: error fetching {} â {}", league.displayName(), e.getMessage());
                 }
             }
 
@@ -476,7 +477,7 @@ public class EspnFootballDataService {
                         if (isFinished(e)) all.add(e);
                     }
                 } catch (Exception e) {
-                    log.warn("ESPN getAllFinishedMatchesToday: error fetching cup {} — {}", cup.displayName(), e.getMessage());
+                    log.warn("ESPN getAllFinishedMatchesToday: error fetching cup {} â {}", cup.displayName(), e.getMessage());
                 }
             }
 
@@ -499,7 +500,7 @@ public class EspnFootballDataService {
         return result;
     }
 
-    // ── SECTION 1C: UPCOMING FIXTURES — NEXT N DAYS (ALL LEAGUES + CUPS) ──
+    // ââ SECTION 1C: UPCOMING FIXTURES â NEXT N DAYS (ALL LEAGUES + CUPS) ââ
 
     public List<Map<String, Object>> getAllUpcomingFixturesByDate(String yyyymmdd) {
         String cacheKey = "upcoming:all:" + yyyymmdd;
@@ -512,13 +513,13 @@ public class EspnFootballDataService {
                     all.addAll(extractEvents(
                             fetch(league.slug() + "/scoreboard?dates=" + yyyymmdd), league.displayName()));
                 } catch (Exception e) {
-                    log.warn("ESPN getAllUpcomingFixturesByDate({}): error fetching {} — {}",
+                    log.warn("ESPN getAllUpcomingFixturesByDate({}): error fetching {} â {}",
                             yyyymmdd, league.displayName(), e.getMessage());
                 }
             }
 
-            // Include ALL cups/competitions — Champions League, Europa League, Conference
-            // League, domestic cups, international tournaments (Euros/Copa América/AFCON/
+            // Include ALL cups/competitions â Champions League, Europa League, Conference
+            // League, domestic cups, international tournaments (Euros/Copa AmÃ©rica/AFCON/
             // Club World Cup), continental club comps (CAF/CONCACAF/CONMEBOL), preseason/
             // club friendlies, etc.
             for (EspnCup cup : EspnCup.allCups()) {
@@ -526,7 +527,7 @@ public class EspnFootballDataService {
                     all.addAll(extractEvents(
                             fetch(cup.slug() + "/scoreboard?dates=" + yyyymmdd), cup.displayName()));
                 } catch (Exception e) {
-                    log.warn("ESPN getAllUpcomingFixturesByDate({}): error fetching cup {} — {}",
+                    log.warn("ESPN getAllUpcomingFixturesByDate({}): error fetching cup {} â {}",
                             yyyymmdd, cup.displayName(), e.getMessage());
                 }
             }
@@ -570,7 +571,7 @@ public class EspnFootballDataService {
         });
     }
 
-    /** Kept for backwards compatibility — delegates to the 3-day window. */
+    /** Kept for backwards compatibility â delegates to the 3-day window. */
     public Map<String, List<Map<String, Object>>> getUpcomingFixturesNext7Days() {
         return getUpcomingFixturesNextDays(3);
     }
@@ -586,7 +587,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 2: SCOREBOARD — CUP ───────────────────────────────────────
+    // ââ SECTION 2: SCOREBOARD â CUP âââââââââââââââââââââââââââââââââââââââ
 
     public List<Map<String, Object>> getCupScoreboard(EspnCup cup) {
         String cacheKey = "scoreboard:cup:" + cup.slug();
@@ -717,8 +718,8 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 2B: INTERNATIONAL TOURNAMENTS ─────────────────────────────
-    // (UEFA European Championship, Copa América, Africa Cup of Nations, FIFA Club World Cup)
+    // ââ SECTION 2B: INTERNATIONAL TOURNAMENTS âââââââââââââââââââââââââââââ
+    // (UEFA European Championship, Copa AmÃ©rica, Africa Cup of Nations, FIFA Club World Cup)
 
     public List<Map<String, Object>> getInternationalTournamentsTodayMatches() {
         return cachedStd("today:intl-tournaments:all", () -> {
@@ -756,7 +757,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 2C: CONTINENTAL CLUB COMPETITIONS (NON-UEFA) ──────────────
+    // ââ SECTION 2C: CONTINENTAL CLUB COMPETITIONS (NON-UEFA) ââââââââââââââ
     // (CAF Champions League, CONCACAF Champions Cup, Copa Libertadores, Copa Sudamericana)
 
     public List<Map<String, Object>> getContinentalClubCompsTodayMatches() {
@@ -795,7 +796,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 2D: PRESEASON / CLUB FRIENDLIES ───────────────────────────
+    // ââ SECTION 2D: PRESEASON / CLUB FRIENDLIES âââââââââââââââââââââââââââ
 
     public List<Map<String, Object>> getPreseasonFriendliesTodayMatches() {
         return cachedStd("today:preseason:all", () -> {
@@ -846,7 +847,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 3: DATE-RANGE / UPCOMING FIXTURES ─────────────────────────
+    // ââ SECTION 3: DATE-RANGE / UPCOMING FIXTURES âââââââââââââââââââââââââ
 
     public List<Map<String, Object>> getUpcomingFixturesByDate(EspnLeague league, String yyyymmdd) {
         log.info("ESPN getUpcomingFixturesByDate({}, {}): fetching", league.displayName(), yyyymmdd);
@@ -884,7 +885,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 4: MATCH DETAIL / SUMMARY ─────────────────────────────────
+    // ââ SECTION 4: MATCH DETAIL / SUMMARY âââââââââââââââââââââââââââââââââ
 
     public Map<String, Object> getMatchSummary(EspnLeague league, String eventId) {
         log.info("ESPN getMatchSummary({}, event={}): fetching full summary", league.displayName(), eventId);
@@ -949,7 +950,7 @@ public class EspnFootballDataService {
                 }
             }
         } catch (Exception e) {
-            log.warn("ESPN extractMatchOdds: error during extraction — {}", e.getMessage());
+            log.warn("ESPN extractMatchOdds: error during extraction â {}", e.getMessage());
         }
         return result;
     }
@@ -988,7 +989,7 @@ public class EspnFootballDataService {
                 }
             }
         } catch (Exception e) {
-            log.warn("ESPN extractRecentForm: error — {}", e.getMessage());
+            log.warn("ESPN extractRecentForm: error â {}", e.getMessage());
         }
         return Collections.emptyList();
     }
@@ -1004,7 +1005,7 @@ public class EspnFootballDataService {
                 }
             }
         } catch (Exception e) {
-            log.warn("ESPN extractMatchNews: error — {}", e.getMessage());
+            log.warn("ESPN extractMatchNews: error â {}", e.getMessage());
         }
         return Collections.emptyList();
     }
@@ -1018,7 +1019,7 @@ public class EspnFootballDataService {
         return Collections.emptyList();
     }
 
-    // ── SECTION 5: STANDINGS ──────────────────────────────────────────────
+    // ââ SECTION 5: STANDINGS ââââââââââââââââââââââââââââââââââââââââââââââ
 
     public Map<String, Object> getStandings(EspnLeague league) {
         return cachedStatic("standings:league:" + league.slug(), () -> {
@@ -1049,7 +1050,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 6: TEAMS ──────────────────────────────────────────────────
+    // ââ SECTION 6: TEAMS ââââââââââââââââââââââââââââââââââââââââââââââââââ
 
     public Map<String, Object> getTeams(EspnLeague league) {
         return cachedStatic("teams:league:" + league.slug(), () -> {
@@ -1068,7 +1069,7 @@ public class EspnFootballDataService {
         });
     }
 
-    // ── SECTION 7: STATUS DETECTION ───────────────────────────────────────
+    // ââ SECTION 7: STATUS DETECTION âââââââââââââââââââââââââââââââââââââââ
 
     public static boolean isLive(Map<String, Object> event) {
         return STATE_IN.equals(extractState(event));
@@ -1082,7 +1083,7 @@ public class EspnFootballDataService {
         return STATE_PRE.equals(extractState(event));
     }
 
-    // ── SECTION 8: FIELD EXTRACTORS ───────────────────────────────────────
+    // ââ SECTION 8: FIELD EXTRACTORS âââââââââââââââââââââââââââââââââââââââ
 
     public static String extractEventId(Map<String, Object> event) {
         Object id = event.get("id");
@@ -1137,7 +1138,7 @@ public class EspnFootballDataService {
                 }
             }
         } catch (Exception e) {
-            log.trace("extractStatus: error — {}", e.getMessage());
+            log.trace("extractStatus: error â {}", e.getMessage());
         }
         return "";
     }
@@ -1164,7 +1165,7 @@ public class EspnFootballDataService {
      * Returns the real competition/league name for an event (e.g. "Championship").
      *
      * Resolution order:
-     *   1. The name stamped onto the event at fetch time (see extractEvents) — reliable,
+     *   1. The name stamped onto the event at fetch time (see extractEvents) â reliable,
      *      and matches our EspnLeague/EspnCup display names used by downstream filters.
      *   2. A league object nested inside the competition, if ESPN supplies one.
      *   3. Empty string.
@@ -1216,12 +1217,12 @@ public class EspnFootballDataService {
                 return city;
             }
         } catch (Exception e) {
-            log.trace("extractVenue: error — {}", e.getMessage());
+            log.trace("extractVenue: error â {}", e.getMessage());
         }
         return "";
     }
 
-    // ── SECTION 9: UTILITY ────────────────────────────────────────────────
+    // ââ SECTION 9: UTILITY ââââââââââââââââââââââââââââââââââââââââââââââââ
 
     public static String formatDate(LocalDate date) {
         return date.format(ESPN_DATE_FMT);
@@ -1245,7 +1246,7 @@ public class EspnFootballDataService {
         log.debug("ESPN invalidateCache('{}'): invalidated across all tiers", key);
     }
 
-    // ── PRIVATE: HTTP FETCH ───────────────────────────────────────────────
+    // ââ PRIVATE: HTTP FETCH âââââââââââââââââââââââââââââââââââââââââââââââ
 
     private Map<String, Object> fetch(String path) {
         log.debug("ESPN fetch: GET /{}", path);
@@ -1257,7 +1258,7 @@ public class EspnFootballDataService {
                     .timeout(Duration.ofSeconds(10))
                     .subscribeOn(Schedulers.boundedElastic())
                     .onErrorResume(e -> {
-                        log.warn("ESPN fetch /{}: network error — {}", path, e.getMessage());
+                        log.warn("ESPN fetch /{}: network error â {}", path, e.getMessage());
                         return reactor.core.publisher.Mono.empty();
                     })
                     .block();
@@ -1272,24 +1273,24 @@ public class EspnFootballDataService {
             return parsed;
 
         } catch (Exception e) {
-            log.error("ESPN fetch /{}: exception — {}", path, e.getMessage());
+            log.error("ESPN fetch /{}: exception â {}", path, e.getMessage());
             return null;
         }
     }
 
-    // ── PRIVATE: CACHE HELPERS ────────────────────────────────────────────
+    // ââ PRIVATE: CACHE HELPERS ââââââââââââââââââââââââââââââââââââââââââââ
 
-    /** 30-second cache — for live/in-progress match data only. */
+    /** 30-second cache â for live/in-progress match data only. */
     private <T> T cachedLive(String key, java.util.function.Supplier<T> loader) {
         return cached(liveCache, key, loader);
     }
 
-    /** 90-second cache — for today's scoreboard, upcoming, finished buckets. */
+    /** 90-second cache â for today's scoreboard, upcoming, finished buckets. */
     private <T> T cachedStd(String key, java.util.function.Supplier<T> loader) {
         return cached(stdCache, key, loader);
     }
 
-    /** 10-minute cache — for standings, team lists, schedules. */
+    /** 10-minute cache â for standings, team lists, schedules. */
     private <T> T cachedStatic(String key, java.util.function.Supplier<T> loader) {
         return cached(staticCache, key, loader);
     }
@@ -1309,7 +1310,7 @@ public class EspnFootballDataService {
         return result;
     }
 
-    // ── PRIVATE: RESPONSE EXTRACTION HELPERS ─────────────────────────────
+    // ââ PRIVATE: RESPONSE EXTRACTION HELPERS âââââââââââââââââââââââââââââ
 
     /**
      * Extracts events and stamps each one with the competition name so the real
@@ -1392,7 +1393,7 @@ public class EspnFootballDataService {
                 }
             }
         } catch (Exception e) {
-            log.trace("extractCompetitorField({}, {}): error — {}", side, field, e.getMessage());
+            log.trace("extractCompetitorField({}, {}): error â {}", side, field, e.getMessage());
         }
         return "";
     }
