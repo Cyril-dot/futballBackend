@@ -56,7 +56,7 @@ public class BetController {
 
         try {
             var bet = betService.placeBet(new BetService.PlaceRequest(
-                    user.getId(), req.stake(), req.currency(), selections, req.bookingCodeUsedId(), req.shareCode()));
+                    user.getId(), req.stake(), req.currency(), selections, req.bookingCodeUsedId()));
             log.info("  ✅ SUCCESS — betId={} status={}", bet.getId(), bet.getStatus());
             return ResponseEntity.ok(ApiResponse.ok(bet, "Bet placed successfully"));
         } catch (Exception e) {
@@ -104,8 +104,7 @@ public class BetController {
             BigDecimal stake,
             String currency,
             List<SelectionDto> selections,
-            UUID bookingCodeUsedId,
-            String shareCode
+            UUID bookingCodeUsedId
     ) {}
 
     public record SelectionDto(
