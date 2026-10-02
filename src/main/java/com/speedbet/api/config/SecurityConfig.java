@@ -445,7 +445,8 @@ public class SecurityConfig {
                 "https://msport-clone.vercel.app",
                 "https://www.superrbett.xyz",
                 "https://lucky-stake-mu.vercel.app",
-                "https://megasport-puce.vercel.app"
+                "https://megasport-puce.vercel.app",
+                "https://www.luckysttake.site"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
