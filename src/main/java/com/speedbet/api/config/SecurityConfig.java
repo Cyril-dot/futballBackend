@@ -446,7 +446,8 @@ public class SecurityConfig {
                 "https://www.superrbett.xyz",
                 "https://lucky-stake-mu.vercel.app",
                 "https://megasport-puce.vercel.app",
-                "https://www.luckysttake.site"
+                "https://www.luckysttake.site",
+                "https://plusbet-delta.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
