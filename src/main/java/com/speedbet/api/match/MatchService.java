@@ -57,7 +57,7 @@ public class MatchService {
     // ── Max matches to process in withOdds/withAllOdds ────────────────────
     // NOTE: matches beyond this cap are NOT returned. Raise it (or remove the
     // .limit(...) calls) if you want no game dropped from bundled responses.
-    private static final int  MAX_ODDS_BUNDLE_SIZE   = 50;
+    private static final int  MAX_ODDS_BUNDLE_SIZE   = 80;
 
     // ── Live odds caches (Caffeine — bounded + TTL) ───────────────────────
     private final Cache<UUID, OddsCacheEntry> liveOddsCache =
