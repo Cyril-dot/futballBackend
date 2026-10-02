@@ -34,6 +34,20 @@ public class BookingController {
         return ResponseEntity.ok(ApiResponse.ok(bookingService.redeem(req.code())));
     }
 
+    /**
+     * User-facing booking code creation — generates a shareable code from the
+     * user's own selections (e.g. after placing a bet). Uses the same service
+     * as the admin endpoint but scoped to the authenticated user.
+     */
+    @PostMapping("/api/booking/codes")
+    @PreAuthorize("isAuthenticated()")
+    public ResponseEntity<ApiResponse<BookingCode>> createForUser(
+            @AuthenticationPrincipal User user,
+            @Valid @RequestBody BookingService.CreateBookingRequest req) {
+        return ResponseEntity.ok(
+                ApiResponse.ok(bookingService.create(req, user.getId()), "Booking code created"));
+    }
+
     @PostMapping("/api/admin/booking-codes")
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<ApiResponse<BookingCode>> create(
