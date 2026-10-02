@@ -36,10 +36,11 @@ public class BetService {
     private final MatchService    matchService;
     private final WalletService   walletService;
     private final UserRepository  userRepo;
+    private final BettingLimits   bettingLimits;
 
     public record PlaceRequest(
             UUID userId, BigDecimal stake, String currency,
-            List<SelectionRequest> selections, UUID bookingCodeUsedId
+            List<SelectionRequest> selections, UUID bookingCodeUsedId, String shareCode
     ) {}
 
     @Transactional
@@ -70,14 +71,19 @@ public class BetService {
             throw ApiException.badRequest("Max " + MAX_SELECTIONS + " selections per bet");
         if (req.stake() == null)
             throw ApiException.badRequest("Stake is required");
-        if (req.stake().compareTo(BigDecimal.ONE) < 0)
-            throw ApiException.badRequest("Minimum stake is GHS 1.00");
 
         // Resolve currency server-side from user's country — never trust the client value
         String currency = userRepo.findById(req.userId())
                 .map(u -> CurrencyResolver.forCountry(u.getCountry()))
                 .orElse("GHS");
         log.info("placeBet — resolved currency={} for userId={}", currency, req.userId());
+
+        // Stake range comes from BettingLimits (app.betting.* config) — the
+        // same values GET /api/public/config publishes to the frontend.
+        if (req.stake().compareTo(bettingLimits.minStake()) < 0)
+            throw ApiException.badRequest("Minimum stake is " + currency + " " + bettingLimits.describe(bettingLimits.minStake()));
+        if (req.stake().compareTo(bettingLimits.maxStake()) > 0)
+            throw ApiException.badRequest("Maximum stake is " + currency + " " + bettingLimits.describe(bettingLimits.maxStake()));
 
         // Validate and lock odds
         List<BetSelection> lockedSelections = req.selections().stream().map(s -> {
@@ -152,6 +158,7 @@ public class BetService {
                 .potentialReturn(potentialReturn)
                 .status(BetStatus.PENDING)
                 .bookingCodeUsedId(req.bookingCodeUsedId())
+                .shareCode(req.shareCode())
                 .build();
         bet = betRepo.save(bet);
         log.info("placeBet — bet persisted id={}", bet.getId());
