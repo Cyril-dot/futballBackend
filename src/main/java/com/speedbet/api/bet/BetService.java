@@ -40,7 +40,7 @@ public class BetService {
 
     public record PlaceRequest(
             UUID userId, BigDecimal stake, String currency,
-            List<SelectionRequest> selections, UUID bookingCodeUsedId, String shareCode
+            List<SelectionRequest> selections, UUID bookingCodeUsedId
     ) {}
 
     @Transactional
@@ -158,7 +158,6 @@ public class BetService {
                 .potentialReturn(potentialReturn)
                 .status(BetStatus.PENDING)
                 .bookingCodeUsedId(req.bookingCodeUsedId())
-                .shareCode(req.shareCode())
                 .build();
         bet = betRepo.save(bet);
         log.info("placeBet — bet persisted id={}", bet.getId());
