@@ -55,9 +55,6 @@ public class Bet {
     @Column(name = "booking_code_used_id")
     private UUID bookingCodeUsedId;
 
-    @Column(name = "share_code")
-    private String shareCode;
-
     // ── Cashout fields ────────────────────────────────────────────────────
 
     /** Amount credited to the wallet when this bet was cashed out. Null if not cashed out. */
