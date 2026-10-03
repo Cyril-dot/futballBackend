@@ -1,5 +1,6 @@
 package com.speedbet.api.bet.cashout;
 
+import com.speedbet.api.user.User;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -42,9 +43,9 @@ public class CashoutController {
     public ResponseEntity<CashoutService.CashoutPreview> preview(
             @PathVariable UUID betId,
             @RequestParam(defaultValue = "100") int pct,
-            @AuthenticationPrincipal UUID userId) {
+            @AuthenticationPrincipal User user) {
 
-        return ResponseEntity.ok(cashoutService.preview(betId, userId, pct));
+        return ResponseEntity.ok(cashoutService.preview(betId, user.getId(), pct));
     }
 
     /**
@@ -53,9 +54,9 @@ public class CashoutController {
     @PostMapping("/full")
     public ResponseEntity<CashoutService.CashoutResult> cashoutFull(
             @PathVariable UUID betId,
-            @AuthenticationPrincipal UUID userId) {
+            @AuthenticationPrincipal User user) {
 
-        return ResponseEntity.ok(cashoutService.cashoutFull(betId, userId));
+        return ResponseEntity.ok(cashoutService.cashoutFull(betId, user.getId()));
     }
 
     /**
@@ -67,8 +68,8 @@ public class CashoutController {
     public ResponseEntity<CashoutService.CashoutResult> cashoutPartial(
             @PathVariable UUID betId,
             @RequestParam int pct,
-            @AuthenticationPrincipal UUID userId) {
+            @AuthenticationPrincipal User user) {
 
-        return ResponseEntity.ok(cashoutService.cashoutPartial(betId, userId, pct));
+        return ResponseEntity.ok(cashoutService.cashoutPartial(betId, user.getId(), pct));
     }
 }
