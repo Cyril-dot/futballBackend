@@ -286,12 +286,21 @@ public class CashoutService {
                     "Cashout unavailable — bet is already " + bet.getStatus());
         }
 
-        boolean allFinished = bet.getSelections().stream()
+        var matches = bet.getSelections().stream()
                 .map(BetSelection::getMatchId)
                 .distinct()
                 .map(matchRepo::findById)
                 .filter(Optional::isPresent)
                 .map(Optional::get)
+                .toList();
+
+        // If we can't find match records, don't block cashout — treat as available
+        if (matches.isEmpty()) {
+            log.warn("cashout eligibility — no match records found for bet {}, allowing cashout", bet.getId());
+            return;
+        }
+
+        boolean allFinished = matches.stream()
                 .allMatch(m -> "FINISHED".equalsIgnoreCase(m.getStatus())
                         || "CANCELLED".equalsIgnoreCase(m.getStatus())
                         || "POSTPONED".equalsIgnoreCase(m.getStatus()));
@@ -333,13 +342,19 @@ public class CashoutService {
                     Optional<com.speedbet.api.odds.Odds> dbOdds =
                             oddsRepo.findFirstByMatchIdAndMarketAndSelection(
                                     s.getMatchId(), s.getMarket(), s.getSelection());
-                    if (dbOdds.isPresent()) {
+                    if (dbOdds.isPresent() && dbOdds.get().getValue() != null) {
                         return dbOdds.get().getValue();
                     }
-                    log.warn("resolveCurrentTotalOdds — DB miss matchId={} market={} selection={}, "
-                                    + "falling back to lockedOdds={}",
-                            s.getMatchId(), s.getMarket(), s.getSelection(), s.getOddsLocked());
-                    return s.getOddsLocked();
+                    BigDecimal locked = s.getOddsLocked();
+                    if (locked != null) {
+                        log.warn("resolveCurrentTotalOdds — DB miss matchId={} market={} selection={}, "
+                                        + "falling back to lockedOdds={}",
+                                s.getMatchId(), s.getMarket(), s.getSelection(), locked);
+                        return locked;
+                    }
+                    log.error("resolveCurrentTotalOdds — NO odds available for matchId={} market={} selection={}, using 1.0",
+                            s.getMatchId(), s.getMarket(), s.getSelection());
+                    return BigDecimal.ONE;
                 })
                 .reduce(BigDecimal.ONE, (a, b) -> a.multiply(b, MathContext.DECIMAL64));
     }
