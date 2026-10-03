@@ -172,6 +172,7 @@ public class SecurityConfig {
                         //       this path is permitAll: RushPay's servers have no JWT.
                         .requestMatchers(HttpMethod.GET,  "/api/tip/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
+                        .requestMatchers(HttpMethod.GET,  "/api/webhooks/alphapay").permitAll()
 
                         // ── Booking ───────────────────────────────────────────────────────
                         .requestMatchers(HttpMethod.POST, "/api/booking/redeem").permitAll()
