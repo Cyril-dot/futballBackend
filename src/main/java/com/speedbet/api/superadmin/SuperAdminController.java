@@ -1,5 +1,6 @@
 package com.speedbet.api.superadmin;
 
+import com.speedbet.api.affiliate.AffiliateCommissionService;
 import com.speedbet.api.affiliate.AffiliateWithdrawalRequest;
 import com.speedbet.api.affiliate.AffiliateWithdrawalStatus;
 import com.speedbet.api.audit.AuditLog;
@@ -7,6 +8,7 @@ import com.speedbet.api.audit.AuditService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.common.PageResponse;
+import com.speedbet.api.referral.ReferralLinkRepository;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserRole;
@@ -39,6 +41,8 @@ public class SuperAdminController {
     private final AuditService auditService;
     private final SuperAdminQueryService queryService;
     private final WalletService walletService;
+    private final ReferralLinkRepository referralLinkRepo;
+    private final AffiliateCommissionService commissionService;
 
     // ══════════════════════════════════════════════════════════════════════════
     // EXISTING ENDPOINTS (unchanged)
@@ -100,6 +104,40 @@ public class SuperAdminController {
                 null, Map.of("email", admin.getEmail(), "commissionRate", rate.toPlainString()), null);
 
         return ResponseEntity.ok(ApiResponse.ok(admin, "Admin created with " + rate + "% commission rate"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // NEW: LIST ADMINS WITH COMMISSION INFO
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * GET /api/super-admin/admins/with-commission
+     *
+     * Lists all admins with their commission rate (from their active referral
+     * link), current unpaid commission balance, and lifetime earnings.
+     */
+    @GetMapping("/admins/with-commission")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> adminsWithCommission() {
+        var admins = userRepo.findAll().stream()
+                .filter(u -> u.getRole() == UserRole.ADMIN)
+                .map(u -> {
+                    var links = referralLinkRepo.findByAdminId(u.getId());
+                    var activeLink = links.stream().filter(l -> l.isActive()).findFirst()
+                            .orElse(links.stream().findFirst().orElse(null));
+                    var balance = commissionService.getOrCreate(u.getId());
+                    Map<String, Object> row = new java.util.LinkedHashMap<>();
+                    row.put("id", u.getId());
+                    row.put("email", u.getEmail());
+                    row.put("firstName", u.getFirstName());
+                    row.put("lastName", u.getLastName());
+                    row.put("commissionRate", activeLink != null ? activeLink.getCommissionPercent() : null);
+                    row.put("commissionBalance", balance.getBalance());
+                    row.put("totalEarned", balance.getTotalEarnedLifetime());
+                    row.put("totalPaidOut", balance.getTotalPaidOutLifetime());
+                    return row;
+                })
+                .toList();
+        return ResponseEntity.ok(ApiResponse.ok(admins));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
