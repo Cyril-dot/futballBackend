@@ -48,6 +48,16 @@ public class SuperAdminCommissionOperationsService {
 
     @Transactional(readOnly = true)
     public List<SuperAdminCommissionOperationsDtos.DailyAdminCommissionDto> daily(LocalDate date, UUID adminId) {
+        try {
+            return dailyInternal(date, adminId);
+        } catch (RuntimeException ex) {
+            log.error("commission.daily.failed date={} adminId={} type={} message={}", date, adminId,
+                    ex.getClass().getSimpleName(), ex.getMessage(), ex);
+            throw ex;
+        }
+    }
+
+    private List<SuperAdminCommissionOperationsDtos.DailyAdminCommissionDto> dailyInternal(LocalDate date, UUID adminId) {
         LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;
         Instant from = reportDate.atStartOfDay(REPORT_ZONE).toInstant();
         Instant to = reportDate.plusDays(1).atStartOfDay(REPORT_ZONE).toInstant();

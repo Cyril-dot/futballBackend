@@ -16,7 +16,6 @@ import com.speedbet.api.user.UserService;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -35,7 +34,6 @@ import java.util.UUID;
 @RequestMapping("/api/super-admin")
 @PreAuthorize("hasRole('SUPER_ADMIN')")
 @RequiredArgsConstructor
-@Slf4j
 public class SuperAdminController {
 
     private final UserRepository userRepo;
@@ -56,71 +54,6 @@ public class SuperAdminController {
                 .filter(u -> u.getRole() == UserRole.ADMIN)
                 .toList();
         return ResponseEntity.ok(ApiResponse.ok(admins));
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // COMMISSION ANALYTICS
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /**
-     * GET /api/super-admin/commission/daily
-     *
-     * Per-admin commission analytics: rate, unpaid balance, lifetime earned
-     * and paid out, plus platform totals.
-     */
-    @GetMapping("/commission/daily")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> commissionAnalytics() {
-        try {
-            var perAdmin = userRepo.findAll().stream()
-                    .filter(u -> u.getRole() == UserRole.ADMIN)
-                    .map(u -> {
-                        try {
-                            var links = referralLinkRepo.findByAdminId(u.getId());
-                            var activeLink = links.stream().filter(l -> l.isActive()).findFirst()
-                                    .orElse(links.stream().findFirst().orElse(null));
-                            var balance = commissionService.getOrCreate(u.getId());
-                            Map<String, Object> row = new java.util.LinkedHashMap<>();
-                            var name = ((u.getFirstName() != null ? u.getFirstName() : "") + " " + (u.getLastName() != null ? u.getLastName() : "")).trim();
-                            row.put("adminId", u.getId());
-                            row.put("adminName", name.isEmpty() ? u.getEmail() : name);
-                            row.put("email", u.getEmail());
-                            row.put("commissionRate", activeLink != null && activeLink.getCommissionPercent() != null
-                                    ? activeLink.getCommissionPercent() : BigDecimal.ZERO);
-                            row.put("unpaidBalance", bd(balance.getBalance()));
-                            row.put("lifetimeEarned", bd(balance.getTotalEarnedLifetime()));
-                            row.put("lifetimePaidOut", bd(balance.getTotalPaidOutLifetime()));
-                            return row;
-                        } catch (Exception e) {
-                            log.error("commissionAnalytics — skipping admin {}: {}", u.getId(), e.getMessage(), e);
-                            return null;
-                        }
-                    })
-                    .filter(java.util.Objects::nonNull)
-                    .sorted((a, b) -> bd(b.get("lifetimeEarned")).compareTo(bd(a.get("lifetimeEarned"))))
-                    .toList();
-
-            var totalEarned = perAdmin.stream().map(r -> bd(r.get("lifetimeEarned"))).reduce(BigDecimal.ZERO, BigDecimal::add);
-            var totalUnpaid = perAdmin.stream().map(r -> bd(r.get("unpaidBalance"))).reduce(BigDecimal.ZERO, BigDecimal::add);
-            var totalPaidOut = perAdmin.stream().map(r -> bd(r.get("lifetimePaidOut"))).reduce(BigDecimal.ZERO, BigDecimal::add);
-
-            Map<String, Object> result = new java.util.LinkedHashMap<>();
-            result.put("admins", perAdmin);
-            result.put("totalAdmins", perAdmin.size());
-            result.put("totalEarned", totalEarned);
-            result.put("totalUnpaid", totalUnpaid);
-            result.put("totalPaidOut", totalPaidOut);
-            return ResponseEntity.ok(ApiResponse.ok(result));
-        } catch (Exception e) {
-            log.error("commissionAnalytics FAILED: {}", e.getMessage(), e);
-            throw e;
-        }
-    }
-
-    /** Null-safe BigDecimal — legacy balance rows can carry NULLs. */
-    private static BigDecimal bd(Object v) {
-        if (v instanceof BigDecimal b) return b;
-        if (v instanceof Number n) return BigDecimal.valueOf(n.doubleValue());
-        return BigDecimal.ZERO;
     }
 
     @PostMapping("/admins")
