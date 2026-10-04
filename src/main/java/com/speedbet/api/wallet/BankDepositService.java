@@ -6,6 +6,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.speedbet.api.common.ApiException;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.user.UserRepository;
 
@@ -61,6 +62,28 @@ public class BankDepositService {
     public BankDeposit getById(UUID id) {
         return repo.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("Bank deposit not found: " + id));
+    }
+
+    // ── User: submit a deposit ─────────────────────────────────────────────────
+
+    @Transactional
+    public BankDeposit submit(UUID userId, BankDepositDtos.SubmitRequest req) {
+        // Prevent duplicate submissions with the same transfer reference
+        if (repo.existsByTransferReference(req.getTransferReference())) {
+            throw ApiException.conflict(
+                    "A deposit with this transfer reference was already submitted.");
+        }
+        BankDeposit deposit = BankDeposit.builder()
+                .userId(userId)
+                .transferReference(req.getTransferReference().trim())
+                .ngnAmountSent(req.getNgnAmountSent())
+                .expectedNgnCredit(req.getExpectedNgnCredit())
+                .senderAccountName(req.getSenderAccountName())
+                .screenshotUrl(req.getScreenshotUrl())
+                .userNote(req.getUserNote())
+                .status(BankDepositStatus.PENDING)
+                .build();
+        return repo.save(deposit);
     }
 
     // ── Admin: approve ────────────────────────────────────────────────────────
