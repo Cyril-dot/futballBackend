@@ -1,5 +1,6 @@
 package com.speedbet.api.user;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.*;
 import org.springframework.security.core.GrantedAuthority;
@@ -45,6 +46,7 @@ public class User implements UserDetails {
 
     private String phone;
 
+    @JsonIgnore
     @Column(name = "password_hash", nullable = false)
     private String passwordHash;
 
@@ -80,6 +82,7 @@ public class User implements UserDetails {
     @Builder.Default
     private boolean winSeen = true;
 
+    @JsonIgnore
     @Column(name = "totp_secret")
     private String totpSecret;
 
@@ -87,6 +90,7 @@ public class User implements UserDetails {
     @Builder.Default
     private boolean totpEnabled = false;
 
+    @JsonIgnore
     @Column(name = "totp_backup_codes", columnDefinition = "TEXT")
     private String totpBackupCodes;
 
@@ -97,9 +101,11 @@ public class User implements UserDetails {
     @Column(name = "email_verified_at")
     private LocalDateTime emailVerifiedAt;
 
+    @JsonIgnore
     @Column(name = "verification_token")
     private String verificationToken;
 
+    @JsonIgnore
     @Column(name = "reset_token")
     private String resetToken;
 
@@ -115,6 +121,7 @@ public class User implements UserDetails {
     @Override public Collection<? extends GrantedAuthority> getAuthorities() {
         return List.of(new SimpleGrantedAuthority("ROLE_" + role.name()));
     }
+    @JsonIgnore
     @Override public String getPassword()               { return passwordHash; }
     @Override public String getUsername()               { return email; }
     @Override public boolean isAccountNonExpired()      { return true; }
