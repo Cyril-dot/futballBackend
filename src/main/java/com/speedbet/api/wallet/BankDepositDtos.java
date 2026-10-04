@@ -9,6 +9,32 @@ import java.util.UUID;
 
 public class BankDepositDtos {
 
+    // ── User submits a deposit ────────────────────────────────────────────────
+    @Getter @Setter
+    public static class SubmitRequest {
+
+        @NotBlank(message = "Transfer reference is required")
+        @Size(max = 128, message = "Transfer reference is too long")
+        private String transferReference;
+
+        @NotNull(message = "Amount sent is required")
+        @DecimalMin(value = "1.00", message = "Amount sent must be positive")
+        private BigDecimal ngnAmountSent;
+
+        @NotNull(message = "Expected credit amount is required")
+        @DecimalMin(value = "1.00", message = "Expected credit must be positive")
+        private BigDecimal expectedNgnCredit;
+
+        @Size(max = 256)
+        private String senderAccountName;   // optional
+
+        @Size(max = 2000000, message = "Screenshot is too large")
+        private String screenshotUrl;       // optional (hosted URL or data-URL)
+
+        @Size(max = 1000)
+        private String userNote;            // optional
+    }
+
     // ── Admin approves ────────────────────────────────────────────────────────
     @Getter @Setter
     public static class ApproveRequest {
