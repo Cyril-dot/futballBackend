@@ -43,6 +43,22 @@ public class BankDepositController {
         return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
     }
 
+    /**
+     * User submits a manual deposit (MoMo/USDT proof + screenshot URL).
+     * Goes to PENDING for super-admin review.
+     */
+    @PostMapping("/api/wallet/bank-deposits")
+    public ResponseEntity<ApiResponse<BankDepositDtos.DepositResponse>> submitDeposit(
+            @AuthenticationPrincipal User user,
+            @Valid @RequestBody BankDepositDtos.SubmitRequest req) {
+
+        var deposit = service.submit(user.getId(), req);
+        return ResponseEntity.ok(ApiResponse.ok(
+                BankDepositDtos.DepositResponse.from(deposit),
+                "Deposit submitted. It will be reviewed shortly."
+        ));
+    }
+
     // ── Admin endpoints ───────────────────────────────────────────────────────
 
     @GetMapping("/api/admin/bank-deposits")
