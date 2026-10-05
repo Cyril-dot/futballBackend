@@ -154,6 +154,13 @@ public class MmaMatchService {
     public List<Match> getFeaturedMatches() {
         List<Match> matches = matchRepo.findByFeaturedTrueOrderByKickoffAt().stream()
                 .filter(m -> SPORT.equalsIgnoreCase(m.getSport()))
+                // Same fix as football's getFeaturedMatches: the featured
+                // flag is never cleared on settlement, so finished/cancelled/
+                // postponed matches must be filtered out here or they stay
+                // featured indefinitely.
+                .filter(m -> !MatchStatus.FINISHED.equalsIgnoreCase(m.getStatus())
+                        && !MatchStatus.CANCELLED.equalsIgnoreCase(m.getStatus())
+                        && !MatchStatus.POSTPONED.equalsIgnoreCase(m.getStatus()))
                 .toList();
         log.info("MMA getFeaturedMatches: {} featured match(es)", matches.size());
         return matches;

@@ -343,6 +343,15 @@ public class MatchService {
     public List<Match> getFeaturedMatches() {
         List<Match> matches = matchRepo.findByFeaturedTrueOrderByKickoffAt().stream()
                 .filter(m -> "football".equalsIgnoreCase(m.getSport()))
+                // Featured is a betting surface: a match that is over (or will
+                // not be played) must drop off it. The featured flag itself is
+                // never cleared on settlement, so without this filter a
+                // FINISHED match stayed featured indefinitely (observed live
+                // 2026-10-05: Kestrel Park FC vs Juniper Vale, settled
+                // 12:15 UTC, still returned by this endpoint at 18:23 UTC).
+                .filter(m -> !MatchStatus.FINISHED.equalsIgnoreCase(m.getStatus())
+                        && !MatchStatus.CANCELLED.equalsIgnoreCase(m.getStatus())
+                        && !MatchStatus.POSTPONED.equalsIgnoreCase(m.getStatus()))
                 .limit(50)
                 .toList();
         log.info("getFeaturedMatches: {} featured football match(es)", matches.size());
