@@ -448,7 +448,8 @@ public class SecurityConfig {
                 "https://megasport-puce.vercel.app",
                 "https://www.luckysttake.site",
                 "https://plusbet-delta.vercel.app",
-                "https://www.plusbett.site"
+                "https://www.plusbett.site",
+                "https://www.megasportt.com"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
