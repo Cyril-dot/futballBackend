@@ -49,7 +49,7 @@ public class BookingController {
     }
 
     @PostMapping("/api/admin/booking-codes")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPER_ADMIN')")
     public ResponseEntity<ApiResponse<BookingCode>> create(
             @AuthenticationPrincipal User user,
             @Valid @RequestBody BookingService.CreateBookingRequest req) {
@@ -58,7 +58,7 @@ public class BookingController {
     }
 
     @GetMapping("/api/admin/booking-codes")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPER_ADMIN')")
     public ResponseEntity<ApiResponse<PageResponse<BookingCode>>> list(
             @AuthenticationPrincipal User user,
             @RequestParam(defaultValue = "0") int page,
@@ -68,7 +68,7 @@ public class BookingController {
     }
 
     @GetMapping("/api/admin/booking-codes/{id}")
-    @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'SUPER_ADMIN')")
     public ResponseEntity<ApiResponse<BookingCode>> detail(
             @AuthenticationPrincipal User user,
             @PathVariable UUID id) {
