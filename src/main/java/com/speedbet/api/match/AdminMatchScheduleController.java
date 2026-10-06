@@ -26,7 +26,7 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/admin/matches/auto")
 @RequiredArgsConstructor
-@PreAuthorize("hasRole('ADMIN')")
+@PreAuthorize("hasAnyRole('ADMIN', 'SUPER_ADMIN')")
 public class AdminMatchScheduleController {
 
     private final AdminMatchScheduleService adminMatchScheduleService;

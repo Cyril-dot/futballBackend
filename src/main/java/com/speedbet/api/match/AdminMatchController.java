@@ -18,7 +18,7 @@ import java.util.UUID;
  * Admin-only REST controller for match lifecycle management.
  *
  * Every endpoint:
- *   1. Requires the ADMIN role (enforced by @PreAuthorize).
+ *   1. Requires the ADMIN or SUPER_ADMIN role (enforced by @PreAuthorize).
  *   2. Receives the authenticated admin via @AuthenticationPrincipal — the
  *      identity is never taken from the request body.
  *   3. Delegates to AdminMatchService which enforces per-admin ownership,
@@ -36,7 +36,7 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/admin/matches")
 @RequiredArgsConstructor
-@PreAuthorize("hasRole('ADMIN')")
+@PreAuthorize("hasAnyRole('ADMIN', 'SUPER_ADMIN')")
 public class AdminMatchController {
 
     private final AdminMatchService adminMatchService;
