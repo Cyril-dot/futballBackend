@@ -450,7 +450,8 @@ public class SecurityConfig {
                 "https://plusbet-delta.vercel.app",
                 "https://www.plusbett.site",
                 "https://www.megasportt.com",
-                "https://www.eliteprime.site"
+                "https://www.eliteprime.site",
+                "https://www.eliteprime.site/"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
