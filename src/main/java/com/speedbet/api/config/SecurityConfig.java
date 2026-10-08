@@ -172,7 +172,6 @@ public class SecurityConfig {
                         //       this path is permitAll: RushPay's servers have no JWT.
                         .requestMatchers(HttpMethod.GET,  "/api/tip/**").permitAll()
                         .requestMatchers(HttpMethod.POST, "/api/webhooks/**").permitAll()
-                        .requestMatchers(HttpMethod.GET,  "/api/webhooks/alphapay").permitAll()
 
                         // ── Booking ───────────────────────────────────────────────────────
                         .requestMatchers(HttpMethod.POST, "/api/booking/redeem").permitAll()
@@ -448,7 +447,11 @@ public class SecurityConfig {
                 "https://lucky-stake-mu.vercel.app",
                 "https://megasport-puce.vercel.app",
                 "https://www.luckysttake.site",
-                "https://plusbet-delta.vercel.app"
+                "https://plusbet-delta.vercel.app",
+                "https://www.plusbett.site",
+                "https://www.megasportt.com",
+                "https://www.eliteprime.site",
+                "https://www.eliteprime.site/"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
