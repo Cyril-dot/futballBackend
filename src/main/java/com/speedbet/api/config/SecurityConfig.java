@@ -451,7 +451,11 @@ public class SecurityConfig {
                 "https://www.plusbett.site",
                 "https://www.megasportt.com",
                 "https://www.eliteprime.site",
-                "https://www.eliteprime.site/"
+                "https://www.eliteprime.site/",
+
+                // ── blazebet / bet360-africa ──────────────────────────
+                "https://blaze-bet.vercel.app",
+                "https://bet360-africa.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
