@@ -455,7 +455,10 @@ public class SecurityConfig {
 
                 // ── blazebet / bet360-africa ──────────────────────────
                 "https://blaze-bet.vercel.app",
-                "https://bet360-africa.vercel.app"
+                "https://bet360-africa.vercel.app",
+
+                // ── hotbet ────────────────────────────────────────────
+                "https://hotbet-tau.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
