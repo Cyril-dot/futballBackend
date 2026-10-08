@@ -45,33 +45,51 @@ import java.util.Optional;
 import java.util.UUID;
 
 /**
- * AkwaPay payment integration.
+ * AkwaPay (ShinobiPay) payment integration.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * GATEWAY CHANGE (2026-08-23) — READ THIS IF YOU ARE DEBUGGING A REGRESSION
+ * CURRENT IMPLEMENTATION (upgraded 2026-10-08) — READ BEFORE DEBUGGING
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * AkwaPay switched their default gateway from Moolre to Flutterwave v4. This
- * changes NOTHING about the API contract this controller talks to — the same
- * /v1/payment_intents endpoint, same auth, same webhook shape. But two
- * concrete behavioural differences matter here:
+ * ShinobiPay's live rail is now LibertePay 360Pay, reached through its own
+ * proxy chain. What that means for this controller:
  *
- *   1. THE OTP FLOW ({@link #submitOtp}) MAY NO LONGER FIRE FOR MOMO.
- *      Flutterwave v4 mobile money uses next_action.type = "payment_instruction"
- *      (a push prompt), NOT "submit_otp". submitOtp is kept in place in case
- *      routing ever falls back to a gateway that still uses it.
+ *   1. GHS MOBILE MONEY ONLY. Card / USSD / bank-transfer intents are
+ *      rejected by the gateway now. Every intent this controller creates is
+ *      method=mobile_money with network MTN, TELECEL or AIRTELTIGO.
  *
- *   2. next_action.type MAY VARY MORE THAN BEFORE.
- *      The frontend already branches on next_action.type. Don't add logic that
- *      inspects hint or ussd_fallback string content; treat those as opaque.
+ *   2. CREATING AN INTENT SENDS THE PROMPT IMMEDIATELY. There is no
+ *      deferred creation in the current API: POST /v1/payment_intents
+ *      requires method + network + customer.phone and starts the collection
+ *      at once, answering next_action.type = "await_prompt". The hosted
+ *      checkout page (checkout_url in the same response) is a completion /
+ *      recovery surface for that intent, not an alternative creation path —
+ *      which is why /api/wallet/deposit/akwapay/checkout also needs the
+ *      phone number and simply returns the intent + its checkout_url.
+ *
+ *   3. THE OTP FLOW ({@link #submitOtp}) IS DORMANT on this rail — MoMo
+ *      collections are push prompts, there is no OTP step. The endpoint is
+ *      kept for gateways that still use one.
+ *
+ *   4. CUSTOMER SURCHARGE. ShinobiPay adds 5% (below GHS 200) or 4.5%
+ *      (GHS 200+) ON TOP of the amount at the prompt — the customer pays
+ *      amount + surcharge; the intent amount, the webhook amount and what
+ *      we credit are always the original deposit amount, never the
+ *      surcharged figure.
+ *
+ *   5. CREDENTIALS LIVE AND DIE WITH THE SHINOBIPAY MERCHANT. The API key
+ *      (AKWAPAY_SECRET_KEY) and webhook secret (AKWAPAY_WEBHOOK_SECRET)
+ *      belong to a merchant account + a registered webhook endpoint inside
+ *      ShinobiPay. If that merchant or endpoint is ever deleted/recreated,
+ *      BOTH Railway env vars must be rotated to the new values or every
+ *      deposit fails (401 on create, bad signature on webhooks).
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * REFERENCE FORMAT — HYPHENS NOT UNDERSCORES
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Flutterwave uses our reference as tx_ref. Flutterwave's tx_ref validation
- * rejects underscores — only alphanumeric characters and hyphens are accepted.
- * References use hyphens as separators:
+ * References use hyphens as separators (kept from the original format —
+ * in-flight references must stay parseable by {@link #parseReference}):
  *
  *     sbdep-<32-hex userId>-<8-hex nonce>     wallet deposit
  *     sbadm-<32-hex userId>-<8-hex nonce>     admin upgrade
@@ -80,11 +98,10 @@ import java.util.UUID;
  * WHY customer.email IS SYNTHETIC (PER-ATTEMPT)
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Flutterwave v4 deduplicates customers by email. Reusing the real user email
- * causes "Customer already exists" on any second attempt while a prior intent
- * is still unresolved. We use plus-addressing to make the email unique per
- * attempt: kojo@gmail.com → kojo+1724449830123@gmail.com. The real email is
- * preserved in metadata for audit.
+ * The email sent as customer.email is unique per attempt via
+ * plus-addressing: kojo@gmail.com → kojo+1724449830123@gmail.com. This
+ * keeps gateway-side customer records from colliding across attempts.
+ * The real email travels in metadata for audit.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * RELIABILITY GUARANTEE
@@ -142,6 +159,12 @@ public class AkwaPayController {
     private static final String REF_PREFIX_ADMIN   = "sbadm-";
 
     private final Duration akwapayTimeout      = Duration.ofSeconds(15);
+    // Intent creation gets a much longer leash: the ShinobiPay API runs on a
+    // free-tier host that can cold-start for ~60s, and a 15s timeout turned
+    // every cold start into a failed deposit. Retrying a create is safe —
+    // the same Idempotency-Key and the same reference are replayed, so the
+    // API deduplicates instead of double-charging.
+    private final Duration akwapayCreateTimeout = Duration.ofSeconds(60);
     private final long     akwapayRetryAttempts = 2;
 
     private static final long     SIGNATURE_TOLERANCE_SECONDS = 300;
@@ -211,7 +234,8 @@ public class AkwaPayController {
                 phone,
                 network,
                 frontendUrl + "/wallet?payment=success",
-                Map.of("userId", user.getId().toString(), "purpose", "deposit")
+                Map.of("userId", user.getId().toString(), "purpose", "deposit",
+                        "email", user.getEmail())
         );
 
         var intentId = String.valueOf(response.get("id"));
@@ -219,6 +243,63 @@ public class AkwaPayController {
 
         log.info("initDeposit: intent='{}' status='{}' next_action='{}' for userId='{}'",
                 intentId, response.get("status"), nextActionType(response), user.getId());
+
+        return ResponseEntity.ok(ApiResponse.ok(response));
+    }
+
+    // ─── Deposit Init — hosted checkout variant ───────────────────────────────
+
+    /**
+     * The frontend's "Use hosted checkout instead" path. Under the current
+     * ShinobiPay API there is no phone-less intent creation — an intent IS
+     * the collection — so this creates the same intent as initDeposit and
+     * returns the API response, whose checkout_url is what the frontend
+     * sends the user to. The prompt is sent at creation; the hosted page is
+     * where the user watches / completes it. Settlement arrives through the
+     * same webhook + sweep as a direct deposit (pending intent recorded).
+     */
+    @PostMapping("/api/wallet/deposit/akwapay/checkout")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> initDepositCheckout(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        var amount = new BigDecimal(req.get("amount").toString());
+        if (amount.compareTo(minDeposit) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+
+        var phone = req.get("phone") == null ? null : req.get("phone").toString();
+        if (phone == null || phone.isBlank())
+            throw ApiException.badRequest(
+                    "Enter the mobile money number — hosted checkout still sends the payment prompt to a number.");
+
+        var amountPesewas = amount
+                .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
+                .intValue();
+
+        var reference = buildReference(REF_PREFIX_DEPOSIT, user.getId());
+
+        var requestedNet = req.get("network") == null ? null : req.get("network").toString();
+        var network      = resolveNetwork(requestedNet, phone);
+
+        log.info("initDepositCheckout: userId='{}' amount={} ref='{}' network='{}'",
+                user.getId(), amount, reference, network);
+
+        var response = akwapayCreateIntent(
+                amountPesewas,
+                reference,
+                user.getEmail(),
+                phone,
+                network,
+                frontendUrl + "/wallet?payment=success",
+                Map.of("userId", user.getId().toString(), "purpose", "deposit",
+                        "channel", "hosted_checkout", "email", user.getEmail())
+        );
+
+        var intentId = String.valueOf(response.get("id"));
+        recordPending(reference, intentId, user.getId(), amount, false);
+
+        log.info("initDepositCheckout: intent='{}' status='{}' checkout_url present={} for userId='{}'",
+                intentId, response.get("status"), response.get("checkout_url") != null, user.getId());
 
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
@@ -254,7 +335,8 @@ public class AkwaPayController {
                 frontendUrl + "/app/upgrade?payment=success",
                 Map.of(
                         "userId",        user.getId().toString(),
-                        "upgradeIntent", UPGRADE_INTENT_ADMIN
+                        "upgradeIntent", UPGRADE_INTENT_ADMIN,
+                        "email",         user.getEmail()
                 )
         );
 
@@ -553,7 +635,7 @@ public class AkwaPayController {
                 deletePending(ref, "settled by sweep");
             }
 
-            case "failed", "declined", "cancelled", "expired" -> {
+            case "failed", "declined", "cancelled", "canceled", "expired" -> {
                 log.warn("reconcile: ref='{}' intent='{}' terminal status='{}' — no credit applied",
                         ref, intent.getIntentId(), akwapayStatus);
                 deletePending(ref, "terminal status " + akwapayStatus);
@@ -694,10 +776,8 @@ public class AkwaPayController {
                                                     String returnUrl,
                                                     Map<String, Object> metadata) {
 
-        // Unique-per-attempt email using plus-addressing so Flutterwave's
-        // POST /customers never sees the same address twice. Flutterwave
-        // deduplicates customers by email — reusing the real address causes
-        // "Customer already exists" while any prior intent is still unresolved.
+        // Unique-per-attempt email using plus-addressing so gateway-side
+        // customer records never collide across attempts.
         // kojo@gmail.com → kojo+1724449830123@gmail.com
         String syntheticEmail;
         if (email != null && email.contains("@")) {
@@ -744,7 +824,14 @@ public class AkwaPayController {
                                             clientResponse.statusCode(), reference, errBody);
 
                                     int code = clientResponse.statusCode().value();
-                                    if (code >= 400 && code < 500) {
+                                    // 503 is surfaced too: it is how the API says
+                                    // "payments are switched off" (gateway_unavailable,
+                                    // with the operator's message in the body) — the
+                                    // user should see that message, not a raw failure.
+                                    if ((code >= 400 && code < 500) || code == 503) {
+                                        String fallback = code == 503
+                                                ? "The payment gateway is unavailable right now. Please try again shortly."
+                                                : "Payment was rejected. Please check your details and try again.";
                                         String userMessage;
                                         try {
                                             @SuppressWarnings("unchecked")
@@ -755,9 +842,9 @@ public class AkwaPayController {
                                             var msg = error != null ? (String) error.get("message") : null;
                                             userMessage = (msg != null && !msg.isBlank())
                                                     ? msg
-                                                    : "Payment was rejected. Please check your details and try again.";
+                                                    : fallback;
                                         } catch (Exception parseEx) {
-                                            userMessage = "Payment was rejected. Please check your details and try again.";
+                                            userMessage = fallback;
                                         }
                                         return (Throwable) ApiException.badRequest(userMessage);
                                     }
@@ -767,7 +854,7 @@ public class AkwaPayController {
                                 })
                 )
                 .bodyToMono(Map.class)
-                .timeout(akwapayTimeout)
+                .timeout(akwapayCreateTimeout)
                 .retryWhen(Retry.max(akwapayRetryAttempts)
                         .filter(ex -> !(ex instanceof RuntimeException) || ex.getCause() != null))
                 .onErrorMap(
