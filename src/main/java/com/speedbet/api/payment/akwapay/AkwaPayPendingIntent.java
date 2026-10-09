@@ -30,27 +30,28 @@ import java.util.UUID;
  *      one id at a time (/v1/payment_intents/{id}). So an intent we forget the
  *      id of is an intent we can never ask about again — there is no way to
  *      rediscover it.
- *   2. The webhook has never fired in production. Every credit so far has come
- *      from the sweep. The "the webhook will catch it" fallback that justified
- *      an in-memory map is not, in fact, operating.
+ *   2. Settlement is webhook-only (2026-10-09). An earlier design also ran a
+ *      polling sweep over these rows; it double-credited in production and
+ *      was removed. The row's job today is to be the durable record the
+ *      signed webhook settles against.
  *
  * Together: intent created → deploy 30 seconds later → map empties → webhook
  * never comes → customer's money is collected by AkwaPay and this service has
  * no record that it should ever be credited. Silent, permanent, and invisible
  * until the customer complains.
  *
- * A row survives the restart. The sweep picks it up on the next cycle and
- * credits normally.
+ * A row survives the restart, so when the webhook lands the service still
+ * knows whose payment it is and can settle it.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * SAFE WITH MULTIPLE INSTANCES
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * If two instances run the sweep concurrently, both may poll AkwaPay for the
- * same reference and both may see `succeeded`. That is harmless:
- * WalletService.credit() dedupes on `reference` and returns 409, which both
- * callers catch and skip. The row is then deleted by whichever finishes first;
- * the second delete is a no-op.
+ * Webhook delivery is at-least-once, and more than one instance may receive
+ * the same event. That is harmless: WalletService.credit() dedupes on
+ * `reference` and returns 409, which the handler catches and skips. The row
+ * is then deleted by whichever delivery finishes first; the second delete is
+ * a no-op.
  */
 @Entity
 @Table(name = "akwapay_pending_intents")
@@ -85,8 +86,8 @@ public class AkwaPayPendingIntent {
     /**
      * GHS, already converted from pesewas at creation time.
      *
-     * Stored rather than re-read from AkwaPay because the sweep credits this
-     * value directly. Reading the amount back from the provider at settlement
+     * Stored rather than re-read from AkwaPay because settlement credits this
+     * recorded value. Reading the amount back from the provider at settlement
      * time would let a provider-side mistake move a different sum than the
      * customer agreed to.
      */
@@ -100,19 +101,14 @@ public class AkwaPayPendingIntent {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
-    /** How many sweep cycles have polled AkwaPay for this. Diagnostics only. */
+    /** Legacy: polling-sweep check count from before the sweep was removed (2026-10). No longer incremented. */
     @Column(name = "attempts", nullable = false)
     private int attempts;
 
     /**
-     * When AkwaPay was last asked about this intent.
-     *
-     * This is what makes tiered polling possible: the sweep ticks every few
-     * seconds, but each individual row is only polled when enough time has
-     * passed for ITS age band. Without this column the choice is one flat
-     * interval for everything — either fast and wasteful, or cheap and slow.
-     *
-     * Null means never polled, which is treated as "due now".
+     * Legacy: when the removed polling sweep last asked AkwaPay about this
+     * intent. Kept for schema compatibility; nothing polls any more —
+     * settlement arrives by webhook only.
      */
     @Column(name = "last_checked_at")
     private Instant lastCheckedAt;

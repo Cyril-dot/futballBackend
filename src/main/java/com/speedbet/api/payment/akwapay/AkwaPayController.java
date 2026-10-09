@@ -15,7 +15,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.EnableScheduling;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -107,10 +106,14 @@ import java.util.UUID;
  * RELIABILITY GUARANTEE
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Webhooks have never fired in production. Every credit has come from the
- * reconciliation sweep ({@link #reconcilePendingIntents}). Treat the sweep as
- * the primary mechanism. Both paths dedupe via WalletService.credit() (409 on
- * duplicate reference) so no double-credit is possible whichever wins the race.
+ * Settlement is WEBHOOK-ONLY (owner's order, 2026-10-09). An earlier
+ * design also ran a reconciliation sweep that polled AkwaPay for pending
+ * intents and credited from the poll; in production that path
+ * double-credited wallets and marked transactions successful, so it was
+ * removed entirely. A deposit or upgrade now settles ONLY when the
+ * signed payment_intent.succeeded webhook lands; credits dedupe via
+ * WalletService.credit() (409 on duplicate reference). If a webhook is
+ * genuinely lost, the payment is credited by hand — never by a poller.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WEBHOOK PAYLOAD
@@ -168,20 +171,6 @@ public class AkwaPayController {
     private final long     akwapayRetryAttempts = 2;
 
     private static final long     SIGNATURE_TOLERANCE_SECONDS = 300;
-    private static final Duration SWEEP_HEAD_START            = Duration.ofSeconds(5);
-    private static final long     SWEEP_INTERVAL_MS           = 5_000;
-
-    private static final Duration TIER_HOT_UNTIL  = Duration.ofMinutes(2);
-    private static final Duration TIER_WARM_UNTIL = Duration.ofMinutes(10);
-    private static final Duration TIER_COOL_UNTIL = Duration.ofMinutes(60);
-
-    private static final Duration POLL_EVERY_HOT  = Duration.ofSeconds(5);
-    private static final Duration POLL_EVERY_WARM = Duration.ofSeconds(30);
-    private static final Duration POLL_EVERY_COOL = Duration.ofMinutes(2);
-    private static final Duration POLL_EVERY_COLD = Duration.ofMinutes(10);
-
-    private static final Duration ABANDON_AFTER = Duration.ofHours(24);
-
     private static final Map<String, String> GH_NETWORK_PREFIXES = new LinkedHashMap<>();
     static {
         for (var p : new String[]{"024", "025", "053", "054", "055", "059"}) GH_NETWORK_PREFIXES.put(p, "MTN");
@@ -256,7 +245,7 @@ public class AkwaPayController {
      * returns the API response, whose checkout_url is what the frontend
      * sends the user to. The prompt is sent at creation; the hosted page is
      * where the user watches / completes it. Settlement arrives through the
-     * same webhook + sweep as a direct deposit (pending intent recorded).
+     * same webhook as a direct deposit (pending intent recorded).
      */
     @PostMapping("/api/wallet/deposit/akwapay/checkout")
     public ResponseEntity<ApiResponse<Map<String, Object>>> initDepositCheckout(
@@ -354,7 +343,7 @@ public class AkwaPayController {
         try {
             pendingIntents.save(new AkwaPayPendingIntent(
                     reference, intentId, userId, amountGhs, adminUpgrade, Instant.now(), 0, null));
-            log.info("recordPending: ref='{}' intent='{}' persisted — sweep will reconcile if the webhook is lost",
+            log.info("recordPending: ref='{}' intent='{}' persisted — settles only when the webhook lands",
                     reference, intentId);
         } catch (Exception e) {
             log.error("recordPending: FAILED to persist ref='{}' intent='{}' userId='{}' amount={} — " +
@@ -541,112 +530,6 @@ public class AkwaPayController {
         return ResponseEntity.ok("OK");
     }
 
-    // ─── Reconciliation sweep ─────────────────────────────────────────────────
-
-    @Scheduled(fixedDelay = 5_000)
-    public void reconcilePendingIntents() {
-        var cutoff = Instant.now().minus(SWEEP_HEAD_START);
-
-        var stale = pendingIntents.findByCreatedAtBeforeOrderByCreatedAtAsc(cutoff);
-        if (stale.isEmpty()) return;
-
-        var due = stale.stream().filter(i -> isDue(i, Instant.now())).toList();
-        if (due.isEmpty()) return;
-
-        log.info("reconcile: {} of {} pending intent(s) due this tick", due.size(), stale.size());
-
-        for (var intent : due) {
-            try {
-                reconcileOne(intent);
-            } catch (Exception e) {
-                log.error("reconcile: unexpected error for ref='{}' intent='{}' — will retry next tick",
-                        intent.getReference(), intent.getIntentId(), e);
-            }
-        }
-    }
-
-    private boolean isDue(AkwaPayPendingIntent intent, Instant now) {
-        var last = intent.getLastCheckedAt();
-        if (last == null) return true;
-        return last.plus(pollIntervalFor(intent, now)).isBefore(now);
-    }
-
-    private Duration pollIntervalFor(AkwaPayPendingIntent intent, Instant now) {
-        var age = Duration.between(intent.getCreatedAt(), now);
-        if (age.compareTo(TIER_HOT_UNTIL)  < 0) return POLL_EVERY_HOT;
-        if (age.compareTo(TIER_WARM_UNTIL) < 0) return POLL_EVERY_WARM;
-        if (age.compareTo(TIER_COOL_UNTIL) < 0) return POLL_EVERY_COOL;
-        return POLL_EVERY_COLD;
-    }
-
-    private void reconcileOne(AkwaPayPendingIntent intent) {
-        var ref = intent.getReference();
-
-        if (intent.getCreatedAt().isBefore(Instant.now().minus(ABANDON_AFTER))) {
-            log.warn("reconcile: abandoning ref='{}' intent='{}' after {}h with no settlement",
-                    ref, intent.getIntentId(), ABANDON_AFTER.toHours());
-            deletePending(ref, "abandoned after " + ABANDON_AFTER.toHours() + "h");
-            return;
-        }
-
-        try {
-            intent.markChecked(Instant.now());
-            pendingIntents.save(intent);
-        } catch (Exception e) {
-            log.warn("reconcile: could not stamp lastCheckedAt for ref='{}': {}", ref, e.getMessage());
-        }
-
-        @SuppressWarnings("unchecked")
-        var result = (Map<String, Object>) webClientBuilder.build()
-                .get().uri(baseUrl + "/payment_intents/" + intent.getIntentId())
-                .header("Authorization", "Bearer " + secretKey)
-                .retrieve()
-                .onStatus(
-                        s -> s.isError(),
-                        r -> r.bodyToMono(String.class).map(body -> {
-                            log.error("reconcile: AkwaPay status check error for ref='{}' status={} body={}",
-                                    ref, r.statusCode(), body);
-                            return new RuntimeException("AkwaPay returned " + r.statusCode());
-                        })
-                )
-                .bodyToMono(Map.class)
-                .timeout(akwapayTimeout)
-                .onErrorResume(e -> {
-                    log.warn("reconcile: status check failed for ref='{}' intent='{}' — will retry next sweep: {}",
-                            ref, intent.getIntentId(), e.getMessage());
-                    return Mono.empty();
-                })
-                .block();
-
-        if (result == null) return;
-
-        var akwapayStatus = String.valueOf(result.get("status")).toLowerCase();
-        log.info("reconcile: ref='{}' intent='{}' akwapayStatus='{}' attempt={}",
-                ref, intent.getIntentId(), akwapayStatus, intent.getAttempts());
-
-        switch (akwapayStatus) {
-            case "succeeded" -> {
-                log.info("reconcile: ref='{}' succeeded on sweep — applying credit now", ref);
-                if (intent.isAdminUpgrade()) {
-                    handleAdminUpgrade(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
-                } else {
-                    handleDeposit(intent.getUserId(), ref, intent.getAmountGhs(), intent.getIntentId());
-                }
-                deletePending(ref, "settled by sweep");
-            }
-
-            case "failed", "declined", "cancelled", "canceled", "expired" -> {
-                log.warn("reconcile: ref='{}' intent='{}' terminal status='{}' — no credit applied",
-                        ref, intent.getIntentId(), akwapayStatus);
-                deletePending(ref, "terminal status " + akwapayStatus);
-            }
-
-            default ->
-                    log.info("reconcile: ref='{}' status='{}' — still in flight, next check in {}s",
-                            ref, akwapayStatus, pollIntervalFor(intent, Instant.now()).toSeconds());
-        }
-    }
-
     private void deletePending(String reference, String why) {
         try {
             if (pendingIntents.existsById(reference)) {
@@ -654,7 +537,7 @@ public class AkwaPayController {
                 log.info("deletePending: ref='{}' removed from pending ledger ({})", reference, why);
             }
         } catch (Exception e) {
-            log.warn("deletePending: could not remove ref='{}' ({}) — harmless, sweep will re-check and skip: {}",
+            log.warn("deletePending: could not remove ref='{}' ({}) — the pending row stays until a webhook settles it: {}",
                     reference, why, e.getMessage());
         }
     }
