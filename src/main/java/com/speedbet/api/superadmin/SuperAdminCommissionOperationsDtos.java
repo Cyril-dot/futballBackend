@@ -32,6 +32,19 @@ public final class SuperAdminCommissionOperationsDtos {
             java.time.Instant paidAt
     ) {}
 
+    public record ReconcileCommissionDto(
+            LocalDate date,
+            UUID adminId,
+            String adminEmail,
+            BigDecimal commissionPercent,
+            BigDecimal totalDeposits,
+            BigDecimal expectedCommission,
+            BigDecimal alreadyCredited,
+            BigDecimal toppedUp,
+            String currency,
+            BigDecimal commissionBalance
+    ) {}
+
     public record ClearCommissionResult(
             long adminsCleared,
             BigDecimal amountCleared,

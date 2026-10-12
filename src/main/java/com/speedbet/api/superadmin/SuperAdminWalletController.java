@@ -1,5 +1,6 @@
 package com.speedbet.api.superadmin;
 
+import com.speedbet.api.referral.ReferralService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -18,6 +19,7 @@ import java.util.UUID;
 public class SuperAdminWalletController {
 
     private final SuperAdminWalletService superAdminWalletService;
+    private final ReferralService referralService;
 
     public record AddFundsRequest(String amount, String reason) {
         BigDecimal parsedAmount() {
@@ -34,8 +36,21 @@ public class SuperAdminWalletController {
             @RequestBody AddFundsRequest request) {
 
         log.info("POST /super-admin/users/{}/add-funds — adminId='{}'", userId, adminId);
-        return ResponseEntity.ok(
-                superAdminWalletService.addFunds(userId, adminId, request.parsedAmount(), request.reason())
-        );
+        var credited = superAdminWalletService.addFunds(userId, adminId, request.parsedAmount(), request.reason());
+
+        // addFunds records the credit as a normal DEPOSIT, and the affiliate
+        // reports count it in the referring admin's deposit totals — so it
+        // must attribute commission exactly like a real deposit, otherwise
+        // the admin's deposits rise with no commission beside them. Runs
+        // after the credit has committed (same pattern as the payment
+        // controllers' handleDeposit) and never fails the credit itself.
+        try {
+            referralService.attributeCommission(userId, credited.amount());
+            log.info("addFunds: commission attributed for userId='{}' deposit={}", userId, credited.amount());
+        } catch (Exception ex) {
+            log.error("addFunds: commission attribution failed for userId='{}' — investigate", userId, ex);
+        }
+
+        return ResponseEntity.ok(credited);
     }
 }

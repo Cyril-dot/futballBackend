@@ -65,6 +65,21 @@ public class SuperAdminCommissionController {
         }
     }
 
+    /** Top up one admin's commission for a UTC day to deposits × current rate. Idempotent. */
+    @PostMapping("/admins/{adminId}/reconcile")
+    public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.ReconcileCommissionDto>> reconcile(
+            @PathVariable UUID adminId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+        String operationId = UUID.randomUUID().toString();
+        try {
+            return ResponseEntity.ok(ApiResponse.ok(operationsService.reconcile(adminId, date), "Commission reconciled"));
+        } catch (RuntimeException ex) {
+            log.error("commission.reconcile.http-failed operationId={} adminId={} date={} type={} message={}", operationId, adminId, date, ex.getClass().getSimpleName(), ex.getMessage(), ex);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(ApiResponse.error("Commission reconcile failed. operationId=" + operationId + " reason=" + safeMessage(ex)));
+        }
+    }
+
     /** Pay and clear unpaid commission entries for one UTC day across all admins. */
     @PostMapping("/clear")
     public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.ClearCommissionResult>> clearAll(

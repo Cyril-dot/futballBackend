@@ -24,6 +24,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
@@ -96,6 +97,80 @@ public class SuperAdminCommissionOperationsService {
         result.sort(Comparator.comparing(SuperAdminCommissionOperationsDtos.DailyAdminCommissionDto::adminEmail,
                 Comparator.nullsLast(String.CASE_INSENSITIVE_ORDER)));
         return result;
+    }
+
+    /**
+     * Tops up one admin's commission for a UTC day so the amount credited for
+     * that day equals referred deposits × the admin's current link rate.
+     *
+     * Why this does not simply call AffiliateCommissionService.creditCommission:
+     * the CommissionLedgerAspect stamps every entry it writes with the instant
+     * the credit happens, so a top-up for a past day would land in today's
+     * reports — and a re-run for that past day would compute the same
+     * shortfall again and double-pay. Instead this mirrors
+     * creditCommission's balance update directly and writes the ledger entry
+     * dated inside the target day, which keeps reconcile idempotent for any
+     * date: a second run sees the top-up in the day's entries and adds zero.
+     */
+    @Transactional
+    public SuperAdminCommissionOperationsDtos.ReconcileCommissionDto reconcile(UUID adminId, LocalDate date) {
+        LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;
+        User admin = getAdmin(adminId);
+        Instant from = reportDate.atStartOfDay(REPORT_ZONE).toInstant();
+        Instant to = reportDate.plusDays(1).atStartOfDay(REPORT_ZONE).toInstant();
+
+        BigDecimal rate = referralLinkRepo.findByAdminId(adminId).stream()
+                .map(ReferralLink::getCommissionPercent)
+                .filter(Objects::nonNull)
+                .findFirst().orElse(BigDecimal.ZERO);
+
+        BigDecimal totalDeposits = transactionRepo.findAdminDepositsBetween(adminId, from, to).stream()
+                .map(row -> row.amount() == null ? BigDecimal.ZERO : row.amount())
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal expected = totalDeposits.multiply(rate)
+                .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
+
+        List<CommissionLedgerEntry> unpaid = unpaidEntries(adminId, reportDate);
+        BigDecimal credited = sum(unpaid);
+        BigDecimal shortfall = expected.subtract(credited);
+
+        AffiliateCommissionBalance balance = balanceRepo.findByUserId(adminId).orElse(null);
+        String currency = unpaid.stream().map(CommissionLedgerEntry::getCurrency)
+                .filter(Objects::nonNull).findFirst()
+                .orElse(balance != null ? balance.getCurrency()
+                        : CountryUtils.currencyOf(admin.getCountry()));
+
+        BigDecimal toppedUp = BigDecimal.ZERO;
+        if (shortfall.compareTo(BigDecimal.ZERO) > 0) {
+            AffiliateCommissionBalance bal = balanceRepo.findByUserIdForUpdate(adminId)
+                    .orElseGet(() -> balanceRepo.save(AffiliateCommissionBalance.builder()
+                            .userId(adminId)
+                            .currency(currency)
+                            .build()));
+            if (!bal.getCurrency().equalsIgnoreCase(currency))
+                throw new IllegalArgumentException("Commission currency mismatch: expected "
+                        + bal.getCurrency() + ", got " + currency);
+            bal.setBalance(bal.getBalance().add(shortfall));
+            bal.setTotalEarnedLifetime(bal.getTotalEarnedLifetime().add(shortfall));
+            balanceRepo.save(bal);
+            balance = bal;
+
+            ledgerRepo.save(CommissionLedgerEntry.builder()
+                    .adminId(adminId)
+                    .amount(shortfall)
+                    .currency(currency)
+                    .createdAt(reportDate.atTime(12, 0).toInstant(REPORT_ZONE))
+                    .build());
+            toppedUp = shortfall;
+        }
+
+        log.info("commission.reconcile adminId={} date={} rate={} deposits={} expected={} credited={} toppedUp={}",
+                adminId, reportDate, rate, totalDeposits, expected, credited, toppedUp);
+        return new SuperAdminCommissionOperationsDtos.ReconcileCommissionDto(
+                reportDate, adminId, admin.getEmail(), rate, totalDeposits, expected,
+                credited, toppedUp, currency,
+                balance == null ? BigDecimal.ZERO : balance.getBalance());
     }
 
     @Transactional
