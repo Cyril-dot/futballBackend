@@ -1372,6 +1372,17 @@ public class MatchService {
         return matchRepo.findUnsettledFinishedBySport("football");
     }
 
+    /**
+     * Fixtures that were never played: still in a dormant status, kickoff before
+     * the cutoff, and no scores. The settlement engine voids bets on these —
+     * the feed (or an admin schedule) abandoned them, so no result is coming.
+     */
+    public List<Match> getStaleUnfinishedMatches(Instant cutoff, int limit) {
+        return matchRepo.findStaleUnfinished(
+                List.of("UPCOMING", "SCHEDULED", "POSTPONED", "CANCELLED"),
+                cutoff, PageRequest.of(0, limit));
+    }
+
     @Transactional
     public void markSettled(String id) {
         matchRepo.findById(toUuid(id)).ifPresent(m -> {

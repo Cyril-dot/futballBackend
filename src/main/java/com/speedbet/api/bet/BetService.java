@@ -11,7 +11,9 @@ import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
@@ -273,6 +275,12 @@ public class BetService {
         return betRepo.findPendingByMatchId(matchId);
     }
 
+    /** Oldest-first page of every PENDING bet — the settlement recovery queue. */
+    public List<Bet> getPendingBetsOldestFirst(int limit) {
+        return betRepo.findByStatus(BetStatus.PENDING,
+                PageRequest.of(0, limit, Sort.by(Sort.Direction.ASC, "placedAt"))).getContent();
+    }
+
     @Transactional
     public void settleBet(Bet bet, BetStatus status, BigDecimal payout) {
         log.info("settleBet — betId={} status={} payout={}", bet.getId(), status, payout);
@@ -280,9 +288,33 @@ public class BetService {
         bet.setSettledAt(java.time.Instant.now());
         if (status == BetStatus.WON) bet.setWinSeen(false);
         betRepo.save(bet);
-        if (status == BetStatus.WON && payout != null) {
+        if (payout == null) return;
+
+        if (status == BetStatus.WON) {
+            // Idempotent: if a previous attempt already landed the payout (its
+            // credit committed but the status update rolled back), credit() would
+            // throw "already processed" and strand the bet PENDING forever.
+            // Detect that state and finalise the status without paying twice.
+            String ref = "WIN-" + bet.getId();
+            if (walletService.alreadyProcessed(ref)) {
+                log.warn("settleBet — bet {} already credited ({}), finalising status only",
+                        bet.getId(), ref);
+                return;
+            }
             walletService.credit(bet.getUserId(), payout, TxKind.BET_WIN,
-                    "WIN-" + bet.getId(), Map.of("betId", bet.getId().toString()));
+                    ref, Map.of("betId", bet.getId().toString()));
+        } else if (status == BetStatus.VOID) {
+            // A voided slip refunds its stake (the engine prices VOID at the full
+            // stake, or the surviving value of a partially-voided multiple). This
+            // credit previously did not exist, so voided stakes were never returned.
+            String ref = "VOID-" + bet.getId();
+            if (walletService.alreadyProcessed(ref)) {
+                log.warn("settleBet — bet {} refund already credited ({}), finalising status only",
+                        bet.getId(), ref);
+                return;
+            }
+            walletService.credit(bet.getUserId(), payout, TxKind.ADJUSTMENT,
+                    ref, Map.of("betId", bet.getId().toString(), "reason", "void-refund"));
         }
     }
 

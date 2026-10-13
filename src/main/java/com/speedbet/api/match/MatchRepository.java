@@ -28,6 +28,12 @@ public interface MatchRepository extends JpaRepository<Match, UUID> {
     @Query("SELECT m FROM Match m WHERE m.status = 'FINISHED' AND m.settledAt IS NULL")
     List<Match> findUnsettledFinished();
 
+    @Query("SELECT m FROM Match m WHERE m.status IN :statuses AND m.kickoffAt < :cutoff "
+            + "AND m.scoreHome IS NULL AND m.scoreAway IS NULL ORDER BY m.kickoffAt ASC")
+    List<Match> findStaleUnfinished(@Param("statuses") List<String> statuses,
+                                    @Param("cutoff") Instant cutoff,
+                                    Pageable pageable);
+
     List<Match> findBySourceOrderByKickoffAtDesc(MatchSource source);
     List<Match> findBySourceAndStatus(MatchSource source, String status);
     List<Match> findByCreatedByAdminIdOrderByKickoffAtDesc(UUID createdByAdminId);

@@ -14,6 +14,8 @@ public interface BetRepository extends JpaRepository<Bet, UUID> {
 
     Page<Bet> findByUserIdOrderByPlacedAtDesc(UUID userId, Pageable pageable);
 
+    Page<Bet> findByStatus(BetStatus status, Pageable pageable);
+
     List<Bet> findByUserIdAndStatus(UUID userId, BetStatus status);
 
     @Query("SELECT b FROM Bet b WHERE b.userId = :userId AND b.status = 'WON' AND b.winSeen = false")

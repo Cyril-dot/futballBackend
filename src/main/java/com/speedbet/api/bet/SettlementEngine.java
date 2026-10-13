@@ -19,6 +19,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -50,18 +51,25 @@ public class SettlementEngine {
      */
     private static final boolean AH_LINE_IS_HOME_PERSPECTIVE = false;
 
-    // ── Scan window ───────────────────────────────────────────────────────
+    // ── Scan bounds ───────────────────────────────────────────────────────
     //
-    // Each pass only looks at matches from the start of yesterday onward. Anything
-    // older is left alone: it is either already handled or genuinely stuck, and
-    // dragging the whole back-catalogue through every 60-second pass is what makes
-    // the runner slow down over time. Bump the day count if a longer tail is needed.
+    // No age window anywhere in settlement. The old "yesterday onward" lookback
+    // stranded real money: any bet whose match aged past the window fell out of
+    // every scan and stayed PENDING forever. The queues below are bounded by
+    // per-pass caps instead — the unsettled-finished list is the work queue
+    // itself (it drains to zero), and recovery walks pending bets oldest-first,
+    // so a backlog clears a batch at a time without re-scanning history.
 
-    private static final int    SETTLEMENT_LOOKBACK_DAYS = 1;
-    private static final ZoneId ZONE                     = ZoneId.systemDefault();
+    private static final ZoneId ZONE = ZoneId.systemDefault();
 
     /** Hard cap per pass so one bad night's backlog cannot monopolise the scheduler. */
     private static final int MAX_MATCHES_PER_PASS = 100;
+
+    /** Pending bets examined per orphan-recovery pass. */
+    private static final int MAX_BETS_PER_RECOVERY_PASS = 200;
+
+    /** Days after kickoff before a never-played fixture is treated as abandoned. */
+    private static final int STALE_FIXTURE_DAYS = 3;
 
     /** First signed number in a string: "-1.5", "+2", "2.5" … */
     private static final Pattern LINE_PATTERN = Pattern.compile("[-+]?\\d+(?:\\.\\d+)?");
@@ -141,13 +149,11 @@ public class SettlementEngine {
 
     @Scheduled(fixedDelay = 60_000)
     public void run() {
-        Instant cutoff = lookbackCutoff();
-
         List<Match> allFinished = matchService.getUnsettledFinished();
-        List<Match> finishedMatches = withinWindow(allFinished, cutoff, "Settlement run");
+        List<Match> finishedMatches = withinWindow(allFinished, Instant.MIN, "Settlement run");
 
-        log.info("Settlement run: {} of {} unsettled finished match(es) inside window (since {})",
-                finishedMatches.size(), allFinished.size(), cutoff);
+        log.info("Settlement run: {} of {} unsettled finished match(es) queued (oldest first)",
+                finishedMatches.size(), allFinished.size());
 
         Tally total = new Tally();
         int matchesSettled = 0, matchesSkipped = 0, matchesFailed = 0;
@@ -202,98 +208,139 @@ public class SettlementEngine {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Picks up slips left PENDING on matches that were already marked settled —
-     * legs deferred while waiting on another fixture, or bets that failed mid-pass.
-     * Same window as the main runner: yesterday onward.
+     * Picks up slips still PENDING even though everything they wait on is already
+     * known — legs deferred in an earlier pass, bets on matches another lifecycle
+     * marked settled, or bets whose payout landed while the status update rolled
+     * back. Bet-centric on purpose: the old match-centric scan only looked at
+     * matches settled since yesterday, so any orphan older than a day fell out of
+     * the window and stayed PENDING forever. This scan walks the oldest pending
+     * bets directly, in bounded batches, with no age limit; a bet is attempted
+     * only when at least one leg can move right now.
+     *
+     * No class-level transaction here on purpose: each slip commits on its own
+     * (see settleBetIsolated), so one poisoned orphan cannot roll back the batch
+     * and put the same bets back in the queue on every pass.
      */
     @Scheduled(fixedDelay = 120_000)
     public void runOrphanedBetRecovery() {
-        Instant cutoff = lookbackCutoff();
-        log.info("Orphan recovery: scanning for pending bets on settled matches since {}", cutoff);
-
-        List<Match> allSettled = matchService.getSettledFinished();
-        List<Match> settledMatches = withinWindow(allSettled, cutoff, "Orphan recovery");
-
-        if (settledMatches.isEmpty()) {
-            log.info("Orphan recovery COMPLETE — no settled matches inside window");
+        List<Bet> pending = betService.getPendingBetsOldestFirst(MAX_BETS_PER_RECOVERY_PASS);
+        if (pending == null || pending.isEmpty()) {
+            log.info("Orphan recovery COMPLETE — no pending bets");
             return;
         }
 
         Tally total = new Tally();
-        int matchesScanned = 0, matchesSkipped = 0, betsExamined = 0;
+        int attempted = 0;
+        Map<UUID, Match> cache = new ConcurrentHashMap<>();
 
-        for (Match match : settledMatches) {
-            if (!isSettleable(match)) {
-                matchesSkipped++;
-                log.warn("Orphan recovery: SKIP match {} — score(s) missing", match.getId());
-                continue;
-            }
-
-            List<Bet> orphans;
+        for (Bet bet : pending) {
             try {
-                orphans = betService.getPendingBetsForMatch(match.getId());
-            } catch (Exception e) {
-                total.failed++;
-                log.error("Orphan recovery: could not load pending bets for match {} — {}",
-                        match.getId(), e.getMessage(), e);
-                continue;
-            }
-
-            if (orphans == null || orphans.isEmpty()) continue;
-
-            matchesScanned++;
-            betsExamined += orphans.size();
-            log.info("Orphan recovery: {} pending bet(s) on settled match {} ({} vs {})",
-                    orphans.size(), match.getId(), match.getHomeTeam(), match.getAwayTeam());
-
-            total.add(settleOrphansForMatch(match, orphans));
-        }
-
-        log.info("Orphan recovery COMPLETE — matches scanned={} skipped={} | bets examined={} | {}",
-                matchesScanned, matchesSkipped, betsExamined, total);
-    }
-
-    /**
-     * No class-level transaction here on purpose: each slip commits on its own (see
-     * settleBetIsolated), so one poisoned orphan cannot roll back the batch and put
-     * the same bets back in the queue on every 2-minute pass.
-     */
-    public Tally settleOrphansForMatch(Match match, List<Bet> orphans) {
-        Tally tally = new Tally();
-        Map<UUID, Match> cache = newCache(match);
-
-        for (Bet bet : orphans) {
-            try {
-                Outcome outcome = self().settleBetIsolated(bet, match, cache);
-                tally.record(outcome);
+                Match trigger = actionableTrigger(bet, cache);
+                if (trigger == null && !hasLostLeg(bet) && !allLegsResolved(bet)) {
+                    // Nothing on this slip can move yet — a leg still waits on a
+                    // match that has not finished. Leave it for a later pass.
+                    continue;
+                }
+                attempted++;
+                Outcome outcome = self().settleBetIsolated(bet, trigger, cache);
+                total.record(outcome);
                 if (outcome == Outcome.DEFERRED || outcome == Outcome.SKIPPED) {
-                    // Legitimately waiting on another fixture — debug, not warn,
-                    // otherwise this logs every two minutes until the other leg lands.
                     log.debug("Orphan recovery: bet {} → {}", bet.getId(), outcome);
                 } else {
-                    log.info("Orphan recovery: settled bet {} for match {} → {}",
-                            bet.getId(), match.getId(), outcome);
+                    log.info("Orphan recovery: settled bet {} → {}", bet.getId(), outcome);
                 }
             } catch (Exception e) {
-                tally.failed++;
-                log.error("Orphan recovery: FAILED for bet {} match {} — {} (other bets unaffected)",
-                        bet.getId(), match.getId(), e.getMessage(), e);
+                total.failed++;
+                log.error("Orphan recovery: FAILED for bet {} — {} (other bets unaffected)",
+                        bet.getId(), e.getMessage(), e);
             }
         }
-        return tally;
+
+        log.info("Orphan recovery COMPLETE — pending examined={} attempted={} | {}",
+                pending.size(), attempted, total);
+    }
+
+    /** First leg match that can be settled right now, or null if none can. */
+    private Match actionableTrigger(Bet bet, Map<UUID, Match> cache) {
+        if (bet.getSelections() == null) return null;
+        for (BetSelection sel : bet.getSelections()) {
+            if (!isPending(sel.getResult())) continue;
+            Match m = resolveSettleableMatch(sel.getMatchId(), null, cache);
+            if (m != null) return m;
+        }
+        return null;
+    }
+
+    private boolean hasLostLeg(Bet bet) {
+        return bet.getSelections() != null && bet.getSelections().stream()
+                .anyMatch(s -> "LOST".equals(normaliseResult(s.getResult())));
+    }
+
+    private boolean allLegsResolved(Bet bet) {
+        return bet.getSelections() != null && !bet.getSelections().isEmpty()
+                && bet.getSelections().stream().allMatch(s -> isResolved(s.getResult()));
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // SCAN WINDOW HELPERS
+    // STALE FIXTURE VOID
     // ══════════════════════════════════════════════════════════════════════
 
-    /** Start of yesterday, local time. */
-    private Instant lookbackCutoff() {
-        return LocalDate.now(ZONE)
-                .minusDays(SETTLEMENT_LOOKBACK_DAYS)
-                .atStartOfDay(ZONE)
-                .toInstant();
+    /**
+     * Fixtures that were never played: kickoff days in the past, still in a
+     * dormant status, no scores — the feed (or an admin schedule) abandoned
+     * them, so no result is ever coming and their bets can never settle from
+     * one. The stale legs are marked VOID and the slip goes through the normal
+     * settlement path: a multiple re-prices around the voided leg, a single
+     * refunds in full via the VOID payout. A rescheduled match carries a fresh
+     * kickoffAt and is not stale; anything live or finished is untouched.
+     */
+    @Scheduled(fixedDelay = 300_000)
+    public void runStaleFixtureVoid() {
+        Instant cutoff = Instant.now().minus(STALE_FIXTURE_DAYS, ChronoUnit.DAYS);
+        List<Match> stale = matchService.getStaleUnfinishedMatches(cutoff, MAX_MATCHES_PER_PASS);
+        if (stale == null || stale.isEmpty()) return;
+
+        Tally total = new Tally();
+        int betsTouched = 0;
+
+        for (Match match : stale) {
+            List<Bet> pendingBets = betService.getPendingBetsForMatch(match.getId());
+            if (pendingBets == null || pendingBets.isEmpty()) continue;
+
+            Map<UUID, Match> cache = newCache(null);
+            for (Bet bet : pendingBets) {
+                try {
+                    boolean marked = false;
+                    for (BetSelection sel : bet.getSelections()) {
+                        if (match.getId().equals(sel.getMatchId()) && isPending(sel.getResult())) {
+                            sel.setResult("VOID");
+                            marked = true;
+                        }
+                    }
+                    if (!marked) continue;
+                    betsTouched++;
+                    betService.saveSelectionsOnly(bet);
+
+                    Outcome outcome = self().settleBetIsolated(bet, null, cache);
+                    total.record(outcome);
+                    log.info("Stale fixture void: bet {} on {} vs {} (kickoff {}) → {}",
+                            bet.getId(), match.getHomeTeam(), match.getAwayTeam(),
+                            match.getKickoffAt(), outcome);
+                } catch (Exception e) {
+                    total.failed++;
+                    log.error("Stale fixture void: FAILED for bet {} on match {} — {}",
+                            bet.getId(), match.getId(), e.getMessage(), e);
+                }
+            }
+        }
+
+        log.info("Stale fixture void COMPLETE — {} stale match(es), {} bet(s) touched | {}",
+                stale.size(), betsTouched, total);
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // SCAN HELPERS
+    // ══════════════════════════════════════════════════════════════════════
 
     /**
      * Keeps only matches at or after the cutoff, oldest first, capped at

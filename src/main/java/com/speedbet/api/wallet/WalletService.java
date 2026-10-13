@@ -78,6 +78,11 @@ public class WalletService {
                 .build());
     }
 
+    /** True when a transaction with this provider reference has already been recorded. */
+    public boolean alreadyProcessed(String providerRef) {
+        return providerRef != null && txRepo.existsByProviderRef(providerRef);
+    }
+
     @Transactional
     public Transaction credit(UUID userId, BigDecimal amount, TxKind kind,
                               String providerRef, Map<String, Object> metadata) {
