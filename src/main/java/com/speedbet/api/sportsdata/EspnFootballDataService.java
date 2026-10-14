@@ -130,7 +130,7 @@ public class EspnFootballDataService {
         DFB_POKAL        ("ger.dfb_pokal",          "DFB Pokal",             true),
         COPPA_ITALIA     ("ita.coppa_italia",       "Coppa Italia",          true),
         COUPE_DE_FRANCE  ("fra.coupe_de_france",    "Coupe de France",       true),
-        CHAMPIONS_LEAGUE ("uefa.champions_league",  "UEFA Champions League", true),
+        CHAMPIONS_LEAGUE ("uefa.champions",         "UEFA Champions League", true),
         EUROPA_LEAGUE    ("uefa.europa",             "UEFA Europa League",    true),
         CONFERENCE_LEAGUE("uefa.europa.conference", "UEFA Conference League",true),
 
