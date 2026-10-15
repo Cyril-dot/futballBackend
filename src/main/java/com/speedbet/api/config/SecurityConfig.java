@@ -411,6 +411,12 @@ public class SecurityConfig {
                 "https://nexbetbg-qua5xs9p.manus.space",
                 "https://royalbet-nine.vercel.app",
                 "https://www.royallbett.com",
+                // Apex origins are DIFFERENT origins to CORS — a browser on the
+                // bare domain gets 403 "Invalid CORS request" on every API call
+                // if only the www host is listed (RoyalBet deposit bug,
+                // diagnosed live 2026-10-15: init returned 403 from the apex
+                // while the same request from www reached the gateway fine).
+                "https://royallbett.com",
                 "https://www.bet360africa.xyz",
                 "https://bet360africa-admin.vercel.app",
                 "https://bet360africa-superadmin.vercel.app",
@@ -444,11 +450,14 @@ public class SecurityConfig {
                 "https://plusbet.vercel.app",
                 "https://msport-clone.vercel.app",
                 "https://www.superrbett.xyz",
+                "https://superrbett.xyz",
+                "https://luckysttake.site",
                 "https://lucky-stake-mu.vercel.app",
                 "https://megasport-puce.vercel.app",
                 "https://www.luckysttake.site",
                 "https://plusbet-delta.vercel.app",
                 "https://www.plusbett.site",
+                "https://plusbett.site",
                 "https://www.megasportt.com",
                 "https://www.eliteprime.site",
                 "https://www.eliteprime.site/",
