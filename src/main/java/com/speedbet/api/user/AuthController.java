@@ -35,7 +35,6 @@ public class AuthController {
     private final AuthenticationManager authManager;
     private final ReferralService referralService;
     private final EmailService emailService;
-    private final OtpService otpService;
 
     @Value("${app.jwt.refresh-token-expiry-days:14}")
     private int refreshExpiryDays;
@@ -69,17 +68,9 @@ public class AuthController {
     public ResponseEntity<ApiResponse<AuthDtos.AuthResponse>> login(
             @Valid @RequestBody AuthDtos.LoginRequest req,
             HttpServletResponse res) {
-        log.info("login: attempt for identifier='{}'", req.email());
-        String identifier = req.email().trim();
-        String email = identifier;
-        if (!identifier.contains("@")) {
-            // Phone login — resolve the number to the account email first.
-            String digits = identifier.replaceAll("\\D", "");
-            String phone = digits.startsWith("233") && digits.length() == 12 ? "0" + digits.substring(3) : digits;
-            email = userService.getByPhone(phone).getEmail();
-        }
-        authManager.authenticate(new UsernamePasswordAuthenticationToken(email, req.password()));
-        var user = userService.getByEmail(email);
+        log.info("login: attempt for email='{}'", req.email());
+        authManager.authenticate(new UsernamePasswordAuthenticationToken(req.email(), req.password()));
+        var user = userService.getByEmail(req.email());
 
         // ✅ Add this check
         if (user.getStatus() == UserStatus.DISABLED) {
@@ -88,18 +79,6 @@ public class AuthController {
 
         log.info("login: success for email='{}'", req.email());
         return ResponseEntity.ok(ApiResponse.ok(buildAuthResponse(user, res)));
-    }
-
-    @PostMapping("/otp/send")
-    public ResponseEntity<ApiResponse<Map<String, String>>> sendOtp(@RequestBody Map<String, String> req) {
-        otpService.sendOtp(req.get("phone"));
-        return ResponseEntity.ok(ApiResponse.ok(Map.of("status", "SENT")));
-    }
-
-    @PostMapping("/otp/verify")
-    public ResponseEntity<ApiResponse<Map<String, String>>> verifyOtp(@RequestBody Map<String, String> req) {
-        otpService.verifyOtp(req.get("phone"), req.get("code"));
-        return ResponseEntity.ok(ApiResponse.ok(Map.of("status", "VERIFIED")));
     }
 
     @PostMapping("/refresh")

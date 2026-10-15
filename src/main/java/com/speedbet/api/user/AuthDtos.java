@@ -17,7 +17,7 @@ public class AuthDtos {
     ) {}
 
     public record LoginRequest(
-            @NotBlank String email, // email address or phone number
+            @Email @NotBlank String email,
             @NotBlank String password
     ) {}
 

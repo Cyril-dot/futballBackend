@@ -100,10 +100,6 @@ public class UserService implements UserDetailsService {
                 .build());
         log.info("register: wallet created for userId='{}'", user.getId());
 
-        // Welcome bonus — every new user starts with GHS 100 on the house.
-        walletService.credit(user.getId(), new BigDecimal("100"), TxKind.WELCOME_BONUS);
-        log.info("register: welcome bonus credited for userId='{}'", user.getId());
-
         return user;
     }
 
@@ -397,11 +393,6 @@ public class UserService implements UserDetailsService {
                 .orElseThrow(() -> ApiException.notFound("User not found"));
     }
 
-    public User getByPhone(String phone) {
-        log.debug("getByPhone: phone='{}'", phone);
-        return userRepo.findByPhone(phone)
-                .orElseThrow(() -> ApiException.badRequest("Invalid login credentials."));
-    }
 
     public User save(User user) {
         log.debug("save: userId='{}'", user.getId());
