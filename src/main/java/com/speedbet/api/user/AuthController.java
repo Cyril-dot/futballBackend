@@ -26,6 +26,9 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/auth")
 @RequiredArgsConstructor
+// NOTE (15 Oct 2026): 7UP BET extras reverted per owner request —
+// OTP/ShinobiPay/welcome-bonus/phone-login removed. Only the
+// Champions League ESPN slug fix remains from the Oct integration work.
 public class AuthController {
 
     private static final Logger log = LoggerFactory.getLogger(AuthController.class);
