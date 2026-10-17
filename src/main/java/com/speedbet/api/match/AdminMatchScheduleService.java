@@ -926,9 +926,9 @@ public class AdminMatchScheduleService {
      *
      *   boolean existsByMatchIdAndStatusIn(UUID matchId, Collection<String> statuses);
      *
-     *   Added to BetRepository. The unsettled status checked is "PENDING"
-     *   (matching BetStatus.PENDING in BetService). Adjust if your enum uses
-     *   additional unsettled values (e.g. "OPEN", "ACTIVE").
+     *   Added to BetRepository. The only unsettled status is "PENDING"
+     *   (BetStatus: PENDING, WON, LOST, VOID, CASHED_OUT) — do NOT add
+     *   other strings here; JPA converts them to the enum and throws.
      *
      * ── Finish-time resolution ────────────────────────────────────────────
      *
@@ -968,9 +968,12 @@ public class AdminMatchScheduleService {
             UUID adminId = match.getCreatedByAdminId();
 
             try {
-                // Check for any unsettled bets — PENDING or OPEN.
+                // Check for unsettled bets — PENDING is the only unsettled
+                // BetStatus (enum: PENDING, WON, LOST, VOID, CASHED_OUT).
+                // Passing any other string (e.g. "OPEN") makes JPA throw
+                // 'No enum constant BetStatus.OPEN' and kills the check.
                 boolean hasUnsettledBets = betRepository.existsByMatchIdAndStatusIn(
-                        matchId, List.of("PENDING", "OPEN"));
+                        matchId, List.of("PENDING"));
 
                 if (hasUnsettledBets) {
                     stillOpen.add(matchId);
