@@ -29,6 +29,11 @@ public class PayoutRequest {
     @Column(nullable = false, precision = 19, scale = 4)
     private BigDecimal amount;
 
+    /** Currency the amount is denominated in (snapshot of the commission balance currency). */
+    @Column(length = 8)
+    @Builder.Default
+    private String currency = "GHS";
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
     @Builder.Default

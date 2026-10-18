@@ -141,6 +141,7 @@ public class AdminAffiliateService {
                 PayoutRequest.builder()
                         .adminId(adminId)
                         .amount(currentBalance)
+                        .currency(commBalance.getCurrency())
                         .status(PayoutStatus.REQUESTED)
                         .periodEnd(Instant.now())
                         .build());
