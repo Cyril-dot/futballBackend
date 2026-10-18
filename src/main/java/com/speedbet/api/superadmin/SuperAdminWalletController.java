@@ -21,7 +21,7 @@ public class SuperAdminWalletController {
     private final SuperAdminWalletService superAdminWalletService;
     private final ReferralService referralService;
 
-    public record AddFundsRequest(String amount, String reason) {
+    public record AddFundsRequest(String amount, String reason, String idempotencyKey) {
         BigDecimal parsedAmount() {
             if (amount == null || amount.isBlank()) return null;
             return new BigDecimal(amount.trim());
@@ -36,7 +36,7 @@ public class SuperAdminWalletController {
             @RequestBody AddFundsRequest request) {
 
         log.info("POST /super-admin/users/{}/add-funds — adminId='{}'", userId, adminId);
-        var credited = superAdminWalletService.addFunds(userId, adminId, request.parsedAmount(), request.reason());
+        var credited = superAdminWalletService.addFunds(userId, adminId, request.parsedAmount(), request.reason(), request.idempotencyKey());
 
         // addFunds records the credit as a normal DEPOSIT, and the affiliate
         // reports count it in the referring admin's deposit totals — so it

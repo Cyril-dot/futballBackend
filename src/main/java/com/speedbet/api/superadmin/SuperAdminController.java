@@ -216,7 +216,11 @@ public class SuperAdminController {
                 ? Map.<String, Object>of("addedBy", actor.getId().toString(), "reason", reason)
                 : Map.<String, Object>of("addedBy", actor.getId().toString());
 
-        var tx = walletService.credit(adminId, amount, TxKind.ADMIN_CREDIT, null, metadata);
+        // Optional client idempotency key: a retried/double-submitted request
+        // then 409s inside credit() instead of topping the admin up twice.
+        var idemKey = req.get("idempotencyKey");
+        String providerRef = idemKey == null || idemKey.isBlank() ? null : "addfunds:" + idemKey.trim();
+        var tx = walletService.credit(adminId, amount, TxKind.ADMIN_CREDIT, providerRef, metadata);
 
         auditService.log(actor.getId(), "ADD_FUNDS_TO_ADMIN", "users", adminId,
                 null, Map.of("amount", amount.toPlainString()), null);

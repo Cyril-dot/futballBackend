@@ -43,6 +43,22 @@ public class AffiliateCommissionService {
                                 .build()));
     }
 
+    /**
+     * Fetch the balance row under a pessimistic write lock, creating it first
+     * if needed. Callers doing check-then-act sequences over the balance
+     * (e.g. AdminAffiliateService.requestPayout) take this lock FIRST, inside
+     * their own transaction, so concurrent calls serialise on the row instead
+     * of both passing their checks and double-crediting.
+     */
+    @Transactional
+    public AffiliateCommissionBalance lockBalanceForUpdate(UUID userId) {
+        return commissionRepo.findByUserIdForUpdate(userId)
+                .orElseGet(() -> commissionRepo.save(
+                        AffiliateCommissionBalance.builder()
+                                .userId(userId)
+                                .build()));
+    }
+
     // ─── Credit ──────────────────────────────────────────────────────────────────
 
     /**

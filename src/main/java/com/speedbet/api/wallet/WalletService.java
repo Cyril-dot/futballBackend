@@ -83,15 +83,24 @@ public class WalletService {
         return providerRef != null && txRepo.existsByProviderRef(providerRef);
     }
 
-    @Transactional
+    @Transactional(isolation = Isolation.SERIALIZABLE)
     public Transaction credit(UUID userId, BigDecimal amount, TxKind kind,
                               String providerRef, Map<String, Object> metadata) {
-        // Idempotency check
+        // Lock the wallet row FIRST (same pattern as debit): concurrent credits
+        // for this wallet serialise here, so the provider-ref check below can
+        // no longer be raced. Before this, two duplicate webhook deliveries a
+        // few ms apart both passed existsByProviderRef under a plain
+        // transaction, wrote duplicate DEPOSIT rows, and BOTH triggered
+        // referral commission — a double credit + double commission.
+        var wallet = em.find(Wallet.class,
+                walletRepo.findByUserId(userId)
+                        .orElseThrow(() -> ApiException.notFound("Wallet not found")).getId(),
+                LockModeType.PESSIMISTIC_WRITE);
+
+        // Idempotency check — race-free under the wallet lock + SERIALIZABLE.
         if (providerRef != null && txRepo.existsByProviderRef(providerRef))
             throw ApiException.conflict("Transaction already processed: " + providerRef);
 
-        var wallet = walletRepo.findByUserId(userId)
-                .orElseThrow(() -> ApiException.notFound("Wallet not found"));
         wallet.setBalance(wallet.getBalance().add(amount, MathContext.DECIMAL64));
         walletRepo.save(wallet);
 

@@ -29,7 +29,7 @@ public class SuperAdminWalletService {
      * like any other top-up; the admin/reason context lives in metadata.
      */
     @Transactional
-    public SuperAdminDtos.WalletCreditDto addFunds(UUID userId, UUID adminId, BigDecimal amount, String reason) {
+    public SuperAdminDtos.WalletCreditDto addFunds(UUID userId, UUID adminId, BigDecimal amount, String reason, String idempotencyKey) {
         User target = userRepo.findById(userId)
                 .orElseThrow(() -> ApiException.notFound("User not found"));
 
@@ -40,11 +40,16 @@ public class SuperAdminWalletService {
         log.info("addFunds: adminId='{}' crediting userId='{}' (role={}) amount='{}'",
                 adminId, userId, target.getRole(), amount);
 
+        // A client-supplied idempotency key becomes the provider ref, so a
+        // retried or double-submitted add-funds 409s inside credit() instead
+        // of crediting (and commissioning) twice. Absent key = legacy behaviour.
+        String providerRef = idempotencyKey == null || idempotencyKey.isBlank()
+                ? null : "addfunds:" + idempotencyKey.trim();
         Transaction tx = walletService.credit(
                 userId,
                 amount,
                 TxKind.DEPOSIT,
-                null,
+                providerRef,
                 Map.of(
                         "source", "SUPER_ADMIN",
                         "adminId", adminId.toString(),

@@ -50,7 +50,13 @@ public class AdminAffiliateService {
                 .map(Referral::getLifetimeCommission)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        var commBalance = commissionService.getOrCreate(adminId);
+        // Lock the commission balance row BEFORE the pending-check and the NG
+        // window computation: two concurrent payout requests (two tabs, a
+        // retried submit) otherwise both pass existsBy... and both sweep the
+        // same NG-deposit window into the balance — a double commission
+        // credit. Under the lock the second caller sees the first's pending
+        // request (and closed window) and is rejected cleanly.
+        var commBalance = commissionService.lockBalanceForUpdate(adminId);
 
         return new AffiliateStatsDTO(
                 referrals.size(),
