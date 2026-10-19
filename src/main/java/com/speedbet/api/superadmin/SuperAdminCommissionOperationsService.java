@@ -37,6 +37,22 @@ import java.util.stream.Collectors;
 public class SuperAdminCommissionOperationsService {
     private static final ZoneOffset REPORT_ZONE = ZoneOffset.UTC;
 
+    /**
+     * NGN → GHS peg used when a GHS-denominated total must include Nigerian
+     * deposits. 1 GHS = 135 NGN (hardcoded approximation — same peg used by
+     * ReferralService when crediting commission).
+     */
+    private static final BigDecimal NGN_PER_GHS = BigDecimal.valueOf(135);
+
+    /** Convert a deposit amount to GHS using the depositor's country. */
+    private static BigDecimal toGhs(BigDecimal amount, String country) {
+        if (amount == null) return BigDecimal.ZERO;
+        if (CountryUtils.NG.equals(CountryUtils.normalize(country))) {
+            return amount.divide(NGN_PER_GHS, 2, RoundingMode.HALF_UP);
+        }
+        return amount;
+    }
+
     private final UserRepository userRepo;
     private final ReferralLinkRepository referralLinkRepo;
     private final AffiliateCommissionBalanceRepository balanceRepo;

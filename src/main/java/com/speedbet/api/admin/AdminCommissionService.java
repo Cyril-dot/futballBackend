@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
@@ -32,6 +33,19 @@ import java.util.function.Function;
 @RequiredArgsConstructor
 public class AdminCommissionService {
     private static final ZoneOffset REPORT_ZONE = ZoneOffset.UTC;
+
+    /** NGN → GHS peg for GHS-denominated totals. 1 GHS = 135 NGN. */
+    private static final BigDecimal NGN_PER_GHS = BigDecimal.valueOf(135);
+
+    /** Convert a deposit amount to GHS using the depositor's country. */
+    private static BigDecimal toGhs(BigDecimal amount, String country) {
+        if (amount == null) return BigDecimal.ZERO;
+        String c = country == null ? "" : country.trim().toUpperCase();
+        if (c.equals("NG") || c.equals("NGA") || c.startsWith("NIGERIA")) {
+            return amount.divide(NGN_PER_GHS, 2, RoundingMode.HALF_UP);
+        }
+        return amount;
+    }
 
     private final CommissionLedgerEntryRepository ledgerRepo;
     private final TransactionRepository transactionRepo;
@@ -57,7 +71,10 @@ public class AdminCommissionService {
         BigDecimal totalDeposits = BigDecimal.ZERO;
         for (AdminDepositRow row : rows) {
             BigDecimal amount = row.amount() == null ? BigDecimal.ZERO : row.amount();
-            totalDeposits = totalDeposits.add(amount);
+            // Total is GHS-denominated: convert each row by depositor country
+            // so NGN deposits are not added 1:1. Per-user rows below stay in
+            // their native currency (each row carries its country).
+            totalDeposits = totalDeposits.add(toGhs(amount, row.country()));
             grouped.computeIfAbsent(row.userId(), ignored -> new UserDepositAccumulator(row))
                     .add(amount);
         }
