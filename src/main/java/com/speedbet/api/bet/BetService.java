@@ -31,6 +31,9 @@ public class BetService {
 
     private static final BigDecimal ODDS_DRIFT_TOLERANCE = new BigDecimal("0.02");
     private static final int        MAX_SELECTIONS        = 20;
+    /** Maximum winning limit (payout cap) per bet, per currency. */
+    private static final BigDecimal MAX_WIN_GHS = new BigDecimal("1200000");
+    private static final BigDecimal MAX_WIN_NGN = new BigDecimal("120000000");
 
     private final BetRepository   betRepo;
     private final OddsRepository  oddsRepo;
@@ -137,6 +140,12 @@ public class BetService {
                 .map(BetSelection::getOddsLocked)
                 .reduce(BigDecimal.ONE, (a, b) -> a.multiply(b, MathContext.DECIMAL64));
         var potentialReturn = req.stake().multiply(totalOdds, MathContext.DECIMAL64);
+        // Maximum winning limit — cap the payout per bet (GH₵1.2M / ₦120M).
+        var maxWin = "NGN".equals(currency) ? MAX_WIN_NGN : MAX_WIN_GHS;
+        if (potentialReturn.compareTo(maxWin) > 0) {
+            log.info("placeBet — potentialReturn={} exceeds max win {} — capping", potentialReturn, maxWin);
+            potentialReturn = maxWin;
+        }
         log.info("placeBet — totalOdds={} potentialReturn={}", totalOdds, potentialReturn);
 
         // Debit wallet
