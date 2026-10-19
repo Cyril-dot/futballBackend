@@ -236,6 +236,68 @@ public class SuperAdminCommissionOperationsService {
         }
     }
 
+    /**
+     * Record a partial commission payment. Deducts {@code amount} from the
+     * admin's commission balance (the "owed" amount) and creates a PROCESSED
+     * payout record. When the balance reaches zero, all unpaid ledger entries
+     * are marked paid so the daily report flips to Paid.
+     */
+    @Transactional
+    public SuperAdminCommissionOperationsDtos.CommissionPayoutDto payPartial(UUID adminId, LocalDate date, BigDecimal amount) {
+        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+            throw new IllegalArgumentException("Payment amount must be greater than zero");
+        }
+        LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;
+        String operationId = UUID.randomUUID().toString();
+        log.info("commission.pay-partial.start operationId={} adminId={} date={} amount={}", operationId, adminId, reportDate, amount);
+        try {
+            User admin = getAdmin(adminId);
+            AffiliateCommissionBalance balance = balanceRepo.findByUserIdForUpdate(admin.getId())
+                    .orElseThrow(() -> new IllegalArgumentException("Commission balance not found for admin: " + admin.getId()));
+            if (amount.compareTo(balance.getBalance()) > 0) {
+                throw new IllegalArgumentException("Payment amount " + amount + " exceeds commission owed " + balance.getBalance());
+            }
+
+            Instant paidAt = Instant.now();
+            BigDecimal newBalance = balance.getBalance().subtract(amount);
+            balance.setBalance(newBalance);
+            balance.setTotalPaidOutLifetime(balance.getTotalPaidOutLifetime().add(amount));
+            balance.setLastPayoutAt(paidAt);
+
+            // Balance fully cleared -> mark all unpaid ledger entries paid so
+            // the daily report shows Paid for the affected days.
+            if (newBalance.compareTo(BigDecimal.ZERO) == 0) {
+                List<CommissionLedgerEntry> entries = ledgerRepo.findByAdminIdSince(admin.getId(), Instant.EPOCH).stream()
+                        .filter(entry -> entry.getPaidAt() == null).toList();
+                entries.forEach(entry -> entry.setPaidAt(paidAt));
+                ledgerRepo.saveAll(entries);
+                log.info("commission.pay-partial.ledger-cleared operationId={} adminId={} entries={}", operationId, adminId, entries.size());
+            }
+            balanceRepo.save(balance);
+
+            String reference = "MANUAL-COMM-PAYOUT-" + admin.getId().toString().substring(0, 8).toUpperCase(Locale.ROOT)
+                    + "-" + reportDate + "-" + paidAt.toEpochMilli();
+            AffiliateWithdrawalRequest payout = withdrawalRepo.save(AffiliateWithdrawalRequest.builder()
+                    .userId(admin.getId()).amount(amount).currency(balance.getCurrency())
+                    .status(AffiliateWithdrawalStatus.PROCESSED).reference(reference)
+                    .requestedAt(paidAt).processedAt(paidAt).build());
+            if (walletRepo.findByUserId(admin.getId()).isPresent()) {
+                walletService.recordExternalDebit(admin.getId(), amount, TxKind.AFFILIATE_COMMISSION_PAYOUT, reference,
+                        Map.of("type", "manual_affiliate_commission_payout", "paidBy", "SUPER_ADMIN",
+                                "commissionDate", reportDate.toString(), "withdrawalRequestId", payout.getId().toString()));
+            }
+            log.info("commission.pay-partial.success operationId={} adminId={} date={} amount={} remaining={}",
+                    operationId, adminId, reportDate, amount, newBalance);
+            return new SuperAdminCommissionOperationsDtos.CommissionPayoutDto(
+                    payout.getId(), admin.getId(), admin.getEmail(), amount, balance.getCurrency(), reference,
+                    payout.getStatus().name(), payout.getProcessedAt());
+        } catch (RuntimeException ex) {
+            log.error("commission.pay-partial.failed operationId={} adminId={} date={} amount={} type={} message={}",
+                    operationId, adminId, reportDate, amount, ex.getClass().getSimpleName(), ex.getMessage(), ex);
+            throw ex;
+        }
+    }
+
     @Transactional
     public SuperAdminCommissionOperationsDtos.ClearCommissionResult clearAll(LocalDate date) {
         LocalDate reportDate = date == null ? LocalDate.now(REPORT_ZONE) : date;

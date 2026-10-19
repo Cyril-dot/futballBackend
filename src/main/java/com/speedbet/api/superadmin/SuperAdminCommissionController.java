@@ -9,6 +9,7 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDate;
+import java.math.BigDecimal;
 import java.util.UUID;
 import java.util.List;
 import org.springframework.format.annotation.DateTimeFormat;
@@ -50,16 +51,24 @@ public class SuperAdminCommissionController {
         return ResponseEntity.ok(ApiResponse.ok(operationsService.daily(date, adminId)));
     }
 
-    /** Mark one UTC commission day as paid, without requiring an admin request. */
+    /**
+     * Mark commission as paid, without requiring an admin request.
+     * Without {@code amount}: settles the full unpaid amount for one UTC day.
+     * With {@code amount}: records a partial payment, deducted from the balance.
+     */
     @PostMapping("/admins/{adminId}/pay")
     public ResponseEntity<ApiResponse<SuperAdminCommissionOperationsDtos.CommissionPayoutDto>> markPaid(
             @PathVariable UUID adminId,
-            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam(required = false) BigDecimal amount) {
         String operationId = UUID.randomUUID().toString();
         try {
-            return ResponseEntity.ok(ApiResponse.ok(operationsService.markPaid(adminId, date), "Commission day marked as paid"));
+            var result = amount != null
+                    ? operationsService.payPartial(adminId, date, amount)
+                    : operationsService.markPaid(adminId, date);
+            return ResponseEntity.ok(ApiResponse.ok(result, amount != null ? "Partial commission payment recorded" : "Commission day marked as paid"));
         } catch (RuntimeException ex) {
-            log.error("commission.pay.http-failed operationId={} adminId={} date={} type={} message={}", operationId, adminId, date, ex.getClass().getSimpleName(), ex.getMessage(), ex);
+            log.error("commission.pay.http-failed operationId={} adminId={} date={} amount={} type={} message={}", operationId, adminId, date, amount, ex.getClass().getSimpleName(), ex.getMessage(), ex);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(ApiResponse.error("Commission payout failed. operationId=" + operationId + " reason=" + safeMessage(ex)));
         }
