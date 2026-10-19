@@ -3,8 +3,6 @@ package com.speedbet.api.affiliate;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.referral.Referral;
 import com.speedbet.api.referral.ReferralRepository;
-import com.speedbet.api.wallet.DepositRow;
-import com.speedbet.api.wallet.TransactionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -13,7 +11,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -23,17 +20,9 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class AdminAffiliateService {
 
-    // Hardcoded NGN -> GHS conversion rate: 1 GHS = 135 NGN (i.e. cedis = naira / 135).
-    // NOTE: this is a fixed approximation and WILL drift from the real market
-    // rate over time — update this constant manually if/when the business
-    // wants to re-peg it.
-    private static final BigDecimal NGN_PER_GHS = BigDecimal.valueOf(135);
-    private static final String NG_COUNTRY_CODE = "NG";
-
     private final ReferralRepository          referralRepo;
     private final PayoutRequestRepository     payoutRequestRepo;
     private final AffiliateCommissionService  commissionService;
-    private final TransactionRepository       transactionRepo;
 
     // ─── Stats ────────────────────────────────────────────────────────────────
 
@@ -75,46 +64,19 @@ public class AdminAffiliateService {
     // ─── Payout Requests ─────────────────────────────────────────────────────
 
     /**
-     * Convert a Nigerian-country deposit total (NGN) into Cedis (GHS).
-     * 1 GHS = 135 NGN (hardcoded), i.e. cedis = naira / 135.
-     */
-    private BigDecimal ngnDepositsToGhs(UUID adminId, Instant since) {
-        BigDecimal totalNaira = transactionRepo.findDepositsByAdminSince(adminId, since).stream()
-                .filter(row -> NG_COUNTRY_CODE.equalsIgnoreCase(row.country()))
-                .map(DepositRow::amount)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        return totalNaira.divide(NGN_PER_GHS, 2, RoundingMode.HALF_UP);
-    }
-
-    /**
-     * Submit a payout request for the admin's current commission balance,
-     * after crediting into it any Nigerian-deposit-derived amount (converted
-     * NGN → GHS at the hardcoded rate) accrued since the NG deposits were
-     * last swept up for this admin.
+     * Submit a payout request for the admin's current commission balance.
      *
      * Admin can request any day — no day-of-week restriction.
      *
      * Rules:
      *   - No existing REQUESTED or APPROVED payout already pending
-     *   - Balance (existing commission + freshly-credited NG deposits) must be > 0
+     *   - Balance must be > 0
      *
-     * IMPORTANT — the "since" cutoff below is deliberately based on the
-     * creation time of the admin's most recent payout request (of ANY
-     * status), not on commBalance.getLastPayoutAt().
-     *
-     * commBalance.getLastPayoutAt() only advances when a payout is actually
-     * swept in markPaid(). If we used it here, a REJECTED request would
-     * leave lastPayoutAt untouched, so the very next requestPayout() call
-     * would recompute ngnDepositsToGhs() over the same window and credit
-     * the same Nigerian deposits into the balance a second time. Anchoring
-     * on the last PayoutRequest.createdAt instead means every request —
-     * approved, rejected, or paid — permanently closes off that window, so
-     * NG deposits are converted and credited exactly once, ever, no matter
-     * what happens to the request afterwards.
-     *
-     * markPaid() does not recompute NG deposits — it just sweeps the
-     * balance this call already topped up.
+     * The balance already holds every commission credit: referral commission
+     * is credited (converted to the balance currency) at the moment each
+     * referred deposit is confirmed — see ReferralService.attributeCommission.
+     * Nothing is swept or recomputed here, so a deposit can never be
+     * counted twice.
      */
     @Transactional
     public PayoutRequest requestPayout(UUID adminId) {
@@ -130,15 +92,7 @@ public class AdminAffiliateService {
 
         var commBalance = commissionService.getOrCreate(adminId);
 
-        Instant since = payoutRequestRepo.findTopByAdminIdOrderByCreatedAtDesc(adminId)
-                .map(PayoutRequest::getCreatedAt)
-                .orElse(Instant.EPOCH);
-
-        BigDecimal ngDepositsInGhs = ngnDepositsToGhs(adminId, since);
-
-        BigDecimal currentBalance = ngDepositsInGhs.compareTo(BigDecimal.ZERO) > 0
-                ? commissionService.creditCommission(adminId, ngDepositsInGhs, commBalance.getCurrency()).getBalance()
-                : commBalance.getBalance();
+        BigDecimal currentBalance = commBalance.getBalance();
 
         if (currentBalance.compareTo(BigDecimal.ZERO) <= 0)
             throw ApiException.badRequest("No commission balance available to request a payout.");
@@ -152,8 +106,8 @@ public class AdminAffiliateService {
                         .periodEnd(Instant.now())
                         .build());
 
-        log.info("requestPayout: created id={} adminId={} ngDepositsInGhs={} creditedBalance={}",
-                request.getId(), adminId, ngDepositsInGhs, currentBalance);
+        log.info("requestPayout: created id={} adminId={} balance={} {}",
+                request.getId(), adminId, currentBalance, commBalance.getCurrency());
 
         return request;
     }
@@ -202,8 +156,8 @@ public class AdminAffiliateService {
      * Mark an APPROVED payout as PAID: sweeps the commission balance.
      *
      * NG-deposit conversion already happened at the hardcoded rate back in
-     * requestPayout and was credited into the balance, so there is nothing
-     * left to recompute here — just sweep.
+     * requestPayout never recomputes anything — it just requests the
+     * balance, so there is nothing left to recompute here — just sweep.
      *
      * Main wallet is never touched.
      */
