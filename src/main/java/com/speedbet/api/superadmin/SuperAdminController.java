@@ -450,6 +450,19 @@ public class SuperAdminController {
         return ResponseEntity.ok(ApiResponse.ok(queryService.getAdminDetail(adminId)));
     }
 
+    /**
+     * GET /api/super-admin/admins/{adminId}/referred-users
+     *
+     * Every user referred by the admin, with their country and total deposits.
+     * Used by the super-admin admin-detail view for the per-user, per-country
+     * deposit breakdown.
+     */
+    @GetMapping("/admins/{adminId}/referred-users")
+    public ResponseEntity<ApiResponse<List<com.speedbet.api.referral.ReferredUserDTO>>> getAdminReferredUsers(
+            @PathVariable UUID adminId) {
+        return ResponseEntity.ok(ApiResponse.ok(referralService.getReferredUserDTOs(adminId)));
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // PLATFORM-WIDE TRANSACTIONS (paginated + filtered)
     // ══════════════════════════════════════════════════════════════════════════

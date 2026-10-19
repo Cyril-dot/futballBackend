@@ -9,6 +9,7 @@ public record ReferredUserDTO(
         String firstName,
         String lastName,
         String email,
+        String country,
         LocalDateTime joinedAt,
         BigDecimal lifetimeStake,
         BigDecimal lifetimeCommission,

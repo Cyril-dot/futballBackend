@@ -30,6 +30,7 @@ public interface ReferralRepository extends JpaRepository<Referral, UUID> {
             u.firstName,
             u.lastName,
             u.email,
+            u.country,
             u.createdAt,
             r.lifetimeStake,
             r.lifetimeCommission,
