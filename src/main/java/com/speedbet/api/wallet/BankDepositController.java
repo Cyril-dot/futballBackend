@@ -68,7 +68,7 @@ public class BankDepositController {
             @RequestParam(defaultValue = "20") int size) {
 
         var result = service.getAll(PageRequest.of(page, size))
-                            .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
+                            .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId()), false));
         return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
     }
 
@@ -78,7 +78,7 @@ public class BankDepositController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size) {
         var result = service.getMomo(PageRequest.of(page, size))
-                .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
+                .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId()), false));
         return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
     }
 
@@ -88,7 +88,7 @@ public class BankDepositController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size) {
         var result = service.getPendingMomo(PageRequest.of(page, size))
-                .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
+                .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId()), false));
         return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
     }
 
@@ -99,7 +99,7 @@ public class BankDepositController {
             @RequestParam(defaultValue = "20") int size) {
 
         var result = service.getPending(PageRequest.of(page, size))
-                            .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId())));
+                            .map(d -> BankDepositDtos.DepositResponse.from(d, service.getUserEmail(d.getUserId()), false));
         return ResponseEntity.ok(ApiResponse.ok(new PageResponse<>(result)));
     }
 

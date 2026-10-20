@@ -68,6 +68,7 @@ public class BankDepositDtos {
         private BigDecimal    creditedNgnAmount;
         private String        senderAccountName;
         private String        screenshotUrl;
+        private boolean       hasScreenshot;
         private String        userNote;
         private BankDepositStatus status;
         private UUID          reviewedBy;
@@ -81,6 +82,16 @@ public class BankDepositDtos {
             return from(d, null);
         }
         public static DepositResponse from(BankDeposit d, String userEmail) {
+            return from(d, userEmail, true);
+        }
+
+        /**
+         * @param includeScreenshot false for LIST responses — a page of full
+         *        base64 receipts is 15–25 MB and stalls the admin review
+         *        queue. The single-deposit GET keeps the image; list rows
+         *        carry {@code hasScreenshot} so the UI knows one exists.
+         */
+        public static DepositResponse from(BankDeposit d, String userEmail, boolean includeScreenshot) {
             return DepositResponse.builder()
                     .id(d.getId())
                     .userId(d.getUserId())
@@ -90,7 +101,8 @@ public class BankDepositDtos {
                     .expectedNgnCredit(d.getExpectedNgnCredit())
                     .creditedNgnAmount(d.getCreditedNgnAmount())
                     .senderAccountName(d.getSenderAccountName())
-                    .screenshotUrl(d.getScreenshotUrl())
+                    .screenshotUrl(includeScreenshot ? d.getScreenshotUrl() : null)
+                    .hasScreenshot(d.getScreenshotUrl() != null && !d.getScreenshotUrl().isBlank())
                     .userNote(d.getUserNote())
                     .status(d.getStatus())
                     .reviewedBy(d.getReviewedBy())
