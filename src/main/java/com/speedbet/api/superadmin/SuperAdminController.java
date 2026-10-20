@@ -9,6 +9,7 @@ import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.common.PageResponse;
 import com.speedbet.api.referral.ReferralLinkRepository;
+import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserRole;
@@ -43,6 +44,7 @@ public class SuperAdminController {
     private final WalletService walletService;
     private final ReferralLinkRepository referralLinkRepo;
     private final AffiliateCommissionService commissionService;
+    private final ReferralService referralService;
 
     // ══════════════════════════════════════════════════════════════════════════
     // EXISTING ENDPOINTS (unchanged)
