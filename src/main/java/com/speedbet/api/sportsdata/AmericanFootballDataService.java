@@ -99,6 +99,8 @@ public class AmericanFootballDataService {
     // ── ESPN NFL base URL ──────────────────────────────────────────────────
     private static final String BASE_URL = "https://site.web.api.espn.com";
     private static final String NFL_PATH            = "/apis/site/v2/sports/football/nfl";
+    // ESPN standings live only on the /apis/v2 base -- the /site/v2 variant 404s.
+    private static final String NFL_V2_PATH         = "/apis/v2/sports/football/nfl";
     private static final long   CACHE_TTL_MIN       = 5;
     private static final long   REQUEST_TIMEOUT_SEC = 12;
 
@@ -481,7 +483,7 @@ public class AmericanFootballDataService {
      */
     public Map<String, Object> getStandings() {
         return cached("standings:nfl", () -> {
-            Map<String, Object> result = fetch(NFL_PATH + "/standings");
+            Map<String, Object> result = fetch(NFL_V2_PATH + "/standings");
             if (result == null) return Map.of();
             log.info("getStandings: fetched NFL standings");
             return result;
