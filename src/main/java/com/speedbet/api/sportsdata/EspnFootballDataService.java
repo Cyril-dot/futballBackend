@@ -22,6 +22,9 @@ public class EspnFootballDataService {
 
     private static final String BASE_URL = "https://site.web.api.espn.com/apis/site/v2/sports/soccer";
 
+    // ESPN serves soccer standings only on the /apis/v2 base -- the /site/v2 variant 404s.
+    private static final String STANDINGS_BASE_URL = "https://site.web.api.espn.com/apis/v2/sports/soccer";
+
     private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {};
     private static final DateTimeFormatter ESPN_DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd");
 
@@ -1029,7 +1032,7 @@ public class EspnFootballDataService {
     public Map<String, Object> getStandings(EspnLeague league) {
         return cachedStatic("standings:league:" + league.slug(), () -> {
             log.info("ESPN getStandings({}): fetching league table", league.displayName());
-            Map<String, Object> raw = fetch(league.slug() + "/standings");
+            Map<String, Object> raw = fetchStandings(league.slug());
             return raw != null ? raw : Map.of();
         });
     }
@@ -1037,7 +1040,7 @@ public class EspnFootballDataService {
     public Map<String, Object> getCupStandings(EspnCup cup) {
         return cachedStatic("standings:cup:" + cup.slug(), () -> {
             log.info("ESPN getCupStandings({}): fetching standings", cup.displayName());
-            Map<String, Object> raw = fetch(cup.slug() + "/standings");
+            Map<String, Object> raw = fetchStandings(cup.slug());
             return raw != null ? raw : Map.of();
         });
     }
@@ -1252,6 +1255,38 @@ public class EspnFootballDataService {
     }
 
     // Ã¢ÂÂÃ¢ÂÂ PRIVATE: HTTP FETCH Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+
+    /** Standings-only fetch: ESPN standings live on the /apis/v2 base (see STANDINGS_BASE_URL). */
+    private Map<String, Object> fetchStandings(String slug) {
+        String url = STANDINGS_BASE_URL + "/" + slug + "/standings";
+        log.debug("ESPN fetchStandings: GET {}", url);
+        try {
+            String raw = client.get()
+                    .uri(url)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .timeout(Duration.ofSeconds(10))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .onErrorResume(e -> {
+                        log.warn("ESPN fetchStandings {}: network error -- {}", slug, e.getMessage());
+                        return reactor.core.publisher.Mono.empty();
+                    })
+                    .block();
+
+            if (raw == null || raw.isBlank()) {
+                log.warn("ESPN fetchStandings {}: blank or null response", slug);
+                return null;
+            }
+
+            Map<String, Object> parsed = mapper.readValue(raw, MAP_TYPE);
+            log.debug("ESPN fetchStandings {}: OK ({} bytes)", slug, raw.length());
+            return parsed;
+
+        } catch (Exception e) {
+            log.error("ESPN fetchStandings {}: exception -- {}", slug, e.getMessage());
+            return null;
+        }
+    }
 
     private Map<String, Object> fetch(String path) {
         log.debug("ESPN fetch: GET /{}", path);
