@@ -85,6 +85,8 @@ public class BaseballDataService {
     // ── ESPN MLB base URL ──────────────────────────────────────────────────
     private static final String BASE_URL = "https://site.web.api.espn.com";
     private static final String MLB_PATH            = "/apis/site/v2/sports/baseball/mlb";
+    // ESPN standings live only on the /apis/v2 base -- the /site/v2 variant 404s.
+    private static final String MLB_V2_PATH         = "/apis/v2/sports/baseball/mlb";
     private static final long   CACHE_TTL_MIN       = 5;
     private static final long   REQUEST_TIMEOUT_SEC = 12;
 
@@ -432,7 +434,7 @@ public class BaseballDataService {
      */
     public Map<String, Object> getStandings() {
         return cached("standings:mlb", () -> {
-            Map<String, Object> result = fetch(MLB_PATH + "/standings");
+            Map<String, Object> result = fetch(MLB_V2_PATH + "/standings");
             if (result == null) return Map.of();
             log.info("getStandings: fetched MLB standings");
             return result;
