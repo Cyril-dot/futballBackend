@@ -31,9 +31,14 @@ import java.util.UUID;
 public class KycService {
 
     private final KycSubmissionRepository submissions;
+    private final KycSettingsService settings;
 
     @Transactional
     public KycSubmission submit(User user, KycDtos.SubmitKycRequest req) {
+        // Super-admin switch (default CLOSED): no new submissions while off.
+        if (!settings.isSubmissionsOpen()) {
+            throw ApiException.forbidden("KYC submissions are currently closed.");
+        }
         var latest = submissions.findFirstByUserIdOrderBySubmittedAtDesc(user.getId());
         if (latest.isPresent() && latest.get().getStatus() == KycStatus.APPROVED) {
             throw ApiException.conflict("Your identity is already verified.");
