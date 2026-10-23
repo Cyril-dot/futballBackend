@@ -38,7 +38,7 @@ public class WithdrawalController {
         // a player (role USER) may only request a withdrawal when their
         // latest KYC submission is APPROVED. Staff are exempt — they are
         // the operators who review withdrawals and KYC.
-        if (user.getRole() == UserRole.USER && !kycService.isVerified(user.getId())) {
+        if (kycService.isEnforcementEnabled() && user.getRole() == UserRole.USER && !kycService.isVerified(user.getId())) {
             throw ApiException.forbidden(
                     "KYC verification is required before you can withdraw. "
                     + "Complete your identity verification (KYC) first.");

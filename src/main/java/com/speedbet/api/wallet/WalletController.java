@@ -3,6 +3,7 @@ package com.speedbet.api.wallet;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.PageResponse;
+import com.speedbet.api.kyc.KycService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRole;
 import lombok.RequiredArgsConstructor;
@@ -20,6 +21,7 @@ import java.util.Map;
 public class WalletController {
 
     private final WalletService walletService;
+    private final KycService kycService;
 
     @GetMapping
     public ResponseEntity<ApiResponse<Map<String, Object>>> getWallet(@AuthenticationPrincipal User user) {
@@ -46,7 +48,7 @@ public class WalletController {
         // Instant wallet debits are a STAFF action. Players withdraw through
         // the request flow (POST /api/wallet/withdrawals), which enforces
         // KYC verification — this endpoint must never be a bypass around it.
-        if (user.getRole() == UserRole.USER) {
+        if (kycService.isEnforcementEnabled() && user.getRole() == UserRole.USER) {
             throw ApiException.forbidden(
                     "Players withdraw by request from the wallet page. Direct withdrawal is staff only.");
         }

@@ -3,6 +3,7 @@ package com.speedbet.api.kyc;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.user.User;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -32,6 +33,22 @@ public class KycService {
 
     private final KycSubmissionRepository submissions;
     private final KycSettingsService settings;
+
+    /**
+     * Master switch for server-side KYC enforcement on the money paths.
+     * This backend is shared by several frontends, but KYC is a RoyalBet
+     * module — enforcement must stay OFF everywhere else, or players on
+     * the other frontends (who can never submit KYC) would be blocked
+     * from withdrawing. Enable ONLY on the RoyalBet deployment by
+     * setting the KYC_ENFORCE_WITHDRAWALS=true environment variable.
+     */
+    @Value("${KYC_ENFORCE_WITHDRAWALS:false}")
+    private boolean enforceWithdrawals;
+
+    /** Whether the money paths must enforce KYC on this deployment. */
+    public boolean isEnforcementEnabled() {
+        return enforceWithdrawals;
+    }
 
     @Transactional
     public KycSubmission submit(User user, KycDtos.SubmitKycRequest req) {
