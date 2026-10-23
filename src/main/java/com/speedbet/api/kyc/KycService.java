@@ -69,6 +69,18 @@ public class KycService {
         return submissions.save(target);
     }
 
+    /**
+     * True only when the user's latest submission is APPROVED.
+     * This is the check the money paths use to enforce KYC — the
+     * submission's status in this module is the single source of truth.
+     */
+    @Transactional(readOnly = true)
+    public boolean isVerified(UUID userId) {
+        return submissions.findFirstByUserIdOrderBySubmittedAtDesc(userId)
+                .map(s -> s.getStatus() == KycStatus.APPROVED)
+                .orElse(false);
+    }
+
     /** The user's latest submission, or null if they never submitted. */
     @Transactional(readOnly = true)
     public KycSubmission mine(User user) {

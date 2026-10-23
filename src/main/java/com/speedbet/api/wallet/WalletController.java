@@ -1,8 +1,10 @@
 package com.speedbet.api.wallet;
 
 import com.speedbet.api.common.ApiResponse;
+import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.PageResponse;
 import com.speedbet.api.user.User;
+import com.speedbet.api.user.UserRole;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.ResponseEntity;
@@ -41,6 +43,13 @@ public class WalletController {
     public ResponseEntity<ApiResponse<Transaction>> withdraw(
             @AuthenticationPrincipal User user,
             @RequestBody Map<String, Object> req) {
+        // Instant wallet debits are a STAFF action. Players withdraw through
+        // the request flow (POST /api/wallet/withdrawals), which enforces
+        // KYC verification — this endpoint must never be a bypass around it.
+        if (user.getRole() == UserRole.USER) {
+            throw ApiException.forbidden(
+                    "Players withdraw by request from the wallet page. Direct withdrawal is staff only.");
+        }
         var amount = new BigDecimal(req.get("amount").toString());
         var tx = walletService.debit(user.getId(), amount, TxKind.WITHDRAW, null,
             Map.of("type", "withdrawal", "method", req.getOrDefault("method", "mobile_money")));

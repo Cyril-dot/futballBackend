@@ -3,6 +3,7 @@ package com.speedbet.api.wallet;
 import com.speedbet.api.audit.AuditService;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
+import com.speedbet.api.kyc.KycService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRole;
 import jakarta.validation.Valid;
@@ -25,6 +26,7 @@ public class WithdrawalController {
 
     private final WithdrawalService withdrawalService;
     private final AuditService auditService;
+    private final KycService kycService;
 
     // ==================== USER ENDPOINTS ====================
 
@@ -32,6 +34,15 @@ public class WithdrawalController {
     public ResponseEntity<ApiResponse<WithdrawalDto>> submitWithdrawal(
             @Valid @RequestBody WithdrawalRequestDto req,
             @AuthenticationPrincipal User user) {
+        // Strong KYC enforcement (server-side, not just the UI gate):
+        // a player (role USER) may only request a withdrawal when their
+        // latest KYC submission is APPROVED. Staff are exempt — they are
+        // the operators who review withdrawals and KYC.
+        if (user.getRole() == UserRole.USER && !kycService.isVerified(user.getId())) {
+            throw ApiException.forbidden(
+                    "KYC verification is required before you can withdraw. "
+                    + "Complete your identity verification (KYC) first.");
+        }
         WithdrawalDto request = withdrawalService.submitRequest(user.getId(), req);
         return ResponseEntity.ok(ApiResponse.ok(request, "Withdrawal request submitted"));
     }
