@@ -470,7 +470,11 @@ public class SecurityConfig {
                 "https://hotbet-tau.vercel.app",
 
                 // ── 7up ───────────────────────────────────────────────
-                "https://7up-six.vercel.app"
+                "https://7up-six.vercel.app",
+
+                // ── playbett ──────────────────────────────────────────
+                "https://playbett.xyz",
+                "https://www.playbett.xyz"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
