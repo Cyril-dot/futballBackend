@@ -1,6 +1,7 @@
 package com.speedbet.api.superadmin;
 
 import com.speedbet.api.common.ApiException;
+import com.speedbet.api.referral.ReferralLinkRepository;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserStatus;
@@ -18,6 +19,7 @@ import java.util.UUID;
 public class SuperAdminUserManagementService {
 
     private final UserRepository userRepo;
+    private final ReferralLinkRepository linkRepo;
 
     @Transactional
     public SuperAdminDtos.UserStatusUpdateDto deactivateUser(UUID userId, UUID adminId) {
@@ -37,7 +39,21 @@ public class SuperAdminUserManagementService {
         user.setUpdatedAt(LocalDateTime.now());
         userRepo.save(user);
 
-        log.info("deactivateUser: userId='{}' set to DISABLED by adminId='{}'", userId, adminId);
+        // A deactivated admin stops earning: deactivate their active referral
+        // links so no new signups attribute to them. (Attribution itself also
+        // skips DISABLED owners, so existing referrals stop paying too.)
+        // Reactivation deliberately does NOT restore links — the admin creates
+        // a new link if they return.
+        int deactivatedLinks = 0;
+        for (var link : linkRepo.findByAdminId(userId)) {
+            if (link.isActive()) {
+                link.setActive(false);
+                linkRepo.save(link);
+                deactivatedLinks++;
+            }
+        }
+        log.info("deactivateUser: userId='{}' set to DISABLED by adminId='{}', {} active referral link(s) deactivated",
+                userId, adminId, deactivatedLinks);
 
         return new SuperAdminDtos.UserStatusUpdateDto(
                 user.getId(),

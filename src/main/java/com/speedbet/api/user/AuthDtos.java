@@ -25,14 +25,23 @@ public class AuthDtos {
             String accessToken,
             String tokenType,
             UserDto user,
-            boolean mustSetup2fa
+            boolean mustSetup2fa,
+            // Register-only: null unless a referral code was supplied. False
+            // means the code was unrecognised, expired, deactivated, or the
+            // user's own (self-referral) — registration still succeeded, just
+            // without attribution. Omitted from JSON when null (NON_NULL).
+            Boolean refValid
     ) {
         public AuthResponse(String accessToken, UserDto user) {
-            this(accessToken, "Bearer", user, false);
+            this(accessToken, "Bearer", user, false, null);
+        }
+
+        public AuthResponse(String accessToken, UserDto user, Boolean refValid) {
+            this(accessToken, "Bearer", user, false, refValid);
         }
 
         public AuthResponse withMustSetup2fa(boolean value) {
-            return new AuthResponse(accessToken, tokenType, user, value);
+            return new AuthResponse(accessToken, tokenType, user, value, refValid);
         }
     }
 

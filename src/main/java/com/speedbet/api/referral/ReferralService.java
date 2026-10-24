@@ -4,6 +4,7 @@ import com.speedbet.api.affiliate.AffiliateCommissionService;
 import com.speedbet.api.bet.CurrencyResolver;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.user.UserRepository;
+import com.speedbet.api.user.UserStatus;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -35,13 +36,13 @@ public class ReferralService {
      * Default commission rate (%) applied immediately after an admin upgrade,
      * before Super Admin finalises it via the onboarding chat.
      *
-     * Rate: 60% — the admin earns 60% of every deposit made by their referred users.
+     * Rate: 70% — the admin earns 70% of every deposit made by their referred users.
      * This is credited to the admin's COMMISSION BALANCE (not their main wallet).
      * Super Admin can adjust this per-admin at any time via
      * AdminUpgradeChatService.setCommission → updateCommissionRate().
      *
      * Examples of custom rates:
-     *   60% (default) — standard admin rate
+     *   70% (default) — standard admin rate
      *   45%           — negotiated lower rate
      *   75%           — negotiated higher rate for top performers
      */
@@ -66,6 +67,41 @@ public class ReferralService {
                 .map(ReferralLink::getId);
         log.info("findLinkIdByCode: code={} found={}", code, result.isPresent());
         return result;
+    }
+
+    public Optional<ReferralLink> findValidLinkByCode(String code) {
+        return linkRepo.findValidByCode(code, Instant.now());
+    }
+
+    /**
+     * Resolves a referral code supplied at registration into an attribution
+     * decision. Registration is NEVER blocked by a bad code: an unrecognised,
+     * expired or deactivated code — or a code belonging to the registering
+     * user themself (self-referral) — resolves to linkId=null with
+     * refValid=false, and the frontend shows the "not recognised" message
+     * while registration continues without attribution.
+     *
+     * @param code  the raw ?ref= code supplied at registration, may be null
+     * @param email the registering user's email, for the self-referral check
+     * @return linkId to attribute (null when nothing should be attributed)
+     *         plus refValid (true when no code was supplied or it resolved)
+     */
+    public record ReferralResolution(UUID linkId, boolean refValid) {}
+
+    @Transactional(readOnly = true)
+    public ReferralResolution resolveRegistrationReferral(String code, String email) {
+        if (code == null || code.isBlank()) return new ReferralResolution(null, true);
+        ReferralLink link = findValidLinkByCode(code).orElse(null);
+        if (link == null) {
+            log.info("resolveRegistrationReferral: code={} did not resolve to a valid link", code);
+            return new ReferralResolution(null, false);
+        }
+        var owner = userRepo.findById(link.getAdminId()).orElse(null);
+        if (owner != null && owner.getEmail() != null && owner.getEmail().equalsIgnoreCase(email)) {
+            log.info("resolveRegistrationReferral: code={} is the registering user's own link — self-referral blocked", code);
+            return new ReferralResolution(null, false);
+        }
+        return new ReferralResolution(link.getId(), true);
     }
 
     // ─── Referral Attribution ─────────────────────────────────────────────────
@@ -94,13 +130,13 @@ public class ReferralService {
      * └──────────────────────────────────────────────────────────────────────┘
      *
      * The rate is stored on the ReferralLink (commissionPercent). It defaults
-     * to 60% at upgrade time. Super Admin can change it per-admin at any point
+     * to 70% at upgrade time. Super Admin can change it per-admin at any point
      * via updateCommissionRate() — the new rate applies on the very next deposit.
      *
-     * Example (default 60% rate):
+     * Example (default 70% rate):
      *   User deposits GHS 100
-     *   Commission = GHS 100 × 60% = GHS 60
-     *   → GHS 60 added to admin's commission balance
+     *   Commission = GHS 100 × 70% = GHS 70
+     *   → GHS 70 added to admin's commission balance
      *   → Admin's main wallet: unchanged
      *   → Commission balance paid out daily by AffiliateDailyPayoutScheduler
      *
@@ -130,6 +166,24 @@ public class ReferralService {
             return;
         }
 
+        // Off-switches: a deactivated or expired link stops paying existing
+        // referrals, and a DISABLED link owner stops earning. All skips are
+        // silent by design — call sites wrap attribution in try/catch so a
+        // skip here can never fail the deposit itself.
+        if (!link.isActive()) {
+            log.info("attributeCommission: linkId={} is deactivated — skipping", link.getId());
+            return;
+        }
+        if (link.getExpiresAt() != null && link.getExpiresAt().isBefore(Instant.now())) {
+            log.info("attributeCommission: linkId={} expired at {} — skipping", link.getId(), link.getExpiresAt());
+            return;
+        }
+        var owner = userRepo.findById(link.getAdminId()).orElse(null);
+        if (owner != null && owner.getStatus() == UserStatus.DISABLED) {
+            log.info("attributeCommission: link owner adminId={} is DISABLED — skipping", link.getAdminId());
+            return;
+        }
+
         // Resolve the deposit currency from the depositor's country — the
         // deposit amount arrives in the depositor's own currency (GHS for
         // Ghana MoMo, NGN for Nigerian bank transfers, ...).
@@ -137,7 +191,7 @@ public class ReferralService {
                 .map(u -> CurrencyResolver.forCountry(u.getCountry()))
                 .orElse("GHS");
 
-        BigDecimal rate       = link.getCommissionPercent();   // e.g. 60, 45, 75 — set per admin
+        BigDecimal rate       = link.getCommissionPercent();   // e.g. 70, 45, 75 — set per admin
         BigDecimal commission = deposit.multiply(
                 rate.divide(BigDecimal.valueOf(100), MathContext.DECIMAL64));
 
@@ -216,12 +270,12 @@ public class ReferralService {
     /**
      * Called by UserService.upgradeToAdmin() after role promotion.
      *
-     * 1. Creates a new referral link at DEFAULT_ADMIN_COMMISSION (60%).
+     * 1. Creates a new referral link at DEFAULT_ADMIN_COMMISSION (70%).
      * 2. Migrates ALL existing referrals to the new link so their referred
      *    users immediately earn at the new rate.
      * 3. Deactivates all old links.
      *
-     * Super Admin can adjust the 60% default at any time via the onboarding
+     * Super Admin can adjust the 70% default at any time via the onboarding
      * chat → updateCommissionRate(). The change takes effect immediately.
      */
     @Transactional
@@ -232,7 +286,7 @@ public class ReferralService {
         ReferralLink newLink = createLink(
                 adminId,
                 "Admin upgrade link",
-                DEFAULT_ADMIN_COMMISSION,   // 60% default, adjustable per admin
+                DEFAULT_ADMIN_COMMISSION,   // 70% default, adjustable per admin
                 null
         );
 

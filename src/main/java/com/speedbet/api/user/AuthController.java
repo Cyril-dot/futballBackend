@@ -51,10 +51,12 @@ public class AuthController {
             HttpServletResponse res) {
         log.info("register: request received for email='{}'", req.email());
 
-        UUID refLinkId = null;
-        if (req.ref() != null) {
-            refLinkId = referralService.findLinkIdByCode(req.ref()).orElse(null);
-        }
+        // A bad referral code never blocks registration: it resolves to no
+        // attribution plus refValid=false, and the frontend shows the
+        // "not recognised — you can still continue" message.
+        boolean refSupplied = req.ref() != null && !req.ref().isBlank();
+        var resolution = referralService.resolveRegistrationReferral(req.ref(), req.email());
+        UUID refLinkId = resolution.linkId();
 
         var user = userService.register(
                 req.email(), req.password(), req.firstName(),
@@ -63,8 +65,10 @@ public class AuthController {
 
         if (refLinkId != null) referralService.attributeUser(refLinkId, user.getId());
 
-        log.info("register: success for email='{}'", req.email());
-        return ResponseEntity.ok(ApiResponse.ok(buildAuthResponse(user, res)));
+        log.info("register: success for email='{}' refSupplied={} refValid={}",
+                req.email(), refSupplied, resolution.refValid());
+        return ResponseEntity.ok(ApiResponse.ok(
+                buildAuthResponse(user, res, refSupplied ? resolution.refValid() : null)));
     }
 
     @PostMapping("/login")
@@ -221,6 +225,12 @@ public class AuthController {
         res.addCookie(cookie);
 
         return new AuthDtos.AuthResponse(accessToken, AuthDtos.UserDto.from(user));
+    }
+
+    private AuthDtos.AuthResponse buildAuthResponse(User user, HttpServletResponse res, Boolean refValid) {
+        var response = buildAuthResponse(user, res);
+        return new AuthDtos.AuthResponse(
+                response.accessToken(), response.user(), refValid);
     }
 
     private String extractRefreshCookie(HttpServletRequest req) {

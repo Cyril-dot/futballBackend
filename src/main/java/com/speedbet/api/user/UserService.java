@@ -239,7 +239,7 @@ public class UserService implements UserDetailsService {
      *  1. Guard — must be USER role
      *  2. Promote role to ADMIN
      *  3. Record ADMIN_UPGRADE_FEE transaction for audit (no balance change)
-     *  4. Create 60% referral link + migrate existing 2% referrals
+     *  4. Create 70% referral link + migrate existing 2% referrals
      */
     @Transactional
     public User upgradeToAdmin(UUID userId, String paystackRef) {
