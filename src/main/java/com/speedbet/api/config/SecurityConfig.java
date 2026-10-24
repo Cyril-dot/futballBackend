@@ -474,7 +474,11 @@ public class SecurityConfig {
 
                 // ── playbett ──────────────────────────────────────────
                 "https://playbett.xyz",
-                "https://www.playbett.xyz"
+                "https://www.playbett.xyz",
+
+                // ── 7upsport ──────────────────────────────────────────
+                "https://7upsport.com",
+                "https://www.7upsport.com"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
