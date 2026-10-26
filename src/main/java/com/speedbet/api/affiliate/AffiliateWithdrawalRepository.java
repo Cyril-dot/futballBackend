@@ -14,6 +14,8 @@ public interface AffiliateWithdrawalRepository extends JpaRepository<AffiliateWi
 
     List<AffiliateWithdrawalRequest> findByStatus(AffiliateWithdrawalStatus status);
 
+    boolean existsByUserIdAndStatus(UUID userId, AffiliateWithdrawalStatus status);
+
     Page<AffiliateWithdrawalRequest> findByStatusOrderByRequestedAtDesc(
             AffiliateWithdrawalStatus status, Pageable pageable);
 

@@ -102,8 +102,8 @@ public class AffiliateCommissionService {
      * Debit the full current commission balance in preparation for payout.
      *
      * This sweeps the balance to ZERO and returns the amount that was swept.
-     * The caller (scheduler) is responsible for creating the
-     * {@link AffiliateWithdrawalRequest} row and the wallet audit record.
+     * Only used when a payout is actually being paid (markPaid on an
+     * APPROVED admin request) — never to queue an unpaid request.
      *
      * @return the amount swept (may be ZERO if nothing was pending)
      */
@@ -125,6 +125,41 @@ public class AffiliateCommissionService {
 
         log.info("sweepCommissionBalance: userId={} swept={} {}", userId, swept, balance.getCurrency());
         return swept;
+    }
+
+    // ─── Debit on processing (scheduler-queued withdrawals) ────────────────────
+
+    /**
+     * Deduct a processed commission payout from the balance.
+     *
+     * Called ONLY when the super-admin marks a scheduler-queued withdrawal
+     * PROCESSED — i.e. the bank/MoMo transfer actually happened. Until this
+     * point the balance (and every "owed" figure derived from it) stays
+     * untouched, so a PENDING request never clears what is owed.
+     *
+     * Deducts at most the current balance, so a partial direct payment made
+     * in the meantime can never drive the balance negative; only the amount
+     * actually deducted joins lifetime paid-out.
+     *
+     * @return the amount actually deducted (may be ZERO)
+     */
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public BigDecimal deductProcessedPayout(UUID userId, BigDecimal amount) {
+        var balance = commissionRepo.findByUserIdForUpdate(userId)
+                .orElseThrow(() -> ApiException.notFound("Commission balance not found for user: " + userId));
+
+        BigDecimal requested = amount == null ? BigDecimal.ZERO : amount.max(BigDecimal.ZERO);
+        BigDecimal deducted = balance.getBalance().min(requested);
+
+        if (deducted.compareTo(BigDecimal.ZERO) > 0) {
+            balance.setBalance(balance.getBalance().subtract(deducted));
+            balance.setTotalPaidOutLifetime(balance.getTotalPaidOutLifetime().add(deducted));
+            balance.setLastPayoutAt(Instant.now());
+            commissionRepo.save(balance);
+        }
+
+        log.info("deductProcessedPayout: userId={} requested={} deducted={} {}", userId, requested, deducted, balance.getCurrency());
+        return deducted;
     }
 
     // ─── Reversal (used when super-admin rejects a payout) ───────────────────────

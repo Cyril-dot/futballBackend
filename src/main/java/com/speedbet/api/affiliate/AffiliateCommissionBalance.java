@@ -13,8 +13,10 @@ import java.util.UUID;
  *
  * Commission balance lifecycle:
  *   1. Credited when a referred user places a qualifying bet  →  credit()
- *   2. Debited daily by the scheduler payout job             →  debit() / reset to ZERO
- *   3. If a payout is rejected by super-admin the amount is  →  credit() (reversal)
+ *   2. Debited ONLY when a payout is actually processed      →  deductProcessedPayout()
+ *      (the daily scheduler only queues a PENDING request now; it no longer
+ *      sweeps the balance, so unpaid commission is never cleared early)
+ *   3. If a swept payout is rejected by super-admin the amount is  →  credit() (reversal)
  *      re-added to the commission balance, NOT the main wallet.
  *
  * The main wallet balance is untouched by affiliate commission operations.

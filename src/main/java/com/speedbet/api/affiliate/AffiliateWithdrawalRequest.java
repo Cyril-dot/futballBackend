@@ -35,6 +35,18 @@ public class AffiliateWithdrawalRequest {
     @Builder.Default
     private AffiliateWithdrawalStatus status = AffiliateWithdrawalStatus.PENDING;
 
+    /**
+     * Whether the commission balance was already swept (zeroed) when this
+     * request was created. NULL means a row created before this flag existed
+     * (old scheduler behaviour — swept at creation, so processing deducts
+     * nothing further and rejecting re-credits). FALSE means the balance was
+     * left untouched at creation and only moves when the request is
+     * processed; rejecting such a request reverses nothing. User wallet
+     * withdrawals never set this flag.
+     */
+    @Column(name = "balance_swept")
+    private Boolean balanceSwept;
+
     // ─── Payment destination (bank or MoMo — stored at request time for audit) ───
 
     @Column(name = "bank_name")
