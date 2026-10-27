@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -87,14 +88,23 @@ public class KycService {
     }
 
     /**
-     * True only when the user's latest submission is APPROVED.
-     * This is the check the money paths use to enforce KYC — the
-     * submission's status in this module is the single source of truth.
+     * True when the user's latest submission is APPROVED — or when it has
+     * been PENDING for 24h or more with no admin decision (27 Oct, Chuks:
+     * admin approval OR auto-verified 24h after submission). The money
+     * paths use this single check, so the gate and the withdrawal
+     * endpoint agree. A REJECTED latest submission is never verified,
+     * and the 24h clock runs from the submission's own submittedAt.
+     * The submission row itself stays PENDING: the admin can still
+     * approve or reject it, and a later REJECTED latest submission
+     * flips this back to false.
      */
     @Transactional(readOnly = true)
     public boolean isVerified(UUID userId) {
         return submissions.findFirstByUserIdOrderBySubmittedAtDesc(userId)
-                .map(s -> s.getStatus() == KycStatus.APPROVED)
+                .map(s -> s.getStatus() == KycStatus.APPROVED
+                        || (s.getStatus() == KycStatus.PENDING
+                                && s.getSubmittedAt() != null
+                                && !Instant.now().minus(Duration.ofHours(24)).isBefore(s.getSubmittedAt())))
                 .orElse(false);
     }
 
