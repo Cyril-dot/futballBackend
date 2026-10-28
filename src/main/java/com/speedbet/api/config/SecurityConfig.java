@@ -478,7 +478,10 @@ public class SecurityConfig {
 
                 // ── 7upsport ──────────────────────────────────────────
                 "https://7upsport.com",
-                "https://www.7upsport.com"
+                "https://www.7upsport.com",
+
+                // ── primestake ──────────────────────────────────────────
+                "https://primestake-eta.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
