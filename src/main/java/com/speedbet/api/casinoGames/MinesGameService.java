@@ -58,15 +58,32 @@ public class MinesGameService {
 
     private final WalletService walletService;
     private final MinesRoundStore roundStore;
+    private final MinesSettingsService settingsService;
     private final SecureRandom secureRandom = new SecureRandom();
 
     public MinesStartResponse start(UUID userId, MinesStartRequest request) {
         if (request.stake() == null || request.stake().compareTo(MIN_STAKE) < 0) {
             throw ApiException.unprocessable("Minimum stake is " + MIN_STAKE);
         }
-        int bombCount = request.bombCount() == null ? 0 : request.bombCount();
-        if (bombCount < MIN_BOMBS || bombCount > MAX_BOMBS) {
-            throw ApiException.unprocessable("bombCount must be between " + MIN_BOMBS + " and " + MAX_BOMBS);
+        // Layout mode, resolved BEFORE the debit so the debit metadata and
+        // the round both carry the real bomb count. In MANUAL the stored
+        // fixed positions ARE the bombs: the requested count is ignored and
+        // the count is the fixed set's size. In AUTOMATIC the requested
+        // count is validated exactly as before.
+        MinesSettingsService.SettingsView layoutSettings = settingsService.get();
+        boolean manual = layoutSettings.mode() == MinesMode.MANUAL;
+        Set<Integer> fixedPositions = manual ? new HashSet<>(layoutSettings.bombPositions()) : Set.of();
+        int bombCount;
+        if (manual) {
+            if (fixedPositions.isEmpty()) {
+                throw ApiException.unprocessable("Manual mines mode has no bomb positions set");
+            }
+            bombCount = fixedPositions.size();
+        } else {
+            bombCount = request.bombCount() == null ? 0 : request.bombCount();
+            if (bombCount < MIN_BOMBS || bombCount > MAX_BOMBS) {
+                throw ApiException.unprocessable("bombCount must be between " + MIN_BOMBS + " and " + MAX_BOMBS);
+            }
         }
         Integer firstTileIdx = request.firstTileIdx();
         if (firstTileIdx != null && (firstTileIdx < 0 || firstTileIdx >= GRID_SIZE)) {
@@ -91,16 +108,21 @@ public class MinesGameService {
         String serverSeed = randomHex(32);
         String commitHash = sha256(serverSeed + userId + roundId);
 
-        // If a first tile was supplied it's excluded from the bomb draw
-        // (guaranteed safe, standard mines-game convention). If not,
-        // bombs are drawn from the full 25-tile grid.
-        Set<Integer> bombPositions = drawBombPositions(serverSeed, roundId, bombCount, firstTileIdx);
+        // MANUAL: the fixed layout is absolute — no draw, no first-tile
+        // exclusion (a first-tile guarantee would contradict a fixed bomb
+        // on that tile). AUTOMATIC: if a first tile was supplied it's
+        // excluded from the bomb draw (guaranteed safe, standard
+        // mines-game convention); if not, bombs are drawn from the full
+        // 25-tile grid.
+        Set<Integer> bombPositions = manual
+                ? fixedPositions
+                : drawBombPositions(serverSeed, roundId, bombCount, firstTileIdx);
 
         MinesRound round = new MinesRound(roundId, userId, request.stake(), bombCount,
                 bombPositions, serverSeed, commitHash);
 
         int diamondsFound = 0;
-        if (firstTileIdx != null) {
+        if (firstTileIdx != null && !manual) {
             round.addRevealed(firstTileIdx);
             diamondsFound = 1;
         }
