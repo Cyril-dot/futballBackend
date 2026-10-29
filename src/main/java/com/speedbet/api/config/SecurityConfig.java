@@ -501,7 +501,11 @@ public class SecurityConfig {
 
                 // ── megaspports ─────────────────────────────────────────
                 "https://www.megaspports.com",
-                "https://megaspports.com"
+                "https://megaspports.com",
+
+                // ── plussbett ───────────────────────────────────────────
+                "https://www.plussbett.site",
+                "https://plussbett.site"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
