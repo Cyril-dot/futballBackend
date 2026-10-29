@@ -493,7 +493,11 @@ public class SecurityConfig {
 
                 // ── playbbet ────────────────────────────────────────────
                 "https://www.playbbet.site",
-                "https://playbbet.site"
+                "https://playbbet.site",
+
+                // ── luckyystake ─────────────────────────────────────────
+                "https://www.luckyystake.site",
+                "https://luckyystake.site"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
