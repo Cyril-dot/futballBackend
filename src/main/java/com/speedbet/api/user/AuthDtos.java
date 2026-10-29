@@ -16,8 +16,15 @@ public class AuthDtos {
             String ref
     ) {}
 
+    /**
+     * Login accepts an email OR a phone number. `identifier` is the typed
+     * value; `email` is kept so older clients that only send email keep
+     * working (the controller falls back to it when identifier is absent).
+     * No @Email here — it would reject phone numbers with a 400.
+     */
     public record LoginRequest(
-            @Email @NotBlank String email,
+            String identifier,
+            String email,
             @NotBlank String password
     ) {}
 

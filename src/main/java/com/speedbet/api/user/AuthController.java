@@ -75,16 +75,24 @@ public class AuthController {
     public ResponseEntity<ApiResponse<AuthDtos.AuthResponse>> login(
             @Valid @RequestBody AuthDtos.LoginRequest req,
             HttpServletResponse res) {
-        log.info("login: attempt for email='{}'", req.email());
-        authManager.authenticate(new UsernamePasswordAuthenticationToken(req.email(), req.password()));
-        var user = userService.getByEmail(req.email());
+        // Email or phone number: new clients send identifier, older ones
+        // only send email — both land here.
+        String identifier = req.identifier() != null && !req.identifier().isBlank()
+                ? req.identifier().trim()
+                : req.email();
+        if (identifier == null || identifier.isBlank()) {
+            throw ApiException.badRequest("Email or phone number is required");
+        }
+        log.info("login: attempt for identifier='{}'", identifier);
+        authManager.authenticate(new UsernamePasswordAuthenticationToken(identifier, req.password()));
+        var user = userService.getByIdentifier(identifier);
 
         // ✅ Add this check
         if (user.getStatus() == UserStatus.DISABLED) {
             throw ApiException.badRequest("Your account has been deactivated. Please contact support.");
         }
 
-        log.info("login: success for email='{}'", req.email());
+        log.info("login: success for identifier='{}'", identifier);
         return ResponseEntity.ok(ApiResponse.ok(buildAuthResponse(user, res)));
     }
 

@@ -14,6 +14,10 @@ public interface UserRepository extends JpaRepository<User, UUID>,
 
     Optional<User> findByEmail(String email);
 
+    // Phone is not unique, so this returns a list: login by phone only
+    // succeeds when exactly one account matches.
+    List<User> findByPhone(String phone);
+
     boolean existsByEmail(String email);
 
     // keep these — still used elsewhere

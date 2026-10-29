@@ -17,7 +17,12 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 @Service
@@ -48,10 +53,69 @@ public class UserService implements UserDetailsService {
     // ─── Auth ─────────────────────────────────────────────────────────────────
 
     @Override
-    public UserDetails loadUserByUsername(String email) throws UsernameNotFoundException {
-        log.debug("loadUserByUsername: looking up '{}'", email);
-        return userRepo.findByEmail(email)
-                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + email));
+    public UserDetails loadUserByUsername(String identifier) throws UsernameNotFoundException {
+        log.debug("loadUserByUsername: looking up '{}'", identifier);
+        return findByIdentifier(identifier)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found: " + identifier));
+    }
+
+    /**
+     * Login-time user resolution: an identifier containing "@" is an email
+     * (lowercased, matching how registration stores it); anything else is a
+     * phone number, matched against the stored phone in every form it could
+     * have been saved in. Phone is NOT unique, so a phone shared by several
+     * accounts resolves to nobody — those users sign in by email instead.
+     * Used by AuthController.login after authentication succeeds, and by
+     * loadUserByUsername during authentication itself, so both halves of
+     * login agree on who the identifier means.
+     */
+    public User getByIdentifier(String identifier) {
+        return findByIdentifier(identifier)
+                .orElseThrow(() -> ApiException.notFound("User not found"));
+    }
+
+    private Optional<User> findByIdentifier(String identifier) {
+        if (identifier == null || identifier.isBlank()) return Optional.empty();
+        String id = identifier.trim();
+        if (id.contains("@")) {
+            return userRepo.findByEmail(id.toLowerCase());
+        }
+        Set<UUID> seen = new LinkedHashSet<>();
+        User match = null;
+        for (String candidate : phoneCandidates(id)) {
+            for (User u : userRepo.findByPhone(candidate)) {
+                if (seen.add(u.getId())) {
+                    if (match != null) return Optional.empty(); // shared phone: ambiguous
+                    match = u;
+                }
+            }
+        }
+        return Optional.ofNullable(match);
+    }
+
+    /**
+     * Every stored form a phone number could be in. Registration stores the
+     * phone exactly as typed, so a login attempt must try the typed form,
+     * the separator-stripped form, and — for Ghana numbers, the only market
+     * with a known country code here — the local (0…) and international
+     * (+233…/233…) forms. Other countries match on their typed form.
+     */
+    static List<String> phoneCandidates(String raw) {
+        String cleaned = raw.trim().replaceAll("[\\s\\-()]", "");
+        List<String> out = new ArrayList<>();
+        out.add(cleaned);
+        String digits = cleaned.startsWith("+") ? cleaned.substring(1) : cleaned;
+        if (!digits.equals(cleaned)) out.add(digits);
+        if (cleaned.startsWith("+233") && cleaned.length() == 13) {
+            out.add("0" + cleaned.substring(4));
+        } else if (cleaned.startsWith("233") && cleaned.length() == 12) {
+            out.add("0" + cleaned.substring(3));
+        } else if (cleaned.startsWith("0") && cleaned.length() == 10) {
+            String rest = cleaned.substring(1);
+            out.add("+233" + rest);
+            out.add("233" + rest);
+        }
+        return out.stream().distinct().toList();
     }
 
     // ─── Registration ─────────────────────────────────────────────────────────
