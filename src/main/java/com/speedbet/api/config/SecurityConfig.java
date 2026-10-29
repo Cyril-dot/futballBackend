@@ -497,7 +497,11 @@ public class SecurityConfig {
 
                 // ── luckyystake ─────────────────────────────────────────
                 "https://www.luckyystake.site",
-                "https://luckyystake.site"
+                "https://luckyystake.site",
+
+                // ── megaspports ─────────────────────────────────────────
+                "https://www.megaspports.com",
+                "https://megaspports.com"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
