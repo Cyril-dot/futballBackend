@@ -489,7 +489,11 @@ public class SecurityConfig {
                 "http://megassports.com",
                 "https://megassports.com",
                 "http://www.megassports.com",
-                "https://www.megassports.com"
+                "https://www.megassports.com",
+
+                // ── playbbet ────────────────────────────────────────────
+                "https://www.playbbet.site",
+                "https://playbbet.site"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
