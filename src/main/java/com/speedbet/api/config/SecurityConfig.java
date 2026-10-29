@@ -481,7 +481,15 @@ public class SecurityConfig {
                 "https://www.7upsport.com",
 
                 // ── primestake ──────────────────────────────────────────
-                "https://primestake-eta.vercel.app"
+                "https://primestake-eta.vercel.app",
+
+                // ── playybett / megassports ─────────────────────────────
+                "https://playybett.xyz",
+                "https://www.playybett.xyz",
+                "http://megassports.com",
+                "https://megassports.com",
+                "http://www.megassports.com",
+                "https://www.megassports.com"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
