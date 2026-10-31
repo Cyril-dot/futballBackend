@@ -293,6 +293,157 @@ public class AkwaPayController {
         return ResponseEntity.ok(ApiResponse.ok(response));
     }
 
+    // ─── Deposit Verify (verify-first) ────────────────────────────────────────
+
+    /**
+     * Verify-first step for MoMo deposits (ShinobiPay POST /v1/verify-number,
+     * owner order 2026-10-31). The frontend calls this BEFORE initDeposit:
+     * the customer sees the account holder's name and the exact total and
+     * confirms, and only then does the frontend call init (which sends the
+     * prompt). This endpoint NEVER sends a prompt itself and creates no
+     * intent. The ShinobiPay secret key stays server-side — the frontend
+     * never calls the ShinobiPay API directly.
+     *
+     * Response is always HTTP 200 with a normalized envelope so every
+     * frontend branches the same way (no HTTP-error branching):
+     *   verified=true  → account_name, can_prompt=true, amount block —
+     *                    show "You're paying {total_display} to
+     *                    {account_name}. Confirm?" and call init on confirm.
+     *   verified=false, reason=no_account → do NOT init; the number holds
+     *                    no MoMo account on that network — tell the
+     *                    customer to check their number.
+     *   verified=false, reason=unavailable → the check itself could not
+     *                    run (ShinobiPay 502 / unreachable / malformed);
+     *                    do NOT prompt blind — tell the customer to wait
+     *                    and retry later.
+     *   verified=false, reason=not_configured → this deployment has no
+     *                    ShinobiPay secret configured; do NOT init.
+     *   verified=false, reason=error → any other upstream failure.
+     * Bad input (missing/invalid amount or phone, unresolvable network,
+     * below-minimum amount) → 400, same rules as initDeposit.
+     * No automatic retry: each verification is a provider call against
+     * the same daily quota, so the customer retries, not the code.
+     */
+    @SuppressWarnings("unchecked")
+    @PostMapping("/api/wallet/deposit/akwapay/verify")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> verifyDeposit(
+            @AuthenticationPrincipal User user,
+            @RequestBody Map<String, Object> req) {
+
+        Object rawAmount = req.get("amount");
+        if (rawAmount == null || rawAmount.toString().isBlank())
+            throw ApiException.badRequest("Enter an amount to verify.");
+        final BigDecimal amount;
+        try {
+            amount = new BigDecimal(rawAmount.toString());
+        } catch (NumberFormatException e) {
+            throw ApiException.badRequest("Enter a valid amount to verify.");
+        }
+        if (amount.compareTo(minDeposit) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+
+        var phone = req.get("phone") == null ? null : req.get("phone").toString();
+        if (phone == null || phone.isBlank())
+            throw ApiException.badRequest("Enter the mobile money number to verify.");
+
+        var requestedNet = req.get("network") == null ? null : req.get("network").toString();
+        var network = resolveNetwork(requestedNet, phone);
+
+        var amountPesewas = amount
+                .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
+                .intValue();
+
+        if (secretKey == null || secretKey.isBlank() || baseUrl == null || baseUrl.isBlank()) {
+            log.warn("verifyDeposit: ShinobiPay secret/base-url not configured for userId='{}'", user.getId());
+            return ResponseEntity.ok(ApiResponse.ok(notVerified(phone, network,
+                    "not_configured", "Number verification is not available on this site right now.")));
+        }
+
+        var body = new HashMap<String, Object>();
+        body.put("phone", phone);
+        body.put("network", network.toUpperCase());
+        body.put("amount_minor", amountPesewas);
+
+        Map.Entry<Integer, Map<String, Object>> exchange;
+        try {
+            exchange = webClientBuilder.build()
+                    .post().uri(baseUrl + "/verify-number")
+                    .header("Authorization", "Bearer " + secretKey)
+                    .header("Content-Type", "application/json")
+                    .bodyValue(body)
+                    .exchangeToMono(resp -> resp.bodyToMono(Map.class)
+                            .defaultIfEmpty(new HashMap<String, Object>())
+                            .map(parsed -> Map.entry(resp.statusCode().value(), (Map<String, Object>) parsed)))
+                    .timeout(akwapayTimeout)
+                    .block();
+        } catch (Exception ex) {
+            log.warn("verifyDeposit: ShinobiPay verify unreachable for userId='{}' network='{}': {}",
+                    user.getId(), network, ex.getMessage());
+            return ResponseEntity.ok(ApiResponse.ok(notVerified(phone, network,
+                    "unavailable", "The check could not run — wait a few minutes and try again. No prompt has been sent.")));
+        }
+
+        if (exchange == null) {
+            return ResponseEntity.ok(ApiResponse.ok(notVerified(phone, network,
+                    "unavailable", "The check could not run — wait a few minutes and try again. No prompt has been sent.")));
+        }
+
+        int status = exchange.getKey();
+        Map<String, Object> up = exchange.getValue();
+
+        if (status == 502) {
+            log.warn("verifyDeposit: ShinobiPay verify 502 for userId='{}' network='{}'", user.getId(), network);
+            return ResponseEntity.ok(ApiResponse.ok(notVerified(phone, network,
+                    "unavailable", "The check could not run — wait a few minutes and try again. No prompt has been sent.")));
+        }
+
+        if (status < 200 || status >= 300) {
+            log.warn("verifyDeposit: ShinobiPay verify status={} for userId='{}' network='{}'", status, user.getId(), network);
+            return ResponseEntity.ok(ApiResponse.ok(notVerified(phone, network,
+                    "error", "Number verification is not available right now. Please try again shortly.")));
+        }
+
+        Object verifiedFlag = up.get("verified");
+        if (Boolean.TRUE.equals(verifiedFlag)) {
+            var out = new HashMap<String, Object>();
+            out.put("verified", true);
+            out.put("account_name", up.get("account_name"));
+            out.put("can_prompt", true);
+            out.put("phone", up.get("phone") != null ? up.get("phone") : phone);
+            out.put("network", up.get("network") != null ? up.get("network") : network);
+            out.put("amount", up.get("amount") instanceof Map<?, ?> ? up.get("amount") : null);
+            out.put("reason", "ok");
+            out.put("message", null);
+            log.info("verifyDeposit: verified userId='{}' network='{}' account='{}'",
+                    user.getId(), network, up.get("account_name"));
+            return ResponseEntity.ok(ApiResponse.ok(out));
+        }
+
+        if (Boolean.FALSE.equals(verifiedFlag)) {
+            log.info("verifyDeposit: no_account userId='{}' network='{}'", user.getId(), network);
+            return ResponseEntity.ok(ApiResponse.ok(notVerified(phone, network,
+                    "no_account", "This number has no MoMo account on " + network + ". Check the number and try again.")));
+        }
+
+        log.warn("verifyDeposit: malformed ShinobiPay verify body for userId='{}' network='{}'", user.getId(), network);
+        return ResponseEntity.ok(ApiResponse.ok(notVerified(phone, network,
+                "unavailable", "The check could not run — wait a few minutes and try again. No prompt has been sent.")));
+    }
+
+    private Map<String, Object> notVerified(String phone, String network,
+                                             String reason, String message) {
+        var out = new HashMap<String, Object>();
+        out.put("verified", false);
+        out.put("account_name", null);
+        out.put("can_prompt", false);
+        out.put("phone", phone);
+        out.put("network", network);
+        out.put("amount", null);
+        out.put("reason", reason);
+        out.put("message", message);
+        return out;
+    }
+
     // ─── Admin Upgrade Init ───────────────────────────────────────────────────
 
     @PostMapping("/api/user/upgrade-to-admin/akwapay/init")
