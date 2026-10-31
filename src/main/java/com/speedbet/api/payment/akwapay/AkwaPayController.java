@@ -70,11 +70,14 @@ import java.util.UUID;
  *      collections are push prompts, there is no OTP step. The endpoint is
  *      kept for gateways that still use one.
  *
- *   4. CUSTOMER SURCHARGE. ShinobiPay adds 5% (below GHS 200) or 4.5%
- *      (GHS 200+) ON TOP of the amount at the prompt — the customer pays
- *      amount + surcharge; the intent amount, the webhook amount and what
- *      we credit are always the original deposit amount, never the
- *      surcharged figure.
+ *   4. CUSTOMER SURCHARGE. ShinobiPay adds 2.5% ON TOP of the amount
+ *      at the prompt — the customer pays amount + surcharge, and the
+ *      webhook's data.amount is that grossed figure. What we credit
+ *      is ALWAYS the original deposit amount recorded in the pending
+ *      intent at creation, never the grossed webhook figure (bug
+ *      fixed 2026-10-31: the webhook handler used to credit
+ *      data.amount directly, so a GHS 150 deposit credited GHS
+ *      153.75 to the player).
  *
  *   5. CREDENTIALS LIVE AND DIE WITH THE SHINOBIPAY MERCHANT. The API key
  *      (AKWAPAY_SECRET_KEY) and webhook secret (AKWAPAY_WEBHOOK_SECRET)
@@ -650,8 +653,27 @@ public class AkwaPayController {
             }
 
             var amountPesewas = Long.parseLong(data.get("amount").toString());
-            var amount        = BigDecimal.valueOf(amountPesewas)
+            var webhookAmount = BigDecimal.valueOf(amountPesewas)
                     .divide(BigDecimal.valueOf(100), MathContext.DECIMAL64);
+
+            // Credit the amount the customer agreed to, NOT the
+            // grossed prompt total. ShinobiPay's webhook amount is
+            // requested + 2.5% (a GHS 150 deposit arrives as 153.75),
+            // and crediting it directly over-credits the player by
+            // the fee on every deposit. The pending intent recorded
+            // the original amount at creation — that is the credit
+            // amount, exactly as its own javadoc promises. If the
+            // pending row is gone (e.g. a redelivery after an
+            // earlier settle, which WalletService dedupes by
+            // reference anyway), fall back to the webhook amount
+            // rather than failing a real payment.
+            var amount = pendingIntents.findById(reference)
+                    .map(AkwaPayPendingIntent::getAmountGhs)
+                    .orElse(webhookAmount);
+            if (amount.compareTo(webhookAmount) != 0) {
+                log.info("AkwaPay webhook: crediting original GHS {} for ref='{}' (webhook grossed figure was GHS {})",
+                        amount, reference, webhookAmount);
+            }
 
             var parsed = parseReference(reference);
             if (parsed == null) {
