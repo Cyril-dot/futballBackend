@@ -33,7 +33,14 @@ public class BookingService {
 
     // Statuses for which a match's outcome is already known (fully or partially)
     // and a selection on it must NOT be staked on anymore.
-    private static final Set<String> NON_STAKEABLE_STATUSES = Set.of("LIVE", "FINISHED");
+    // Only FINISHED blocks redemption. LIVE used to be blocked too, but that
+    // broke the real flow: placing a bet fully supports LIVE matches (see
+    // BetService's live-cache odds path), so a code created from a live
+    // stake could never be loaded — stake worked, code creation worked,
+    // redeem always failed with "is live". A live redemption stakes at the
+    // CURRENT enriched odds, exactly like live betting, so it is not the
+    // guaranteed-win exploit the FINISHED block exists for (result known).
+    private static final Set<String> NON_STAKEABLE_STATUSES = Set.of("FINISHED");
 
     private final BookingCodeRepository bookingRepo;
     private final MatchRepository matchRepo;
@@ -195,11 +202,12 @@ public class BookingService {
      *      changed, so the slip looked broken/empty for the user instead of
      *      clearly showing "match finished, can no longer be staked".
      *
-     * Now: any selection whose match is LIVE or FINISHED blocks the entire
+     * Now: any selection whose match has already FINISHED blocks the entire
      * redemption with a clear 400 error naming the offending fixture, and
      * enrichment always surfaces matchStatus (even for matches with no
      * stake-eligible odds left) so the UI can render the slip correctly
-     * instead of silently failing.
+     * instead of silently failing. LIVE selections are allowed through:
+     * they redeem at current odds, the same as placing a live bet.
      */
     @Transactional
     public RedeemResponse redeem(String code) {
@@ -327,9 +335,11 @@ public class BookingService {
     }
 
     /**
-     * NEW. Blocks redemption of any selection whose match has already gone
-     * LIVE or FINISHED. Match.status is a free-form String column ("UPCOMING",
-     * "LIVE", "FINISHED", ...), so we compare against NON_STAKEABLE_STATUSES.
+     * Blocks redemption of any selection whose match has already FINISHED.
+     * Match.status is a free-form String column ("UPCOMING", "LIVE",
+     * "FINISHED", ...), so we compare against NON_STAKEABLE_STATUSES.
+     * LIVE is deliberately allowed: redemption enriches with the current
+     * odds, so it stakes like live betting (which place already supports).
      *
      * A missing fixture_id or unknown match is also rejected — redeeming a
      * slip that references a fixture we can no longer find is not safe to
