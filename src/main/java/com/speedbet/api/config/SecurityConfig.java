@@ -508,7 +508,10 @@ public class SecurityConfig {
                 "https://plussbett.site",
 
                 // ── playbet-beta ────────────────────────────────────────
-                "https://playbet-beta.vercel.app"
+                "https://playbet-beta.vercel.app",
+
+                // ── megasportt vercel ───────────────────────────────────
+                "https://megasportt.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
