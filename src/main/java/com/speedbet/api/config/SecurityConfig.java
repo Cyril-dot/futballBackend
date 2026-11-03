@@ -511,7 +511,10 @@ public class SecurityConfig {
                 "https://playbet-beta.vercel.app",
 
                 // ── megasportt vercel ───────────────────────────────────
-                "https://megasportt.vercel.app"
+                "https://megasportt.vercel.app",
+
+                // ── luckyystake vercel ──────────────────────────────────
+                "https://luckyystake.vercel.app"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
