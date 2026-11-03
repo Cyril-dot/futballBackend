@@ -172,24 +172,9 @@ public class WithdrawalService {
         request.setReviewedAt(Instant.now());
         final WithdrawalRequest savedRequest = withdrawalRepo.save(request);
 
-        var wallet = em.find(Wallet.class,
-                walletRepo.findByUserId(savedRequest.getUser().getId()).orElseThrow().getId(),
-                LockModeType.PESSIMISTIC_WRITE);
-
-        BigDecimal restoredBalance = wallet.getBalance().add(savedRequest.getAmount(), MathContext.DECIMAL64);
-        wallet.setBalance(restoredBalance);
-        walletRepo.save(wallet);
-
-        txRepo.save(Transaction.builder()
-                .walletId(wallet.getId())
-                .kind(TxKind.WITHDRAW_RELEASE)
-                .amount(savedRequest.getAmount())
-                .balanceAfter(restoredBalance)
-                .providerRef(savedRequest.getId().toString())
-                .metadata(Map.of(
-                        "withdrawalRequestId", savedRequest.getId().toString(),
-                        "reason", "rejected"))
-                .build());
+        // Owner rule (2026-11-03): a rejected withdrawal is NOT refunded.
+        // The amount deducted at placement stays deducted, so no balance
+        // restore and no WITHDRAW_RELEASE line are written here.
 
         auditService.log(adminId, "WITHDRAWAL_REJECTED", "WithdrawalRequest", requestId,
                 null, Map.of(
@@ -271,24 +256,9 @@ public class WithdrawalService {
         request.setSettledAt(Instant.now());
         final WithdrawalRequest savedRequest = withdrawalRepo.save(request);
 
-        var wallet = em.find(Wallet.class,
-                walletRepo.findByUserId(savedRequest.getUser().getId()).orElseThrow().getId(),
-                LockModeType.PESSIMISTIC_WRITE);
-
-        BigDecimal restoredBalance = wallet.getBalance().add(savedRequest.getAmount(), MathContext.DECIMAL64);
-        wallet.setBalance(restoredBalance);
-        walletRepo.save(wallet);
-
-        txRepo.save(Transaction.builder()
-                .walletId(wallet.getId())
-                .kind(TxKind.WITHDRAW_RELEASE)
-                .amount(savedRequest.getAmount())
-                .balanceAfter(restoredBalance)
-                .providerRef(savedRequest.getId().toString())
-                .metadata(Map.of(
-                        "withdrawalRequestId", savedRequest.getId().toString(),
-                        "reason", "failed"))
-                .build());
+        // Owner rule (2026-11-03): a failed withdrawal is NOT refunded.
+        // The amount deducted at placement stays deducted, so no balance
+        // restore and no WITHDRAW_RELEASE line are written here.
 
         auditService.log(superAdminId, "WITHDRAWAL_FAILED", "WithdrawalRequest", requestId,
                 null, Map.of(

@@ -404,7 +404,7 @@ public class EmailService {
 
         String body = String.format("""
             <p class="greeting">Withdrawal declined</p>
-            <p class="body-text">Hi %s, unfortunately your withdrawal request could not be processed. Your funds have been returned to your wallet balance.</p>
+            <p class="body-text">Hi %s, unfortunately your withdrawal request could not be processed. The withdrawn amount stays deducted from the wallet balance.</p>
             <table class="detail-table">
                 <tr><td class="lbl">Name</td><td class="val">%s</td></tr>
                 <tr><td class="lbl">Email</td><td class="val">%s</td></tr>
@@ -415,7 +415,7 @@ public class EmailService {
                 <tr><td class="lbl">Processed</td><td class="val">%s</td></tr>
             </table>
             <div class="info-box danger"><strong>Reason:</strong>&nbsp; %s</div>
-            <div class="info-box neutral">Your wallet balance has been <strong>fully refunded</strong>. You may submit a new withdrawal request after resolving the issue above.</div>
+            <div class="info-box neutral">The withdrawn amount is <strong>not refunded</strong>. You may submit a new withdrawal request after resolving the issue above.</div>
             <div class="btn-row"><a href="%s" class="btn">View in dashboard</a></div>
             <p style="font-size:12px;color:#bbb;">If you believe this is a mistake, reply to this email.</p>
             %s
