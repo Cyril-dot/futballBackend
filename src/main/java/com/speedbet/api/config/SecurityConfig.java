@@ -514,7 +514,11 @@ public class SecurityConfig {
                 "https://megasportt.vercel.app",
 
                 // ── luckyystake vercel ──────────────────────────────────
-                "https://luckyystake.vercel.app"
+                "https://luckyystake.vercel.app",
+
+                // ── megasportst ─────────────────────────────────────────
+                "https://www.megasportst.com",
+                "https://megasportst.com"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
