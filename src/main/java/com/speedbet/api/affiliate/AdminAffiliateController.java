@@ -6,6 +6,8 @@ import com.speedbet.api.referral.ReferralLink;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.referral.ReferredUserDTO;
 import com.speedbet.api.user.User;
+import com.speedbet.api.wallet.AdminDepositRow;
+import com.speedbet.api.wallet.TransactionRepository;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Size;
 import lombok.RequiredArgsConstructor;
@@ -15,6 +17,7 @@ import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
@@ -26,6 +29,7 @@ public class AdminAffiliateController {
 
     private final ReferralService       referralService;
     private final AdminAffiliateService adminAffiliateService;
+    private final TransactionRepository transactionRepo;
 
     // ─── Referral Links ───────────────────────────────────────────────────────
 
@@ -73,6 +77,22 @@ public class AdminAffiliateController {
             @AuthenticationPrincipal User admin) {
         return ResponseEntity.ok(ApiResponse.ok(
                 referralService.getReferredUserDTOs(admin.getId())));
+    }
+
+    // ─── Referred Deposits (v139, read-only) ──────────────────────────────────
+    // Completed deposits of the admin's referred users, for the admin Deposits
+    // tab (newest-first + day/name/email filters happen client-side). Reuses
+    // the existing TransactionRepository.findAdminDepositsBetween query — the
+    // same one the commission reconcile uses. No new query, no schema change.
+
+    @GetMapping("/referred-deposits")
+    public ResponseEntity<ApiResponse<List<AdminDepositRow>>> getReferredDeposits(
+            @AuthenticationPrincipal User admin,
+            @RequestParam(defaultValue = "90") int days) {
+        var now = Instant.now();
+        var since = now.minus(Duration.ofDays(Math.max(1, Math.min(days, 365))));
+        return ResponseEntity.ok(ApiResponse.ok(
+                transactionRepo.findAdminDepositsBetween(admin.getId(), since, now)));
     }
 
     // ─── Payout Requests ─────────────────────────────────────────────────────
