@@ -3,6 +3,7 @@ package com.speedbet.api.casinoGames;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
+import com.speedbet.api.superadmin.PlatformSettingsService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -39,7 +40,6 @@ import java.util.concurrent.ThreadLocalRandom;
 public class FootballGameService {
 
     private static final int MATCH_DURATION_SECONDS = 30;
-    private static final BigDecimal MIN_STAKE = BigDecimal.ONE;
     // Grace period before an unsettled round is force-settled by the
     // server itself. Generous relative to MATCH_DURATION_SECONDS (30s)
     // since the outcome is already frozen at play() time either way —
@@ -48,6 +48,7 @@ public class FootballGameService {
 
     private final WalletService walletService;
     private final RoundStore roundStore;
+    private final PlatformSettingsService platformSettings;
 
     public OddsQuote previewOdds() {
         Odds odds = Odds.generate();
@@ -66,8 +67,9 @@ public class FootballGameService {
     }
 
     public PlayResponse play(UUID userId, PlayRequest request) {
-        if (request.stake().compareTo(MIN_STAKE) < 0) {
-            throw ApiException.unprocessable("Minimum stake is " + MIN_STAKE);
+        var minStake = platformSettings.current().getMinStakeGhs();
+        if (request.stake().compareTo(minStake) < 0) {
+            throw ApiException.unprocessable("Minimum stake is " + minStake);
         }
 
         Team home;

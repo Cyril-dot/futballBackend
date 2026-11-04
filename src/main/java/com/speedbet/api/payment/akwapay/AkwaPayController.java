@@ -2,6 +2,7 @@ package com.speedbet.api.payment.akwapay;
 
 import com.speedbet.api.chat.AdminUpgradeChatService;
 import com.speedbet.api.common.ApiException;
+import com.speedbet.api.superadmin.PlatformSettingsService;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.user.User;
@@ -188,12 +189,15 @@ public class AkwaPayController {
     private final AkwaPayPendingIntentRepository pendingIntents;
     private final WebClient.Builder              webClientBuilder;
     private final ObjectMapper                   objectMapper;
+    private final PlatformSettingsService platformSettings;
 
     @Value("${app.akwapay.secret-key}")              private String     secretKey;
     @Value("${app.akwapay.webhook-secret}")          private String     webhookSecret;
     @Value("${app.akwapay.base-url}")                private String     baseUrl;
-    @Value("${app.platform.min-deposit-amount:300}") private BigDecimal minDeposit;
     @Value("${app.platform.frontend-url}")           private String     frontendUrl;
+
+    /** Min deposit from the super-admin platform amounts (env default lives in the settings service). */
+    private BigDecimal minDeposit() { return platformSettings.current().getMinDepositGhs(); }
 
     // ─── Deposit Init ─────────────────────────────────────────────────────────
 
@@ -203,8 +207,8 @@ public class AkwaPayController {
             @RequestBody Map<String, Object> req) {
 
         var amount = new BigDecimal(req.get("amount").toString());
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        if (amount.compareTo(minDeposit()) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit());
 
         var amountPesewas = amount
                 .multiply(BigDecimal.valueOf(100), MathContext.DECIMAL64)
@@ -256,8 +260,8 @@ public class AkwaPayController {
             @RequestBody Map<String, Object> req) {
 
         var amount = new BigDecimal(req.get("amount").toString());
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        if (amount.compareTo(minDeposit()) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit());
 
         var phone = req.get("phone") == null ? null : req.get("phone").toString();
         if (phone == null || phone.isBlank())
@@ -342,8 +346,8 @@ public class AkwaPayController {
         } catch (NumberFormatException e) {
             throw ApiException.badRequest("Enter a valid amount to verify.");
         }
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        if (amount.compareTo(minDeposit()) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit());
 
         var phone = req.get("phone") == null ? null : req.get("phone").toString();
         if (phone == null || phone.isBlank())

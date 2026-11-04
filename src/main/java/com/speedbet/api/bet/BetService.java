@@ -8,6 +8,7 @@ import com.speedbet.api.odds.OddsRepository;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
+import com.speedbet.api.superadmin.PlatformSettingsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
@@ -32,8 +33,8 @@ public class BetService {
     private static final BigDecimal ODDS_DRIFT_TOLERANCE = new BigDecimal("0.02");
     private static final int        MAX_SELECTIONS        = 20;
     /** Maximum winning limit (payout cap) per bet, per currency. */
-    private static final BigDecimal MAX_WIN_GHS = new BigDecimal("1200000");
-    private static final BigDecimal MAX_WIN_NGN = new BigDecimal("120000000");
+    // Max win used to live here as constants (GH₵1.2M / ₦120M); now the
+    // super-admin platform amounts own them, with the same values as defaults.
 
     private final BetRepository   betRepo;
     private final OddsRepository  oddsRepo;
@@ -41,6 +42,7 @@ public class BetService {
     private final MatchService    matchService;
     private final WalletService   walletService;
     private final UserRepository  userRepo;
+    private final PlatformSettingsService platformSettings;
 
     public record PlaceRequest(
             UUID userId, BigDecimal stake, String currency,
@@ -75,8 +77,9 @@ public class BetService {
             throw ApiException.badRequest("Max " + MAX_SELECTIONS + " selections per bet");
         if (req.stake() == null)
             throw ApiException.badRequest("Stake is required");
-        if (req.stake().compareTo(BigDecimal.ONE) < 0)
-            throw ApiException.badRequest("Minimum stake is GHS 1.00");
+        var minStake = platformSettings.current().getMinStakeGhs();
+        if (req.stake().compareTo(minStake) < 0)
+            throw ApiException.badRequest("Minimum stake is GHS " + minStake);
 
         // Resolve currency server-side from user's country — never trust the client value
         String currency = userRepo.findById(req.userId())
@@ -140,8 +143,8 @@ public class BetService {
                 .map(BetSelection::getOddsLocked)
                 .reduce(BigDecimal.ONE, (a, b) -> a.multiply(b, MathContext.DECIMAL64));
         var potentialReturn = req.stake().multiply(totalOdds, MathContext.DECIMAL64);
-        // Maximum winning limit — cap the payout per bet (GH₵1.2M / ₦120M).
-        var maxWin = "NGN".equals(currency) ? MAX_WIN_NGN : MAX_WIN_GHS;
+        // Maximum winning limit — cap the payout per bet (super-admin settable).
+        var maxWin = "NGN".equals(currency) ? platformSettings.current().getMaxWinNgn() : platformSettings.current().getMaxWinGhs();
         if (potentialReturn.compareTo(maxWin) > 0) {
             log.info("placeBet — potentialReturn={} exceeds max win {} — capping", potentialReturn, maxWin);
             potentialReturn = maxWin;

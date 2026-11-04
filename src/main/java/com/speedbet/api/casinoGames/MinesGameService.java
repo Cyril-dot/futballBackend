@@ -3,6 +3,7 @@ package com.speedbet.api.casinoGames;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
+import com.speedbet.api.superadmin.PlatformSettingsService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -50,7 +51,6 @@ public class MinesGameService {
     public static final int GRID_SIZE = 25;
     public static final int MIN_BOMBS = 1;
     public static final int MAX_BOMBS = 24;
-    private static final BigDecimal MIN_STAKE = BigDecimal.ONE;
     private static final BigDecimal RTP = new BigDecimal("0.97");
     // Generous relative to a typical round — this only exists to catch
     // rounds nobody ever calls reveal()/cashout() for again.
@@ -59,11 +59,13 @@ public class MinesGameService {
     private final WalletService walletService;
     private final MinesRoundStore roundStore;
     private final MinesSettingsService settingsService;
+    private final PlatformSettingsService platformSettings;
     private final SecureRandom secureRandom = new SecureRandom();
 
     public MinesStartResponse start(UUID userId, MinesStartRequest request) {
-        if (request.stake() == null || request.stake().compareTo(MIN_STAKE) < 0) {
-            throw ApiException.unprocessable("Minimum stake is " + MIN_STAKE);
+        var minStake = platformSettings.current().getMinStakeGhs();
+        if (request.stake() == null || request.stake().compareTo(minStake) < 0) {
+            throw ApiException.unprocessable("Minimum stake is " + minStake);
         }
         // Layout mode, resolved BEFORE the debit so the debit metadata and
         // the round both carry the real bomb count. In MANUAL the stored
