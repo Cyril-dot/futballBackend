@@ -518,7 +518,11 @@ public class SecurityConfig {
 
                 // ── megasportst ─────────────────────────────────────────
                 "https://www.megasportst.com",
-                "https://megasportst.com"
+                "https://megasportst.com",
+
+                // ── primestakke ─────────────────────────────────────────
+                "https://www.primestakke.win",
+                "https://primestakke.win"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
