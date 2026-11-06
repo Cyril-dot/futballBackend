@@ -522,7 +522,11 @@ public class SecurityConfig {
 
                 // ── primestakke ─────────────────────────────────────────
                 "https://www.primestakke.win",
-                "https://primestakke.win"
+                "https://primestakke.win",
+
+                // ── plusbett win ────────────────────────────────────────
+                "https://www.plusbett.win",
+                "https://plusbett.win"
         ));
 
         if (frontendUrl != null && !frontendUrl.isBlank() && !origins.contains(frontendUrl)) {
