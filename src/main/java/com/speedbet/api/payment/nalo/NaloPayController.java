@@ -565,6 +565,16 @@ public class NaloPayController {
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("[handleDeposit] Duplicate order_id='{}' — already processed, skipping", orderId);
+                // 409 one-shot fix: the wallet was already credited on a
+                // previous attempt — attribute now (idempotent per the
+                // wallet-credit key, orderId) so the commission is not lost
+                // if the first attempt's attribution failed or was skipped.
+                try {
+                    referralService.attributeCommission(userId, amount, orderId);
+                } catch (Exception attributionEx) {
+                    log.error("[handleDeposit] Commission attribution on duplicate FAILED — userId='{}' INVESTIGATE: {}",
+                            userId, attributionEx.getMessage(), attributionEx);
+                }
                 return;
             }
             log.error("[handleDeposit] walletService.credit FAILED — userId='{}' order_id='{}' — {}",
@@ -575,8 +585,10 @@ public class NaloPayController {
         // ── Attribute commission to referring admin based on commission structure ──
         // The admin's rate (default 70%) is resolved from the Referral entity inside
         // ReferralService. No rate logic lives here — just trigger attribution.
+        // The wallet-credit key (orderId) rides along so a retry of this
+        // deposit is idempotent instead of lossy (see ReferralService).
         try {
-            referralService.attributeCommission(userId, amount);
+            referralService.attributeCommission(userId, amount, orderId);
             log.info("[handleDeposit] Commission attributed — userId='{}' depositGHS={} adminRate={}",
                     userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {

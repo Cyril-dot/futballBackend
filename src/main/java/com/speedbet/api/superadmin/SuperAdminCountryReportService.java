@@ -21,6 +21,9 @@ import java.util.*;
 @RequiredArgsConstructor
 public class SuperAdminCountryReportService {
 
+    /** NGN → GHS peg for GHS-denominated totals. 1 GHS = 135 NGN — same peg as AdminCommissionService.toGhs. */
+    private static final BigDecimal NGN_PER_GHS = BigDecimal.valueOf(135);
+
     private final SuperAdminDepositService depositService;
     private final SuperAdminCommissionService commissionService;
 
@@ -88,9 +91,18 @@ public class SuperAdminCountryReportService {
                     ? depTotal.divide(BigDecimal.valueOf(depCount), 2, RoundingMode.HALF_UP)
                     : BigDecimal.ZERO;
 
-            BigDecimal rate = depTotal.signum() > 0
+            // The commission ledger is GHS-only while the deposit total is
+            // in the bucket's own currency — a rate computed on raw NGN
+            // understates the NG effective rate ~135x. Convert the deposit
+            // total to GHS first (same 135 peg as AdminCommissionService);
+            // GH buckets are GHS already, so they are unaffected.
+            BigDecimal depTotalGhs = "NGN".equals(currency)
+                    ? depTotal.divide(NGN_PER_GHS, 2, RoundingMode.HALF_UP)
+                    : depTotal;
+
+            BigDecimal rate = depTotalGhs.signum() > 0
                     ? comTotal.multiply(BigDecimal.valueOf(100))
-                        .divide(depTotal, 2, RoundingMode.HALF_UP)
+                        .divide(depTotalGhs, 2, RoundingMode.HALF_UP)
                     : BigDecimal.ZERO;
 
             summaries.add(new SuperAdminDtos.CountrySummaryDto(

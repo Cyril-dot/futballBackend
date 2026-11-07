@@ -81,10 +81,9 @@ public class SuperAdminController {
      * Creates a new admin AND sets their commission rate in one step, at
      * creation time — calls UserService.createAdminWithCommissionRate(...),
      * a separate method from the one the existing POST /admins endpoint
-     * above calls. That endpoint (and UserService.createAdmin) are left
-     * completely untouched; admins created through it still get no referral
-     * link / commission rate until updateAdminCommissionRate (below) is
-     * called on them separately.
+     * above calls. That endpoint now also creates an auto referral link
+     * at the 70% default; use THIS endpoint whenever Super Admin wants
+     * to set a different rate at creation time.
      *
      * Required body fields: email, password, firstName, lastName, commissionRate
      *   commissionRate is sent as a plain numeric string, e.g. "60" means 60%.

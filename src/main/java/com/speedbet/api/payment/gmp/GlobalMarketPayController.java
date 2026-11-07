@@ -991,8 +991,16 @@ public class GlobalMarketPayController {
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 // Already credited on a previous pass (poller vs user verify).
-                log.warn("creditWallet: DUPLICATE ref='{}' userId='{}' already processed — skipping " +
-                        "(commission was attributed on the first pass)", idempotencyRef, userId);
+                // Attribute now (idempotent per ref) — the first pass may
+                // have credited the wallet without attributing.
+                log.warn("creditWallet: DUPLICATE ref='{}' userId='{}' already processed — attributing commission for the retry",
+                        idempotencyRef, userId);
+                try {
+                    referralService.attributeCommission(userId, amount, idempotencyRef);
+                } catch (Exception attributionEx) {
+                    log.error("creditWallet: commission attribution on duplicate failed userId='{}' ref='{}' — investigate",
+                            userId, idempotencyRef, attributionEx);
+                }
                 return;
             }
             log.error("creditWallet: ✖ wallet credit FAILED userId='{}' ref='{}' amount={} {} status={}",
@@ -1005,7 +1013,7 @@ public class GlobalMarketPayController {
         }
 
         try {
-            referralService.attributeCommission(userId, amount);
+            referralService.attributeCommission(userId, amount, idempotencyRef);
             log.info("creditWallet: commission attributed userId='{}' deposit={} {} ref='{}'",
                     userId, currency, amount, idempotencyRef);
         } catch (Exception ex) {

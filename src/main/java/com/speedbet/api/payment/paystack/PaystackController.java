@@ -225,6 +225,16 @@ public class PaystackController {
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("handleDeposit: duplicate ref='{}' already processed — skipping", ref);
+                // 409 one-shot fix: the wallet was already credited on a
+                // previous attempt — attribute now (idempotent per ref) so
+                // the commission is not lost if the first attempt's
+                // attribution failed or was skipped.
+                try {
+                    referralService.attributeCommission(userId, amount, ref);
+                } catch (Exception attributionEx) {
+                    log.error("handleDeposit: commission attribution on duplicate failed for userId='{}' — investigate",
+                            userId, attributionEx);
+                }
                 return;
             }
             throw ex;
@@ -234,7 +244,7 @@ public class PaystackController {
         // The admin's rate (default 70%) is resolved from the Referral entity inside
         // ReferralService. No rate logic lives here — just trigger attribution.
         try {
-            referralService.attributeCommission(userId, amount);
+            referralService.attributeCommission(userId, amount, ref);
             log.info("handleDeposit: commission attributed for userId='{}' deposit='{}' adminRate={}",
                     userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {

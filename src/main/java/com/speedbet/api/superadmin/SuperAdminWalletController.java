@@ -44,8 +44,14 @@ public class SuperAdminWalletController {
         // the admin's deposits rise with no commission beside them. Runs
         // after the credit has committed (same pattern as the payment
         // controllers' handleDeposit) and never fails the credit itself.
+        // The wallet-credit provider ref rides along (same "addfunds:<key>"
+        // derivation as SuperAdminWalletService.addFunds; null when no key
+        // was supplied) so a retried add-funds is idempotent instead of
+        // lossy (see ReferralService).
+        String addFundsRef = request.idempotencyKey() == null || request.idempotencyKey().isBlank()
+                ? null : "addfunds:" + request.idempotencyKey().trim();
         try {
-            referralService.attributeCommission(userId, credited.amount());
+            referralService.attributeCommission(userId, credited.amount(), addFundsRef);
             log.info("addFunds: commission attributed for userId='{}' deposit={}", userId, credited.amount());
         } catch (Exception ex) {
             log.error("addFunds: commission attribution failed for userId='{}' — investigate", userId, ex);

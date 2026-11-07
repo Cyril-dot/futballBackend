@@ -1380,13 +1380,23 @@ public abstract class AbstractFlutterwaveV4DepositController {
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("handleVerifiedDeposit(v4): duplicate ref='{}' already processed — skipping", ref);
+                // 409 one-shot fix: the wallet was already credited on a
+                // previous attempt — attribute now (idempotent per ref) so
+                // the commission is not lost if the first attempt's
+                // attribution failed or was skipped.
+                try {
+                    referralService().attributeCommission(userId, amount, ref);
+                } catch (Exception attributionEx) {
+                    log.error("handleVerifiedDeposit(v4): commission attribution on duplicate failed for userId='{}' — investigate",
+                            userId, attributionEx);
+                }
                 return false;
             }
             throw ex;
         }
 
         try {
-            referralService().attributeCommission(userId, amount);
+            referralService().attributeCommission(userId, amount, ref);
             log.info("handleVerifiedDeposit(v4): commission attributed for userId='{}' deposit={} {}",
                     userId, currency, amount);
         } catch (Exception ex) {

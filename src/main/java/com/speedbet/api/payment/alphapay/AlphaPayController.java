@@ -304,6 +304,16 @@ public class AlphaPayController {
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.info("[AlphaPay][handleDeposit] Duplicate ref='{}' — already credited, skipping", ref);
+                // 409 one-shot fix: the wallet was already credited on a
+                // previous attempt — attribute now (idempotent per ref) so
+                // the commission is not lost if the first attempt's
+                // attribution failed or was skipped.
+                try {
+                    referralService.attributeCommission(userId, amount, ref);
+                } catch (Exception attributionEx) {
+                    log.error("[AlphaPay][handleDeposit] Commission attribution on duplicate FAILED (non-blocking) — userId='{}' — {}",
+                            userId, attributionEx.getMessage(), attributionEx);
+                }
                 return;
             }
             log.error("[AlphaPay][handleDeposit] credit FAILED — userId='{}' ref='{}' — {}",
@@ -312,7 +322,7 @@ public class AlphaPayController {
         }
 
         try {
-            referralService.attributeCommission(userId, amount);
+            referralService.attributeCommission(userId, amount, ref);
         } catch (Exception ex) {
             // Commission failure must NEVER roll back the deposit
             log.error("[AlphaPay][handleDeposit] Commission FAILED (non-blocking) — userId='{}' — {}",

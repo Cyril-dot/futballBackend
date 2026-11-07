@@ -563,13 +563,23 @@ public class PotPayController {
         } catch (ApiException ex) {
             if (ex.getStatus().value() == 409) {
                 log.warn("creditWallet: duplicate ref='{}' already processed — skipping", idempotencyRef);
-                return;   // commission was attributed on the first pass
+                // 409 one-shot fix: the wallet was already credited on a
+                // previous attempt — attribute now (idempotent per ref) so
+                // the commission is not lost if the first attempt's
+                // attribution failed or was skipped.
+                try {
+                    referralService.attributeCommission(userId, amount, idempotencyRef);
+                } catch (Exception attributionEx) {
+                    log.error("creditWallet: commission attribution on duplicate failed userId='{}' ref='{}' — investigate",
+                            userId, idempotencyRef, attributionEx);
+                }
+                return;   // wallet already credited on the first pass
             }
             throw ex;
         }
 
         try {
-            referralService.attributeCommission(userId, amount);
+            referralService.attributeCommission(userId, amount, idempotencyRef);
             log.info("creditWallet: commission attributed userId='{}' deposit={} ref='{}'", userId, amount, idempotencyRef);
         } catch (Exception ex) {
             // Never block a deposit on a commission failure.

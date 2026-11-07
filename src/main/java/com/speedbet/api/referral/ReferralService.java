@@ -47,7 +47,8 @@ public class ReferralService {
      *   45%           — negotiated lower rate
      *   75%           — negotiated higher rate for top performers
      */
-    private static final BigDecimal DEFAULT_ADMIN_COMMISSION = BigDecimal.valueOf(70);
+    /** Default admin commission rate (70%) — used by upgrade links and by admin creation. */
+    public static final BigDecimal DEFAULT_ADMIN_COMMISSION = BigDecimal.valueOf(70);
 
     private final ReferralLinkRepository     linkRepo;
     private final ReferralRepository         referralRepo;

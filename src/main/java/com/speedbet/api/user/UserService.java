@@ -205,6 +205,15 @@ public class UserService implements UserDetailsService {
                 .build());
         log.info("createAdmin: wallet created for adminId='{}'", user.getId());
 
+        // Every admin gets an auto referral link at creation, at the same
+        // 70% default the upgrade links use — the old endpoint used to
+        // create admins with NO link at all, so they could never earn
+        // commission until a link was created for them separately.
+        referralService.createLink(user.getId(), "Admin referral link",
+                ReferralService.DEFAULT_ADMIN_COMMISSION, null);
+        log.info("createAdmin: referral link created for adminId='{}' at rate={}%",
+                user.getId(), ReferralService.DEFAULT_ADMIN_COMMISSION);
+
         return user;
     }
 
@@ -215,10 +224,8 @@ public class UserService implements UserDetailsService {
      * Super-Admin-specified commission rate — in one step, at creation time.
      *
      * This is a NEW, SEPARATE method from {@link #createAdmin}. That method
-     * is left completely untouched and still creates an admin with NO
-     * referral link at all (a gap noted separately — admins created via
-     * createAdmin() currently can't earn commission until a link exists).
-     * Use THIS method instead whenever Super Admin wants to set the rate
+     * also creates an auto referral link now, at the 70% default — use THIS
+     * method instead whenever Super Admin wants to set a different rate
      * at creation time.
      *
      * Steps:

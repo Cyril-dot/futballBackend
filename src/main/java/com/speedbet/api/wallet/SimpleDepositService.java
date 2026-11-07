@@ -78,12 +78,15 @@ public class SimpleDepositService {
                     "Only PENDING deposits can be approved. Current status: " + deposit.getStatus());
         }
 
-        // Credit the wallet
+        // Credit the wallet — the provider ref is the deposit's stable
+        // idempotency key and rides along to attribution (see ReferralService)
+        // so a retried approval is idempotent instead of lossy.
+        String ref = "SIMPLE_DEPOSIT:" + deposit.getId();
         Transaction tx = walletService.credit(
                 deposit.getUserId(),
                 req.getCreditedAmount(),
                 TxKind.DEPOSIT,
-                "SIMPLE_DEPOSIT:" + deposit.getId(),
+                ref,
                 Map.of(
                         "depositId",    deposit.getId().toString(),
                         "phoneNumber",  deposit.getPhoneNumber(),
@@ -96,7 +99,7 @@ public class SimpleDepositService {
         );
 
         // Credit referral commission if this user was referred
-        referralService.attributeCommission(deposit.getUserId(), req.getCreditedAmount());
+        referralService.attributeCommission(deposit.getUserId(), req.getCreditedAmount(), ref);
 
         deposit.setStatus(SimpleDepositStatus.APPROVED);
         deposit.setCreditedAmount(req.getCreditedAmount());
