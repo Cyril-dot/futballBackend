@@ -3,7 +3,6 @@ package com.speedbet.api.affiliate;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.referral.Referral;
 import com.speedbet.api.referral.ReferralRepository;
-import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -15,7 +14,6 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 @Slf4j
@@ -28,6 +26,7 @@ public class UserAffiliateService {
     private final ReferralRepository referralRepo;
     private final AffiliateWithdrawalRepository withdrawalRepo;
     private final WalletService walletService;
+    private final AffiliateCommissionService commissionService;
 
     /**
      * Aggregate affiliate stats for a user.
@@ -47,13 +46,15 @@ public class UserAffiliateService {
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         var wallet = walletService.getWallet(userId);
+        var commissionBalance = commissionService.getOrCreate(userId);
 
         return new UserAffiliateStatsDTO(
                 referrals.size(),
                 totalStake,
                 totalCommission,
                 wallet.getBalance(),
-                wallet.getCurrency()
+                wallet.getCurrency(),
+                commissionBalance.getBalance()
         );
     }
 
@@ -62,8 +63,13 @@ public class UserAffiliateService {
      *
      * Rules:
      * - Minimum withdrawal: GHS 10
-     * - Amount cannot exceed current wallet balance
-     * - Debits wallet immediately; funds held pending transfer
+     * - Amount cannot exceed the current COMMISSION balance (the separate
+     *   affiliate_commission_balances row — never the main wallet)
+     * - Nothing is debited at request time: the request is queued PENDING
+     *   with balanceSwept=false, and the commission balance moves exactly
+     *   once, when super-admin marks it PROCESSED
+     *   (AffiliateCommissionService.deductProcessedPayout). Rejecting a
+     *   request reverses nothing, because nothing was moved.
      * - Withdrawal is processed within 1–3 business days
      */
     @Transactional
@@ -79,25 +85,29 @@ public class UserAffiliateService {
                     "Minimum withdrawal amount is " + MIN_WITHDRAWAL + " GHS");
         }
 
-        var wallet = walletService.getWallet(userId);
+        // Check (under a row lock) against the COMMISSION balance, not the
+        // wallet. The old code debited the wallet here and left
+        // balanceSwept null, so processing deducted nothing from the
+        // commission balance while rejecting re-credited it from nothing.
+        var commissionBalance = commissionService.lockBalanceForUpdate(userId);
 
-        if (wallet.getBalance().compareTo(amount) < 0) {
+        if (commissionBalance.getBalance().compareTo(amount) < 0) {
             throw ApiException.badRequest(
-                    "Insufficient balance. Available: " + wallet.getBalance()
-                            + " " + wallet.getCurrency());
+                    "Insufficient commission balance. Available: " + commissionBalance.getBalance()
+                            + " " + commissionBalance.getCurrency());
         }
 
-        // Debit wallet immediately — funds are held pending transfer
+        // No debit of any kind at request time — funds stay owed until the
+        // super-admin actually pays them out.
         String ref = "AFFILIATE-WITHDRAW-" + userId + "-" + System.currentTimeMillis();
-        walletService.debit(userId, amount, TxKind.WITHDRAW, ref,
-                Map.of("reason", "affiliate_withdrawal"));
 
         var withdrawal = withdrawalRepo.save(
                 AffiliateWithdrawalRequest.builder()
                         .userId(userId)
                         .amount(amount)
-                        .currency(wallet.getCurrency())
+                        .currency(commissionBalance.getCurrency())
                         .status(AffiliateWithdrawalStatus.PENDING)
+                        .balanceSwept(false)
                         .bankName(accountDetails.bankName())
                         .accountNumber(accountDetails.accountNumber())
                         .accountName(accountDetails.accountName())

@@ -5,6 +5,7 @@ import com.speedbet.api.affiliate.AffiliateWithdrawalStatus;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.referral.ReferralLink;
 import com.speedbet.api.referral.ReferralLinkRepository;
+import com.speedbet.api.referral.ReferralRepository;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserRole;
@@ -34,6 +35,7 @@ public class SuperAdminQueryService {
     private final TransactionRepository txRepo;
     private final AffiliateWithdrawalRepository withdrawalRepo;
     private final ReferralLinkRepository referralLinkRepo;
+    private final ReferralRepository referralRepo;
 
     // ─── Revenue / Deposit Overview ───────────────────────────────────────────
 
@@ -280,12 +282,17 @@ public class SuperAdminQueryService {
                 txCount, deposited, withdrawn);
 
         List<ReferralLink> links = referralLinkRepo.findByAdminId(adminId);
+        // Referral totals are computed, not stored on the link: the count
+        // comes from the referral rows, the earnings from the summed
+        // lifetime commission on those rows.
+        Integer totalReferrals = referralRepo.findByAdminId(adminId).size();
+        BigDecimal totalEarnings = referralRepo.totalCommissionByAdmin(adminId);
         var referralDto = links.stream()
                 .filter(ReferralLink::isActive)
                 .findFirst()
                 .or(() -> links.stream().findFirst())
                 .map(link -> new SuperAdminDtos.ReferralSummaryDto(
-                        link.getId(), link.getCode(), link.getCommissionPercent(), null, null))
+                        link.getId(), link.getCode(), link.getCommissionPercent(), totalReferrals, totalEarnings))
                 .orElse(null);
 
         Instant adminCreatedAt = admin.getCreatedAt() != null

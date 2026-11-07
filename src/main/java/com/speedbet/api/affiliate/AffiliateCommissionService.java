@@ -73,6 +73,20 @@ public class AffiliateCommissionService {
      */
     @Transactional(isolation = Isolation.SERIALIZABLE)
     public AffiliateCommissionBalance creditCommission(UUID userId, BigDecimal amount, String currency) {
+        return creditCommission(userId, amount, currency, null, null);
+    }
+
+    /**
+     * Same as {@link #creditCommission(UUID, BigDecimal, String)}, plus the
+     * depositor and the deposit reference the commission was attributed
+     * from. The CommissionLedgerAspect reads those two extra args off the
+     * call and stores them on the ledger row, so reports can attribute
+     * commission by depositor country and re-attribution of the same
+     * deposit is idempotent. Pass null for either when unknown.
+     */
+    @Transactional(isolation = Isolation.SERIALIZABLE)
+    public AffiliateCommissionBalance creditCommission(UUID userId, BigDecimal amount, String currency,
+                                                       UUID depositorUserId, String depositReference) {
         if (amount.compareTo(BigDecimal.ZERO) <= 0)
             throw ApiException.badRequest("Commission credit amount must be positive");
 

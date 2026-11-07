@@ -36,4 +36,14 @@ public interface CommissionLedgerEntryRepository extends JpaRepository<Commissio
             "where c.createdAt >= :since " +
             "order by c.createdAt asc")
     List<CommissionLedgerEntry> findAllSince(@Param("since") Instant since);
+
+    /**
+     * Idempotency guard for re-attribution: true when this admin was already
+     * credited commission for the given deposit reference. Used by
+     * ReferralService.attributeCommission so a webhook retry (or any
+     * re-delivery) that reaches attribution again never credits twice.
+     */
+    boolean existsByAdminIdAndDepositReference(
+            @Param("adminId") UUID adminId,
+            @Param("depositReference") String depositReference);
 }

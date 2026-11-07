@@ -10,7 +10,11 @@ public final class CurrencyResolver {
 
     private static final Map<String, String> COUNTRY_TO_CURRENCY = Map.ofEntries(
         Map.entry("GH", "GHS"),   // Ghana
+        Map.entry("GHA", "GHS"),  // Ghana (alpha-3)
+        Map.entry("GHANA", "GHS"), // Ghana (full name)
         Map.entry("NG", "NGN"),   // Nigeria
+        Map.entry("NGA", "NGN"),  // Nigeria (alpha-3)
+        Map.entry("NIGERIA", "NGN"), // Nigeria (full name)
         Map.entry("KE", "KES"),   // Kenya
         Map.entry("ZA", "ZAR"),   // South Africa
         Map.entry("UG", "UGX"),   // Uganda

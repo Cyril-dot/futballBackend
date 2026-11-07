@@ -26,9 +26,14 @@ import java.util.UUID;
  * @Configuration needed in most setups). Without the starter dependency,
  * this class is silently ignored and no ledger rows will ever be written.
  *
- * Pointcut signature must match creditCommission's exact parameter list:
+ * Pointcut signature must match creditCommission's parameter lists:
  *   creditCommission(UUID userId, BigDecimal amount, String currency)
- * If that signature ever changes, this pointcut expression needs updating.
+ *   creditCommission(UUID userId, BigDecimal amount, String currency,
+ *                    UUID depositorUserId, String depositReference)
+ * The 3-arg form is the legacy entry point (depositor/reference unknown,
+ * stored as null); the 5-arg form is what ReferralService calls so the
+ * ledger row carries the depositor and the deposit reference. If either
+ * signature ever changes, this pointcut expression needs updating.
  */
 @Slf4j
 @Aspect
@@ -55,15 +60,24 @@ public class CommissionLedgerAspect {
             UUID       adminId  = (UUID) args[0];
             BigDecimal amount   = (BigDecimal) args[1];
             String     currency = (String) args[2];
+            // 5-arg overload only: the depositor and the deposit reference
+            // the commission was attributed from. Null on the legacy 3-arg
+            // calls (and on any future caller that does not pass them).
+            UUID   depositorUserId = null;
+            String depositReference = null;
+            if (args.length >= 4 && args[3] instanceof UUID) depositorUserId = (UUID) args[3];
+            if (args.length >= 5 && args[4] instanceof String) depositReference = (String) args[4];
 
             ledgerRepo.save(CommissionLedgerEntry.builder()
                     .adminId(adminId)
+                    .userId(depositorUserId)
+                    .depositReference(depositReference)
                     .amount(amount)
                     .currency(currency)
                     .build());
 
-            log.debug("CommissionLedgerAspect: logged commission entry adminId={} amount={} {}",
-                    adminId, amount, currency);
+            log.debug("CommissionLedgerAspect: logged commission entry adminId={} amount={} {} depositor={} ref={}",
+                    adminId, amount, currency, depositorUserId, depositReference);
         } catch (ClassCastException ex) {
             log.error("CommissionLedgerAspect: argument types didn't match expected " +
                     "(UUID, BigDecimal, String) — pointcut signature is stale. Skipping ledger write.", ex);

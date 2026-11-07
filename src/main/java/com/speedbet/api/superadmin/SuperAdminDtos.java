@@ -211,8 +211,8 @@ public class SuperAdminDtos {
             UUID linkId,
             String code,
             BigDecimal commissionPercent,
-            Integer totalReferrals,   // not stored on ReferralLink — null unless computed separately
-            BigDecimal totalEarnings  // not stored on ReferralLink — null unless computed separately
+            Integer totalReferrals,   // computed in SuperAdminQueryService.getAdminDetail
+            BigDecimal totalEarnings  // summed lifetime commission, same source
     ) {}
 
     // ─── Transaction (platform-wide) ─────────────────────────────────────────

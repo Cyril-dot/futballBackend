@@ -449,8 +449,10 @@ public abstract class AbstractFlutterwaveDepositController {
 
         // Attribute commission to referring admin. Never block a deposit because
         // of a commission failure — same guarantee as the Paystack integration.
+        // The wallet-credit ref rides along so a retry of this deposit is
+        // idempotent instead of lossy (see ReferralService).
         try {
-            referralService().attributeCommission(userId, amount);
+            referralService().attributeCommission(userId, amount, ref);
             log.info("handleVerifiedDeposit: commission attributed for userId='{}' deposit={} {}",
                     userId, currency, amount);
         } catch (Exception ex) {

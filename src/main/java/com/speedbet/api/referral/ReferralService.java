@@ -1,5 +1,6 @@
 package com.speedbet.api.referral;
 
+import com.speedbet.api.admin.CommissionLedgerEntryRepository;
 import com.speedbet.api.affiliate.AffiliateCommissionService;
 import com.speedbet.api.bet.CurrencyResolver;
 import com.speedbet.api.common.ApiException;
@@ -51,6 +52,7 @@ public class ReferralService {
     private final ReferralLinkRepository     linkRepo;
     private final ReferralRepository         referralRepo;
     private final AffiliateCommissionService commissionService; // ← commission balance, NOT wallet
+    private final CommissionLedgerEntryRepository ledgerRepo;
     private final UserRepository             userRepo;
 
     /**
@@ -151,7 +153,24 @@ public class ReferralService {
      */
     @Transactional
     public void attributeCommission(UUID userId, BigDecimal deposit) {
-        log.info("attributeCommission: userId={} deposit={}", userId, deposit);
+        attributeCommission(userId, deposit, null);
+    }
+
+    /**
+     * Same as {@link #attributeCommission(UUID, BigDecimal)}, plus the
+     * deposit reference for idempotency.
+     *
+     * @param depositReference the deposit's idempotency reference (the same
+     *        ref the wallet credit used), or null when the caller does not
+     *        have one. When present, attribution is idempotent per
+     *        (admin, reference): a retry that finds an existing ledger
+     *        entry for this reference skips crediting instead of paying
+     *        twice — and a retry after a 409 wallet duplicate still gets
+     *        its commission instead of losing it.
+     */
+    @Transactional
+    public void attributeCommission(UUID userId, BigDecimal deposit, String depositReference) {
+        log.info("attributeCommission: userId={} deposit={} ref={}", userId, deposit, depositReference);
 
         Referral referral = referralRepo.findByUserId(userId).orElse(null);
         if (referral == null) {
@@ -184,6 +203,18 @@ public class ReferralService {
             return;
         }
 
+        // Idempotency guard (409 one-shot fix): if this deposit was already
+        // attributed — a webhook retry, a re-delivery, or a second handler
+        // run for the same ref — the ledger already holds the entry, so
+        // skip everything instead of crediting (and double-counting
+        // lifetime stats) a second time. Must sit BEFORE the stats update.
+        if (depositReference != null && !depositReference.isBlank()
+                && ledgerRepo.existsByAdminIdAndDepositReference(link.getAdminId(), depositReference)) {
+            log.info("attributeCommission: commission already credited for adminId={} ref={} — skipping (idempotent retry)",
+                    link.getAdminId(), depositReference);
+            return;
+        }
+
         // Resolve the deposit currency from the depositor's country — the
         // deposit amount arrives in the depositor's own currency (GHS for
         // Ghana MoMo, NGN for Nigerian bank transfers, ...).
@@ -210,7 +241,9 @@ public class ReferralService {
         // would have added commission money directly into the admin's spendable
         // wallet balance. Commission earned from referrals lives in a separate
         // ledger and is paid out daily via AffiliateDailyPayoutScheduler.
-        commissionService.creditCommission(link.getAdminId(), commissionGhs, "GHS");
+        // The depositor + deposit ref ride along so the ledger row carries
+        // them (country report + idempotent re-attribution).
+        commissionService.creditCommission(link.getAdminId(), commissionGhs, "GHS", userId, depositReference);
 
         log.info("attributeCommission: {} GHS ({} {}) → commission balance of adminId={} | "
                         + "userId={} deposited {} {} at {}%",

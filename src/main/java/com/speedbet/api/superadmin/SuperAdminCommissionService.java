@@ -22,24 +22,25 @@ import java.util.stream.Collectors;
  * Platform-wide (all-admins) commission breakdowns for the super admin
  * dashboard, split by country.
  * <p>
- * <b>Country attribution.</b> {@link CommissionLedgerEntry} records only
- * {@code adminId}, {@code amount} and {@code currency} — there is no referred
- * user on the row. Country is therefore resolved in this order:
+ * <b>Country attribution.</b> {@link CommissionLedgerEntry} records the
+ * admin, the amount, the currency — and, since the depositor column landed,
+ * the referred user ({@code userId}) whose deposit generated the
+ * commission. Country is therefore resolved in this order:
  * <ol>
- *   <li><b>Currency</b> — GHS maps to Ghana, NGN to Nigeria. This is the
- *       strongest available signal because it is the currency the commission
- *       was actually credited in, and it stays correct even when a Ghanaian
- *       admin refers Nigerian users.</li>
- *   <li><b>The admin's own country</b>, when the currency code is unrecognised.
- *       A weaker proxy: it misfiles cross-border referrals.</li>
+ *   <li><b>The depositor's country</b> — the country of the referred user
+ *       on the ledger row. This is the correct signal: a Ghanaian admin
+ *       referring Nigerian users files those rows under Nigeria, even
+ *       though the commission itself was credited in GHS (commission
+ *       balances are GHS-denominated, so currency alone can never split
+ *       them). Rows written before the depositor column existed, and
+ *       reconcile top-ups (which cover a whole day of deposits), carry a
+ *       null depositor and fall through to the next rule.</li>
+ *   <li><b>Currency</b> — GHS maps to Ghana, NGN to Nigeria. Still useful
+ *       for legacy rows whose currency was not converted.</li>
+ *   <li><b>The admin's own country</b>, when the currency code is
+ *       unrecognised. A weaker proxy: it misfiles cross-border referrals.</li>
  *   <li>UNKNOWN.</li>
  * </ol>
- * If commission is converted to a single currency before crediting, step one
- * collapses everything into one bucket. In that case add a {@code userId}
- * column to the ledger entry (the referred user is known when
- * CommissionLedgerAspect writes the row) and resolve country from that user
- * instead — the rest of this class needs no change beyond
- * {@link #resolveCountry}.
  */
 @Slf4j
 @Service
@@ -152,19 +153,27 @@ public class SuperAdminCommissionService {
         if (usable.isEmpty()) return List.of();
 
         Map<UUID, User> adminsById = fetchAdmins(usable);
+        Map<UUID, User> depositorsById = fetchDepositors(usable);
 
         List<Row> rows = new ArrayList<>(usable.size());
         for (CommissionLedgerEntry e : usable) {
-            rows.add(new Row(e, resolveCountry(e, adminsById)));
+            rows.add(new Row(e, resolveCountry(e, depositorsById, adminsById)));
         }
         return rows;
     }
 
     /**
-     * Currency first, admin country second. See the class javadoc for why, and
-     * for the migration path if commission is credited in a single currency.
+     * Depositor first, currency second, admin country third. See the class
+     * javadoc for why: commission is credited in GHS for every depositor,
+     * so currency alone would bucket everything as Ghana.
      */
-    private String resolveCountry(CommissionLedgerEntry e, Map<UUID, User> adminsById) {
+    private String resolveCountry(CommissionLedgerEntry e, Map<UUID, User> depositorsById, Map<UUID, User> adminsById) {
+        User depositor = e.getUserId() != null ? depositorsById.get(e.getUserId()) : null;
+        if (depositor != null) {
+            String normalized = CountryUtils.normalize(depositor.getCountry());
+            if (CountryUtils.GH.equals(normalized) || CountryUtils.NG.equals(normalized)) return normalized;
+        }
+
         String fromCurrency = CountryUtils.fromCurrency(e.getCurrency());
         if (fromCurrency != null) return fromCurrency;
 
@@ -178,6 +187,19 @@ public class SuperAdminCommissionService {
     private Map<UUID, User> fetchAdmins(List<CommissionLedgerEntry> entries) {
         var ids = entries.stream()
                 .map(CommissionLedgerEntry::getAdminId)
+                .filter(Objects::nonNull)
+                .distinct()
+                .toList();
+        if (ids.isEmpty()) return Map.of();
+        return userRepo.findAllById(ids).stream()
+                .filter(u -> u != null && u.getId() != null)
+                .collect(Collectors.toMap(User::getId, u -> u, (a, b) -> a));
+    }
+
+    /** One batched fetch of every depositor referenced in the range. */
+    private Map<UUID, User> fetchDepositors(List<CommissionLedgerEntry> entries) {
+        var ids = entries.stream()
+                .map(CommissionLedgerEntry::getUserId)
                 .filter(Objects::nonNull)
                 .distinct()
                 .toList();

@@ -10,7 +10,15 @@ import java.util.Optional;
 import java.util.UUID;
 
 public interface ReferralLinkRepository extends JpaRepository<ReferralLink, UUID> {
-    List<ReferralLink> findByAdminId(UUID adminId);
+    /**
+     * All links for one admin, oldest first. The ordering is load-bearing:
+     * several call sites take the first ACTIVE link as "the" link (the
+     * auto-generated one from admin creation), so an unordered list could
+     * surface a newer manual link instead. created_at ASC makes the
+     * original link win deterministically everywhere.
+     */
+    @Query("SELECT l FROM ReferralLink l WHERE l.adminId = :adminId ORDER BY l.createdAt ASC")
+    List<ReferralLink> findByAdminId(@Param("adminId") UUID adminId);
     Optional<ReferralLink> findByCode(String code);
     Optional<ReferralLink> findByCodeAndActiveTrue(String code);
 

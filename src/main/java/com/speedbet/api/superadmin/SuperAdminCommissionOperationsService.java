@@ -97,7 +97,7 @@ public class SuperAdminCommissionOperationsService {
                     .toList();
             List<CommissionLedgerEntry> ledger = ledgerRepo.findByAdminIdSince(admin.getId(), from).stream()
                     .filter(e -> e.getCreatedAt() != null && !e.getCreatedAt().isBefore(from)
-                            && e.getCreatedAt().isBefore(to) && e.getPaidAt() == null)
+                            && e.getCreatedAt().isBefore(to))
                     .toList();
             AffiliateCommissionBalance balance = balances.get(admin.getId());
             BigDecimal balanceAmount = balance == null ? BigDecimal.ZERO : balance.getBalance();
@@ -116,7 +116,14 @@ public class SuperAdminCommissionOperationsService {
                 depositsByCurrency.merge(currency, d.amount() == null ? BigDecimal.ZERO : d.amount(), BigDecimal::add);
                 countsByCurrency.merge(currency, 1L, Long::sum);
             }
-            boolean hasUnpaid = !ledger.isEmpty();
+            // Earned for the day comes from the STORED ledger entries for
+            // that day — paid or not. The old code only counted unpaid
+            // entries, so the moment a day was paid & cleared this endpoint
+            // read 0 for it. The per-currency rows still derive their
+            // earned figure as deposits x rate (the same formula used at
+            // credit time), but only when the day has stored ledger entries
+            // backing it; a day with no entries at all earns nothing.
+            boolean hasLedgerEntries = !ledger.isEmpty();
             if (depositsByCurrency.isEmpty()) {
                 // No deposits today - preserve the previous single-row shape so
                 // the admin still appears (the frontend hides zero-activity rows).
@@ -133,7 +140,7 @@ public class SuperAdminCommissionOperationsService {
                     String currency = entry.getKey();
                     BigDecimal depositTotal = entry.getValue();
                     long depositCount = countsByCurrency.getOrDefault(currency, 0L);
-                    BigDecimal earned = hasUnpaid
+                    BigDecimal earned = hasLedgerEntries
                             ? depositTotal.multiply(rate).divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP)
                             : BigDecimal.ZERO;
                     result.add(new SuperAdminCommissionOperationsDtos.DailyAdminCommissionDto(

@@ -8,7 +8,6 @@ import com.speedbet.api.referral.ReferralLink;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.referral.ReferredUserDTO;
 import com.speedbet.api.user.User;
-import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.cache.annotation.Cacheable;
@@ -33,6 +32,7 @@ public class AdminController {
     private final ReferralService referralService;
     private final WalletService walletService;
     private final AuditService auditService;
+    private final CommissionLedgerEntryRepository ledgerRepo;
 
     @GetMapping("/analytics")
     @Cacheable(value = "adminKpis", key = "#user.id")
@@ -46,10 +46,13 @@ public class AdminController {
             case "30d"   -> Instant.now().minus(30, ChronoUnit.DAYS);
             default      -> Instant.now().minus(7, ChronoUnit.DAYS);
         };
-        var commission = walletService.getTransactions(user.getId(),
-                        PageRequest.of(0, 1000)).getContent().stream()
-                .filter(t -> t.getKind() == TxKind.REFERRAL_COMMISSION && t.getCreatedAt().isAfter(since))
-                .map(t -> t.getAmount())
+        // Commission in period comes from the commission ledger — the same
+        // source the country reports use. The old code summed wallet
+        // transactions of kind REFERRAL_COMMISSION, which nothing ever
+        // writes (commission is credited to the separate commission
+        // balance), so it was always 0.
+        var commission = ledgerRepo.findByAdminIdSince(user.getId(), since).stream()
+                .map(e -> e.getAmount())
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         return ResponseEntity.ok(ApiResponse.ok(Map.of(

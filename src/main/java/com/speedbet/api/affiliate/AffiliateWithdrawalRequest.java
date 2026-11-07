@@ -9,7 +9,9 @@ import java.util.UUID;
 
 /**
  * Represents a commission withdrawal request submitted by an affiliate user.
- * Wallet is debited immediately on creation; status tracks processing by super-admin.
+ * Nothing is debited at creation: the request is queued PENDING and the
+ * commission balance moves exactly once, when super-admin marks it
+ * PROCESSED. The main wallet is never touched by this flow.
  */
 @Entity
 @Table(name = "affiliate_withdrawal_requests")

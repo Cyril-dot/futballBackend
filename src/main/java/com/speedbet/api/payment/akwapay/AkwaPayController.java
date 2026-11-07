@@ -744,7 +744,7 @@ public class AkwaPayController {
         }
 
         try {
-            referralService.attributeCommission(userId, amount);
+            referralService.attributeCommission(userId, amount, ref);
             log.info("handleDeposit: commission attributed for userId='{}' deposit={} adminRate={}",
                     userId, amount, ADMIN_COMMISSION_RATE);
         } catch (Exception ex) {
