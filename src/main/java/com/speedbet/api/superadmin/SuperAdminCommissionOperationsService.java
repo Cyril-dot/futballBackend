@@ -187,7 +187,11 @@ public class SuperAdminCommissionOperationsService {
                 .divide(BigDecimal.valueOf(100), 2, RoundingMode.HALF_UP);
 
         List<CommissionLedgerEntry> unpaid = unpaidEntries(adminId, reportDate);
-        BigDecimal credited = sum(unpaid);
+        // Already credited counts EVERY entry for the day, paid or not: a
+        // paid entry was still credited to the balance, so counting only
+        // unpaid entries re-adds money that was already earned (and paid).
+        // That is how a balance ends up double its earned commission.
+        BigDecimal credited = sum(ledgerRepo.findByAdminIdBetween(adminId, from, to));
         BigDecimal shortfall = expected.subtract(credited);
 
         AffiliateCommissionBalance balance = balanceRepo.findByUserId(adminId).orElse(null);

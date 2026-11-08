@@ -32,6 +32,20 @@ public interface CommissionLedgerEntryRepository extends JpaRepository<Commissio
             @Param("from") Instant from,
             @Param("to") Instant to);
 
+    /**
+     * Every ledger entry for an admin in a day window, paid or not.
+     * Reconcile's "already credited" must count paid entries too: a paid
+     * entry was still credited to the balance, and counting only unpaid
+     * entries re-adds money that was already paid out.
+     */
+    @Query("select c from CommissionLedgerEntry c " +
+           "where c.adminId = :adminId and c.createdAt >= :from and c.createdAt < :to " +
+           "order by c.createdAt asc")
+    List<CommissionLedgerEntry> findByAdminIdBetween(
+            @Param("adminId") UUID adminId,
+            @Param("from") Instant from,
+            @Param("to") Instant to);
+
     @Query("select c from CommissionLedgerEntry c " +
             "where c.createdAt >= :since " +
             "order by c.createdAt asc")
