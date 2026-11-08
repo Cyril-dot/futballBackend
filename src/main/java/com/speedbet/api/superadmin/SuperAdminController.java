@@ -9,6 +9,7 @@ import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.common.PageResponse;
 import com.speedbet.api.referral.ReferralLinkRepository;
+import com.speedbet.api.referral.ReferralRepository;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
@@ -43,6 +44,7 @@ public class SuperAdminController {
     private final SuperAdminQueryService queryService;
     private final WalletService walletService;
     private final ReferralLinkRepository referralLinkRepo;
+    private final ReferralRepository referralRepo;
     private final AffiliateCommissionService commissionService;
     private final ReferralService referralService;
 
@@ -132,6 +134,7 @@ public class SuperAdminController {
                     row.put("firstName", u.getFirstName());
                     row.put("lastName", u.getLastName());
                     row.put("commissionRate", activeLink != null ? activeLink.getCommissionPercent() : null);
+                    row.put("totalReferrals", referralRepo.findByAdminId(u.getId()).size());
                     row.put("commissionBalance", balance.getBalance());
                     row.put("totalEarned", balance.getTotalEarnedLifetime());
                     row.put("totalPaidOut", balance.getTotalPaidOutLifetime());
