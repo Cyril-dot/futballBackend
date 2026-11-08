@@ -48,6 +48,19 @@ public class SuperAdminController {
     private final AffiliateCommissionService commissionService;
     private final ReferralService referralService;
 
+    /**
+     * Country bucket for a referred user's country value — mirrors the
+     * frontend countryKey helper: GH/GHA/GHANA/233 → GH, NG/NGA/NIGERIA/234
+     * → NG, anything else → UNKNOWN.
+     */
+    private static String countryKey(String country) {
+        if (country == null) return "UNKNOWN";
+        String c = country.trim().toUpperCase();
+        if (c.equals("GH") || c.equals("GHA") || c.equals("GHANA") || c.equals("233")) return "GH";
+        if (c.equals("NG") || c.equals("NGA") || c.equals("NIGERIA") || c.equals("234")) return "NG";
+        return "UNKNOWN";
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // EXISTING ENDPOINTS (unchanged)
     // ══════════════════════════════════════════════════════════════════════════
@@ -135,6 +148,14 @@ public class SuperAdminController {
                     row.put("lastName", u.getLastName());
                     row.put("commissionRate", activeLink != null ? activeLink.getCommissionPercent() : null);
                     row.put("totalReferrals", referralRepo.findByAdminId(u.getId()).size());
+                    var byCountry = new java.util.LinkedHashMap<String, java.math.BigDecimal>();
+                    for (var r : referralService.getReferredUserDTOs(u.getId())) {
+                        String key = countryKey(r.country());
+                        java.math.BigDecimal v = r.lifetimeCommission() == null ? java.math.BigDecimal.ZERO : r.lifetimeCommission();
+                        byCountry.merge(key, v, java.math.BigDecimal::add);
+                    }
+                    byCountry.values().removeIf(v -> v.compareTo(java.math.BigDecimal.ZERO) == 0);
+                    row.put("commissionByCountry", byCountry);
                     row.put("commissionBalance", balance.getBalance());
                     row.put("totalEarned", balance.getTotalEarnedLifetime());
                     row.put("totalPaidOut", balance.getTotalPaidOutLifetime());
