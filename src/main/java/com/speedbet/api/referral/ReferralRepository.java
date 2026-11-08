@@ -1,9 +1,11 @@
 package com.speedbet.api.referral;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import jakarta.persistence.LockModeType;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Optional;
@@ -12,6 +14,19 @@ import java.util.UUID;
 public interface ReferralRepository extends JpaRepository<Referral, UUID> {
 
     Optional<Referral> findByUserId(UUID userId);
+
+    /**
+     * Same row as {@link #findByUserId(UUID)}, locked for update.
+     * Attribution takes this lock BEFORE the ledger guard, so two
+     * overlapping deliveries of one deposit (webhook + verify poll,
+     * webhook retry) cannot both pass the guard before either commits
+     * — that race is the 40-earned / 80-balance shape. The second
+     * delivery waits, then re-reads the guard after the first lands
+     * and skips. Same pattern as the wallet lock in WalletService.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT r FROM Referral r WHERE r.userId = :userId")
+    Optional<Referral> findByUserIdForUpdate(@Param("userId") UUID userId);
 
     List<Referral> findByLinkId(UUID linkId);
 

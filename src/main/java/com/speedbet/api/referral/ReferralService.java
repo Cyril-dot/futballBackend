@@ -173,7 +173,15 @@ public class ReferralService {
     public void attributeCommission(UUID userId, BigDecimal deposit, String depositReference) {
         log.info("attributeCommission: userId={} deposit={} ref={}", userId, deposit, depositReference);
 
-        Referral referral = referralRepo.findByUserId(userId).orElse(null);
+        // Lock the referral row BEFORE the ledger guard: two overlapping
+        // deliveries of one deposit (webhook + verify poll, webhook retry)
+        // must not both pass the guard before either commits — that race
+        // is the 40-earned / 80-balance shape (referral stats lost-update
+        // to +40 once while the balance serialises to +40 twice). The
+        // lock is held to commit, so the second delivery re-reads the
+        // guard after the first lands and skips. Same pattern as the
+        // wallet's pessimistic lock in WalletService.
+        Referral referral = referralRepo.findByUserIdForUpdate(userId).orElse(null);
         if (referral == null) {
             log.info("attributeCommission: userId={} has no referral — no commission to attribute", userId);
             return;
