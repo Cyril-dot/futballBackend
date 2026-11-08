@@ -10,6 +10,7 @@ import com.speedbet.api.admin.CommissionLedgerEntry;
 import com.speedbet.api.admin.CommissionLedgerEntryRepository;
 import com.speedbet.api.referral.ReferralLink;
 import com.speedbet.api.referral.ReferralLinkRepository;
+import com.speedbet.api.referral.ReferralRepository;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRepository;
 import com.speedbet.api.user.UserRole;
@@ -55,6 +56,7 @@ public class SuperAdminCommissionOperationsService {
 
     private final UserRepository userRepo;
     private final ReferralLinkRepository referralLinkRepo;
+    private final ReferralRepository referralRepo;
     private final AffiliateCommissionBalanceRepository balanceRepo;
     private final AffiliateCommissionService commissionService;
     private final AffiliateWithdrawalRepository withdrawalRepo;
@@ -200,8 +202,26 @@ public class SuperAdminCommissionOperationsService {
                 .orElse(balance != null ? balance.getCurrency()
                         : CountryUtils.currencyOf(admin.getCountry()));
 
+        // Permanent guard: the balance must never exceed lifetime earned
+        // minus lifetime paid. Lifetime earned comes from the referral
+        // rows — the source of truth, never from the balance row or the
+        // ledger, which is exactly what a bad top-up corrupts. Even if
+        // "credited" is misread (0), the top-up cannot push the balance
+        // past what the admin actually earned. That is how admin1's
+        // balance reached 80 on 40 earned.
+        BigDecimal lifetimeEarned = referralRepo.totalCommissionByAdmin(adminId);
+        if (lifetimeEarned == null) lifetimeEarned = BigDecimal.ZERO;
+        BigDecimal lifetimePaid = balance == null ? BigDecimal.ZERO : balance.getTotalPaidOutLifetime();
+        BigDecimal balanceNow = balance == null ? BigDecimal.ZERO : balance.getBalance();
+        BigDecimal headroom = lifetimeEarned.subtract(lifetimePaid).subtract(balanceNow);
+        BigDecimal allowed = shortfall.min(headroom.max(BigDecimal.ZERO));
+        if (shortfall.compareTo(allowed) > 0) {
+            log.warn("commission.reconcile.capped adminId={} date={} shortfall={} allowed={} lifetimeEarned={} balance={}",
+                    adminId, reportDate, shortfall, allowed, lifetimeEarned, balanceNow);
+        }
+
         BigDecimal toppedUp = BigDecimal.ZERO;
-        if (shortfall.compareTo(BigDecimal.ZERO) > 0) {
+        if (allowed.compareTo(BigDecimal.ZERO) > 0) {
             AffiliateCommissionBalance bal = balanceRepo.findByUserIdForUpdate(adminId)
                     .orElseGet(() -> balanceRepo.save(AffiliateCommissionBalance.builder()
                             .userId(adminId)
@@ -210,18 +230,18 @@ public class SuperAdminCommissionOperationsService {
             if (!bal.getCurrency().equalsIgnoreCase(currency))
                 throw new IllegalArgumentException("Commission currency mismatch: expected "
                         + bal.getCurrency() + ", got " + currency);
-            bal.setBalance(bal.getBalance().add(shortfall));
-            bal.setTotalEarnedLifetime(bal.getTotalEarnedLifetime().add(shortfall));
+            bal.setBalance(bal.getBalance().add(allowed));
+            bal.setTotalEarnedLifetime(bal.getTotalEarnedLifetime().add(allowed));
             balanceRepo.save(bal);
             balance = bal;
 
             ledgerRepo.save(CommissionLedgerEntry.builder()
                     .adminId(adminId)
-                    .amount(shortfall)
+                    .amount(allowed)
                     .currency(currency)
                     .createdAt(reportDate.atTime(12, 0).toInstant(REPORT_ZONE))
                     .build());
-            toppedUp = shortfall;
+            toppedUp = allowed;
         }
 
         log.info("commission.reconcile adminId={} date={} rate={} deposits={} expected={} credited={} toppedUp={}",
