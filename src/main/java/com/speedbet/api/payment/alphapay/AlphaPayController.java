@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.referral.ReferralService;
+import com.speedbet.api.superadmin.AlphaPaySettingsService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
@@ -78,12 +79,12 @@ public class AlphaPayController {
     private final ReferralService   referralService;
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
+    private final AlphaPaySettingsService alphaPaySettings;
 
-    @Value("${app.alphapay.secret-key}")           private String     secretKey;
-    @Value("${app.alphapay.base-url}")             private String     baseUrl;          // https://api.edibytes.online/api
-    @Value("${app.alphapay.domain}")               private String     domain;           // luckysttake.site (must be whitelisted)
-    @Value("${app.alphapay.callback-url}")         private String     callbackUrl;      // https://<your-api>/api/webhooks/alphapay
-    @Value("${app.alphapay.return-url}")           private String     returnUrl;        // https://www.luckysttake.site/wallet/deposit/complete
+    // Config (secret, base URL, domain, callback URL, return URL) is no
+    // longer read from @Value fields: AlphaPaySettingsService resolves
+    // each call from the super-admin panel's stored row, falling back to
+    // the Railway env values. Resolved per call, never cached.
     @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -99,6 +100,13 @@ public class AlphaPayController {
 
         var amount = extractValidAmount(req);
 
+        // Fail closed before any AlphaPay call: no key anywhere (neither
+        // stored in the panel nor in env) means deposits cannot start.
+        var cfg = alphaPaySettings.resolved();
+        if (cfg.secretKey() == null || cfg.secretKey().isBlank()) {
+            throw ApiException.badRequest("AlphaPay is not configured yet — set the key in the super admin panel.");
+        }
+
         String phone = null;
         var rawPhone = req.get("phone");
         if (rawPhone != null && !rawPhone.toString().isBlank()) {
@@ -112,8 +120,8 @@ public class AlphaPayController {
         body.put("amount",       amount);              // BigDecimal, GHS, 2dp — NOT pesewas
         body.put("currency",     "GHS");
         body.put("reference",    reference);
-        body.put("domain",       domain);
-        body.put("callback_url", callbackUrl);
+        body.put("domain",       cfg.domain());
+        body.put("callback_url", cfg.callbackUrl());
         if (phone != null) body.put("phone_number", phone);
 
         log.info("[AlphaPay][init] Calling initialize — userId='{}' ref='{}' amountGHS={} phone='{}'",
@@ -261,9 +269,9 @@ public class AlphaPayController {
     // ═══════════════════════════════════════════════════════════════════════════
     @GetMapping("/api/webhooks/alphapay")
     public ResponseEntity<Void> browserReturn(@RequestParam(value = "reference", required = false) String reference) {
-        var target = returnUrl;
+        var target = alphaPaySettings.resolved().returnUrl();
         if (reference != null && REF_PATTERN.matcher(reference).matches()) {
-            target = returnUrl + (returnUrl.contains("?") ? "&" : "?") + "reference=" + reference;
+            target = target + (target.contains("?") ? "&" : "?") + "reference=" + reference;
         }
         return ResponseEntity.status(302).location(URI.create(target)).build();
     }
@@ -351,12 +359,19 @@ public class AlphaPayController {
     @SuppressWarnings("unchecked")
     private Map<String, Object> callAlphaPay(HttpMethod method, String path, Object body,
                                              boolean auth, String tag) {
+        // Resolve fresh on every call: a key saved in the panel minutes
+        // ago applies immediately, with no restart. Never call AlphaPay
+        // with an empty bearer token — fail closed instead.
+        var cfg = alphaPaySettings.resolved();
+        if (auth && (cfg.secretKey() == null || cfg.secretKey().isBlank())) {
+            throw ApiException.badRequest("AlphaPay is not configured yet — set the key in the super admin panel.");
+        }
         var spec = webClientBuilder.build()
                 .method(method)
-                .uri(baseUrl + path)
+                .uri(cfg.baseUrl() + path)
                 .accept(MediaType.APPLICATION_JSON);
 
-        if (auth) spec = spec.header(HttpHeaders.AUTHORIZATION, "Bearer " + secretKey);
+        if (auth) spec = spec.header(HttpHeaders.AUTHORIZATION, "Bearer " + cfg.secretKey());
         var withBody = body != null
                 ? spec.contentType(MediaType.APPLICATION_JSON).bodyValue(body)
                 : spec;
@@ -470,9 +485,12 @@ public class AlphaPayController {
     // ─── Signature ─────────────────────────────────────────────────────────────
 
     private boolean verifySignature(byte[] rawBody, String signature) {
+        // An empty secret can never validate a signature — fail closed.
+        String secret = alphaPaySettings.resolved().secretKey();
+        if (secret == null || secret.isBlank()) return false;
         try {
             var mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(secretKey.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             var computed = HexFormat.of().formatHex(mac.doFinal(rawBody));
             // constant-time compare
             return MessageDigest.isEqual(
