@@ -5,13 +5,13 @@ import com.speedbet.api.common.ApiException;
 import com.speedbet.api.common.ApiResponse;
 import com.speedbet.api.referral.ReferralService;
 import com.speedbet.api.superadmin.PaytellerSettingsService;
+import com.speedbet.api.superadmin.PlatformSettingsService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.wallet.TxKind;
 import com.speedbet.api.wallet.WalletService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
@@ -88,8 +88,10 @@ public class PaytellerDepositController {
     private final WebClient.Builder webClientBuilder;
     private final ObjectMapper      objectMapper;
     private final PaytellerSettingsService paytellerSettings;
+    private final PlatformSettingsService  platformSettings;
 
-    @Value("${app.platform.min-deposit-amount:1}") private BigDecimal minDeposit;
+    /** Min deposit from the super-admin platform amounts (env default lives in the settings service). */
+    private BigDecimal minDeposit() { return platformSettings.current().getMinDepositGhs(); }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Step 1 — Create payment
@@ -461,8 +463,8 @@ public class PaytellerDepositController {
         try { amount = new BigDecimal(raw.toString()); }
         catch (NumberFormatException e) { throw ApiException.badRequest("amount must be a valid number."); }
         amount = amount.setScale(2, RoundingMode.HALF_UP);
-        if (amount.compareTo(minDeposit) < 0)
-            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit);
+        if (amount.compareTo(minDeposit()) < 0)
+            throw ApiException.badRequest("Minimum deposit is GHS " + minDeposit());
         return amount;
     }
 
