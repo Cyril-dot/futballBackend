@@ -112,6 +112,17 @@ public class User implements UserDetails {
     @Builder.Default
     private boolean emailInvalid = false;
 
+    /**
+     * MSport only: true once Reoon has checked this account's stored
+     * email (at signup, at send-verification, or once at login for
+     * pre-existing accounts). Prevents the login-time check from
+     * burning a Reoon credit on every login — one check per account.
+     * Other skins never set this.
+     */
+    @Column(name = "email_reoon_checked")
+    @Builder.Default
+    private boolean emailReoonChecked = false;
+
     /** MSport only: the new email awaiting verification (see /api/auth/update-email-request). Null normally. */
     @JsonIgnore
     @Column(name = "pending_email")

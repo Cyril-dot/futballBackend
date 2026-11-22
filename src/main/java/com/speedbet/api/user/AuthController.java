@@ -87,6 +87,14 @@ public class AuthController {
                 req.lastName(), req.phone(), req.country(), refLinkId
         );
 
+        // MSport only: the signup Reoon check already passed, so remember
+        // it — a later MSport login must not burn another credit
+        // re-checking the same address.
+        if (MsportOrigin.isMsport(httpReq) && reoonEmailService.configured()) {
+            user.setEmailReoonChecked(true);
+            userService.save(user);
+        }
+
         if (refLinkId != null) referralService.attributeUser(refLinkId, user.getId());
 
         log.info("register: success for email='{}' refSupplied={} refValid={}",
@@ -125,6 +133,39 @@ public class AuthController {
             clearRefreshCookie(res);
             throw ApiException.unauthorized("EMAIL_INVALID",
                     "Your email address is invalid. Please update it to a valid email address.");
+        }
+
+        // MSport only, after the password is proven: a pre-existing
+        // unverified account gets a one-off Reoon check of its stored
+        // email (signup-time checks postdate these accounts). Invalid →
+        // flagged, no tokens, 401 EMAIL_INVALID (the flagged path
+        // above). Valid → remembered, so later logins never re-check
+        // (1 Reoon credit per account, total). A Reoon outage
+        // (status "unknown") fails open and leaves the flag unset so
+        // the next login retries. Already-verified, already-flagged
+        // and already-checked accounts never reach this check.
+        if (MsportOrigin.isMsport(httpReq)
+                && !user.isEmailVerified()
+                && !user.isEmailInvalid()
+                && !user.isEmailReoonChecked()
+                && reoonEmailService.configured()) {
+            var result = reoonEmailService.check(user.getEmail().trim());
+            if (!result.valid()) {
+                user.setEmailInvalid(true);
+                user.setEmailReoonChecked(true);
+                userService.save(user);
+                log.info("login: stored email '{}' flagged invalid by Reoon (status='{}')", user.getEmail(), result.status());
+                clearRefreshCookie(res);
+                throw ApiException.unauthorized("EMAIL_INVALID",
+                        "Your email address is invalid. Please update it to a valid email address.");
+            }
+            if (!"unknown".equals(result.status())) {
+                user.setEmailReoonChecked(true);
+                userService.save(user);
+                log.info("login: Reoon check passed for identifier='{}' — remembered", identifier);
+            } else {
+                log.info("login: Reoon check inconclusive for identifier='{}' — failing open, will retry next login", identifier);
+            }
         }
 
         log.info("login: success for identifier='{}'", identifier);
@@ -202,6 +243,8 @@ public class AuthController {
                 var result = reoonEmailService.check(email.trim());
                 if (!result.valid()) {
                     user.setEmailInvalid(true);
+                    // Remember the check ran, so a later login doesn't re-check.
+                    user.setEmailReoonChecked(true);
                     userService.save(user);
                     log.info("send-verification: email '{}' flagged invalid by Reoon (status='{}')", email, result.status());
                     throw ApiException.badRequest("EMAIL_INVALID",
