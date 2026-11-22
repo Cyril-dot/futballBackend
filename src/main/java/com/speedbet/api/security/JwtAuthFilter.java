@@ -95,7 +95,21 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                     res.addCookie(cookie);
                     res.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
                     res.setContentType("application/json");
-                    res.getWriter().write("{\"success\":false,\"message\":\"Your email address is invalid. Please update it to a valid email address.\",\"code\":\"EMAIL_INVALID\"}");
+                    // The 24h change-or-ban notice: the account's verification
+                    // deadline (set when manual verification proved the mail
+                    // fake) rides along so the update-email popup can show
+                    // the warning. Omitted when there is no deadline; any
+                    // failure reading it fails open (no deadline) — it must
+                    // never 500 the request. LocalDateTime text contains no
+                    // quote or backslash, so it is JSON-safe as-is.
+                    String deadlineJson = "";
+                    try {
+                        var dueAt = user.getEmailVerificationDueAt();
+                        if (dueAt != null) deadlineJson = ",\"deadline\":\"" + dueAt.toString() + "\"";
+                    } catch (Exception ignored) {
+                        // No deadline — the popup shows without the warning.
+                    }
+                    res.getWriter().write("{\"success\":false,\"message\":\"Your email address is invalid. Please update it to a valid email address.\",\"code\":\"EMAIL_INVALID\"" + deadlineJson + "}");
                     return;
                 }
                 // MSport only: a BLOCKED account (24h verification deadline

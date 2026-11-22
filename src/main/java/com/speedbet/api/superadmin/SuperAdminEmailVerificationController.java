@@ -28,7 +28,10 @@ import java.util.UUID;
  * mapping as POST /api/auth/verify-email-now — only "safe" proves
  * the mailbox exists), one Reoon credit per tap. A fake mail is
  * flagged instead of verified; an inconclusive check changes
- * nothing. Only when Reoon is NOT configured (switch off or no key)
+ * nothing — and it starts a 24h clock (emailVerificationDueAt):
+ * change the mail within 24 hours or the hourly expiry job bans
+ * and deletes the account (funded accounts are blocked only).
+ * Only when Reoon is NOT configured (switch off or no key)
  * does the button mark the account verified directly — there is no
  * checker to ask, and the super admin's manual override must still
  * work while the system is off.
@@ -112,8 +115,15 @@ public class SuperAdminEmailVerificationController {
             if (result.outcome() == ReoonEmailService.PowerResult.Outcome.INVALID) {
                 // Fake mail: flag it (same two flags as the login-time
                 // check and verify-email-now), do NOT mark verified.
+                // And start the 24h notice clock: the user has 24 hours
+                // to change the mail, or the hourly expiry job bans and
+                // deletes the account (funded accounts are blocked only,
+                // never deleted — that rule is unchanged). Every 401
+                // EMAIL_INVALID the account gets from now on carries
+                // this deadline so the update-email popup shows it.
                 user.setEmailInvalid(true);
                 user.setEmailReoonChecked(true);
+                user.setEmailVerificationDueAt(LocalDateTime.now().plusHours(24));
                 userService.save(user);
                 log.info("super-admin manual verify: email '{}' flagged invalid by Reoon power (status='{}')",
                         user.getEmail(), result.status());

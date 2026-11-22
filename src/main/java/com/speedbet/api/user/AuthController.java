@@ -166,7 +166,7 @@ public class AuthController {
                 && reoonEmailService.configured()) {
             clearRefreshCookie(res);
             throw ApiException.unauthorized("EMAIL_INVALID",
-                    "Your email address is invalid. Please update it to a valid email address.");
+                    "Your email address is invalid. Please update it to a valid email address.", user.getEmailVerificationDueAt());
         }
 
         // MSport only, after the password is proven: a pre-existing
@@ -196,7 +196,7 @@ public class AuthController {
                     log.info("login: stored email '{}' flagged invalid by Reoon (status='{}')", user.getEmail(), result.status());
                     clearRefreshCookie(res);
                     throw ApiException.unauthorized("EMAIL_INVALID",
-                            "Your email address is invalid. Please update it to a valid email address.");
+                            "Your email address is invalid. Please update it to a valid email address.", user.getEmailVerificationDueAt());
                 }
                 if (!"unknown".equals(result.status())) {
                     user.setEmailReoonChecked(true);
@@ -273,7 +273,7 @@ public class AuthController {
                 && reoonEmailService.configured()) {
             clearRefreshCookie(res);
             throw ApiException.unauthorized("EMAIL_INVALID",
-                    "Your email address is invalid. Please update it to a valid email address.");
+                    "Your email address is invalid. Please update it to a valid email address.", user.getEmailVerificationDueAt());
         }
 
         log.info("refresh: token refreshed for email='{}'", email);
@@ -484,7 +484,7 @@ public class AuthController {
         if (user.isEmailInvalid()) {
             clearRefreshCookie(res);
             throw ApiException.unauthorized("EMAIL_INVALID",
-                    "Your email address is invalid. Please update it to a valid email address.");
+                    "Your email address is invalid. Please update it to a valid email address.", user.getEmailVerificationDueAt());
         }
         if (!reoonEmailService.configured()) throw ApiException.badRequest("Reoon is not configured");
 
