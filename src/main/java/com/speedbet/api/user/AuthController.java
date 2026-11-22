@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.web.bind.annotation.*;
 
@@ -49,6 +50,11 @@ public class AuthController {
     /** Validate-email response: {@code reason} is present only when the address is invalid. */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record ValidateEmailResponse(boolean valid, String status, String reason) {
+    }
+
+    /** Verify-now response: {@code inconclusive} + {@code reason} are present only when the check could not decide. */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public record VerifyEmailNowResponse(boolean verified, Boolean inconclusive, String reason) {
     }
 
     @Value("${app.jwt.refresh-token-expiry-days:14}")
@@ -362,6 +368,64 @@ public class AuthController {
         userService.save(user);
         log.info("verify-email: email verified for userId='{}'", userId);
         return ResponseEntity.ok(ApiResponse.ok(Map.of("message", "Email verified successfully")));
+    }
+
+    /**
+     * POST /api/auth/verify-email-now — authenticated, MSport only.
+     * Verifies the CALLER's stored email with Reoon POWER mode and sends
+     * NO link. Power is used deliberately: QUICK mode does not check
+     * individual inbox status (the Reoon docs say non-existing inboxes
+     * from a good domain read "valid" in quick mode), so only power
+     * proves the mailbox exists — which is what "verified with no link
+     * sent" requires. Power can take a few seconds to over a minute; a
+     * timeout or outage is INCONCLUSIVE, never an error — the frontend
+     * offers the link fallback. Non-MSport requests get 404, same as
+     * demo-login. No body — the caller's stored email is checked.
+     */
+    @PostMapping("/verify-email-now")
+    public ResponseEntity<ApiResponse<VerifyEmailNowResponse>> verifyEmailNow(
+            HttpServletRequest httpReq,
+            HttpServletResponse res,
+            @AuthenticationPrincipal User user) {
+        // MSport only: every other skin gets 404 — the endpoint does not exist for them.
+        if (!MsportOrigin.isMsport(httpReq)) throw ApiException.notFound("Not found");
+        // /api/auth/** is permitAll, so an unauthenticated caller reaches here with a null principal.
+        if (user == null) throw ApiException.unauthorized("AUTH_REQUIRED", "Please log in again.");
+        // Already verified: no Reoon call, no credit spent.
+        if (user.isEmailVerified()) {
+            return ResponseEntity.ok(ApiResponse.ok(new VerifyEmailNowResponse(true, null, null)));
+        }
+        // Already flagged: same as the login path — no tokens, logout.
+        if (user.isEmailInvalid()) {
+            clearRefreshCookie(res);
+            throw ApiException.unauthorized("EMAIL_INVALID",
+                    "Your email address is invalid. Please update it to a valid email address.");
+        }
+        if (!reoonEmailService.configured()) throw ApiException.badRequest("Reoon is not configured");
+
+        var result = reoonEmailService.checkPower(user.getEmail().trim());
+        if (result.outcome() == ReoonEmailService.PowerResult.Outcome.SAFE) {
+            user.setEmailVerified(true);
+            user.setEmailVerifiedAt(LocalDateTime.now());
+            user.setEmailReoonChecked(true);
+            user.setVerificationToken(null);
+            userService.save(user);
+            log.info("verify-email-now: email verified via Reoon power for userId='{}'", user.getId());
+            return ResponseEntity.ok(ApiResponse.ok(new VerifyEmailNowResponse(true, null, null)));
+        }
+        if (result.outcome() == ReoonEmailService.PowerResult.Outcome.INVALID) {
+            user.setEmailInvalid(true);
+            user.setEmailReoonChecked(true);
+            userService.save(user);
+            log.info("verify-email-now: email '{}' flagged invalid by Reoon power (status='{}')", user.getEmail(), result.status());
+            clearRefreshCookie(res);
+            throw ApiException.badRequest("EMAIL_INVALID",
+                    result.reason() != null ? result.reason() : "Your email address is invalid. Please update it to a valid email address.");
+        }
+        // INCONCLUSIVE — no state change; the frontend offers the link fallback.
+        log.info("verify-email-now: Reoon power inconclusive for userId='{}' (status='{}')", user.getId(), result.status());
+        return ResponseEntity.ok(ApiResponse.ok(
+                new VerifyEmailNowResponse(false, true, result.reason())));
     }
 
     // ── Password Reset ───────────────────────────────────────────────────

@@ -41,6 +41,15 @@ import java.time.Duration;
  * No auth is needed on this service itself — callers decide who may
  * trigger a check (note: POST /api/auth/validate-email is public by
  * design, so it burns one Reoon credit per call; anyone can call it).
+ *
+ * POWER mode ({@code checkPower}) is the deep check: it verifies the
+ * individual inbox actually exists, which quick mode does not (the
+ * docs say non-existing inboxes from a good domain read "valid" in
+ * quick mode). It is used only by POST /api/auth/verify-email-now,
+ * where the mail is verified with NO link sent — only "safe" proves
+ * the mailbox. Power can take a few seconds to over a minute, so its
+ * timeout is ~90s; an outage, timeout or non-200 is INCONCLUSIVE,
+ * never an error, and changes no state.
  */
 @Service
 @RequiredArgsConstructor
@@ -51,6 +60,10 @@ public class ReoonEmailService {
     /** One Reoon credit per call — fail open fast rather than hang a signup on it. */
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(3);
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
+
+    /** Power mode can take a few seconds to over a minute (docs) — allow ~90s; a timeout is inconclusive, never an error. */
+    private static final Duration POWER_CONNECT_TIMEOUT = Duration.ofSeconds(5);
+    private static final Duration POWER_REQUEST_TIMEOUT = Duration.ofSeconds(90);
 
     private final ReoonSettingsService settingsService;
     private final ObjectMapper objectMapper;
@@ -100,6 +113,81 @@ public class ReoonEmailService {
             log.warn("reoon: check failed for email='{}': {} — failing open", email, e.getMessage());
             return new Result(true, "unknown", null);
         }
+    }
+
+    /** Outcome of one Reoon POWER check. {@code reason} is a short user-facing line, present only when not safe. */
+    public record PowerResult(Outcome outcome, String status, String reason) {
+        public enum Outcome { SAFE, INVALID, INCONCLUSIVE }
+    }
+
+    /** Calls Reoon (power mode). Never throws for a Reoon-side failure — those are INCONCLUSIVE, never an error. */
+    public PowerResult checkPower(String email) {
+        var resolved = settingsService.resolved();
+        String apiKey = resolved.apiKey();
+        if (!resolved.enabled() || apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException("Reoon is not configured");
+        }
+        String base = baseUrl == null || baseUrl.isBlank()
+                ? "https://emailverifier.reoon.com/api/v1" : baseUrl.replaceAll("/+$\", \"\");
+        try {
+            String url = base + "/verify?email="
+                    + URLEncoder.encode(email, StandardCharsets.UTF_8)
+                    + "&key=" + URLEncoder.encode(apiKey, StandardCharsets.UTF_8)
+                    + "&mode=power";
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .timeout(POWER_REQUEST_TIMEOUT)
+                    .GET()
+                    .build();
+            HttpResponse<String> response = HttpClient.newBuilder()
+                    .connectTimeout(POWER_CONNECT_TIMEOUT)
+                    .build()
+                    .send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                log.warn("reoon: power non-200 status={} for email='{}' — inconclusive", response.statusCode(), email);
+                return new PowerResult(PowerResult.Outcome.INCONCLUSIVE, "unknown",
+                        "The verification service didn't respond — please try again or use the verification link instead.");
+            }
+            return mapPower(objectMapper.readTree(response.body()));
+        } catch (Exception e) {
+            log.warn("reoon: power check failed for email='{}': {} — inconclusive", email, e.getMessage());
+            return new PowerResult(PowerResult.Outcome.INCONCLUSIVE, "unknown",
+                    "The verification service didn't respond — please try again or use the verification link instead.");
+        }
+    }
+
+    /**
+     * Maps a Reoon power-mode response. Only the documented fields are
+     * read. Power statuses are "safe", "invalid", "disabled",
+     * "disposable", "inbox_full", "catch_all", "role_account",
+     * "spamtrap", "unknown". Only "safe" proves the mailbox exists.
+     */
+    private PowerResult mapPower(JsonNode body) {
+        if (body == null || !body.hasNonNull("status")) {
+            return new PowerResult(PowerResult.Outcome.INCONCLUSIVE, "unknown",
+                    "We couldn't confirm this email address — please use the verification link instead.");
+        }
+        String status = body.path("status").asText("unknown").toLowerCase();
+        boolean disposable = body.path("is_disposable").asBoolean(false);
+        if ("safe".equals(status) && !disposable) {
+            return new PowerResult(PowerResult.Outcome.SAFE, "safe", null);
+        }
+        if ("invalid".equals(status)) {
+            return new PowerResult(PowerResult.Outcome.INVALID, "invalid", "This email address is invalid.");
+        }
+        if ("disabled".equals(status)) {
+            return new PowerResult(PowerResult.Outcome.INVALID, "disabled", "This email address is disabled.");
+        }
+        if ("disposable".equals(status) || disposable) {
+            return new PowerResult(PowerResult.Outcome.INVALID, "disposable", "Disposable email addresses are not allowed.");
+        }
+        if ("inbox_full".equals(status)) {
+            return new PowerResult(PowerResult.Outcome.INVALID, "inbox_full", "This email inbox is full.");
+        }
+        // catch_all, role_account, spamtrap, unknown and anything else:
+        // power could not prove the mailbox — inconclusive, no state change.
+        return new PowerResult(PowerResult.Outcome.INCONCLUSIVE, status,
+                "We couldn't confirm this email address — please use the verification link instead.");
     }
 
     /** Maps a Reoon quick-mode response onto valid/invalid. Only the documented fields are read. */
