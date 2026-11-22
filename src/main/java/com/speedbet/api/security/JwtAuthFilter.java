@@ -141,7 +141,7 @@ public class JwtAuthFilter extends OncePerRequestFilter {
      * finish money already in flight (verify / otp / submit-otp /
      * submit-birthday, cashouts, mines reveal, football settle),
      * webhooks (unauthenticated — this filter never sees them), and
-     * /api/user/upgrade-to-admin/*/init (an admin purchase, not a
+     * /api/user/upgrade-to-admin/{id}/init (an admin purchase, not a
      * deposit, bet or withdrawal).
      */
     private static boolean isMoneyInitiating(HttpServletRequest req) {
