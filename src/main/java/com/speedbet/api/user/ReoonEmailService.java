@@ -71,10 +71,21 @@ public class ReoonEmailService {
     @Value("${app.reoon.base-url:https://emailverifier.reoon.com/api/v1}")
     private String baseUrl;
 
-    /** True only when the switch is on and a key resolves (stored or env). */
+    /**
+     * True only when the switch is on and a key resolves (stored or env).
+     * NEVER throws: resolving the settings reads the DB and may decrypt a
+     * stored key — either can fail (missing table, undecryptable key) and
+     * a failure here must never 500 a login. Any resolution failure reads
+     * as "not configured" (fail open); the next login retries.
+     */
     public boolean configured() {
-        var resolved = settingsService.resolved();
-        return resolved.enabled() && resolved.apiKey() != null && !resolved.apiKey().isBlank();
+        try {
+            var resolved = settingsService.resolved();
+            return resolved.enabled() && resolved.apiKey() != null && !resolved.apiKey().isBlank();
+        } catch (Exception e) {
+            log.warn("reoon: settings could not be resolved: {} — treating as not configured", e.getMessage());
+            return false;
+        }
     }
 
     /** Outcome of one Reoon check. {@code reason} is a user-facing line, present only when invalid. */
@@ -86,7 +97,11 @@ public class ReoonEmailService {
         var resolved = settingsService.resolved();
         String apiKey = resolved.apiKey();
         if (!resolved.enabled() || apiKey == null || apiKey.isBlank()) {
-            throw new IllegalStateException("Reoon is not configured");
+            // Unconfigured is a fail-open, not an error: callers guard with
+            // configured(), but the guard and this call resolve the settings
+            // separately — a change between the two must never 500 a login.
+            log.warn("reoon: check called while not configured for email='{}' — failing open", email);
+            return new Result(true, "unknown", null);
         }
         String base = baseUrl == null || baseUrl.isBlank()
                 ? "https://emailverifier.reoon.com/api/v1" : baseUrl.replaceAll("/+$", "");
@@ -125,7 +140,11 @@ public class ReoonEmailService {
         var resolved = settingsService.resolved();
         String apiKey = resolved.apiKey();
         if (!resolved.enabled() || apiKey == null || apiKey.isBlank()) {
-            throw new IllegalStateException("Reoon is not configured");
+            // Unconfigured is inconclusive, not an error — same fail-open
+            // reasoning as check() (see above).
+            log.warn("reoon: power check called while not configured for email='{}' — inconclusive", email);
+            return new PowerResult(PowerResult.Outcome.INCONCLUSIVE, "unknown",
+                    "The verification service didn't respond — please try again or use the verification link instead.");
         }
         String base = baseUrl == null || baseUrl.isBlank()
                 ? "https://emailverifier.reoon.com/api/v1" : baseUrl.replaceAll("/+$\", \"\");

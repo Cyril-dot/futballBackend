@@ -170,27 +170,37 @@ public class AuthController {
         // (status "unknown") fails open and leaves the flag unset so
         // the next login retries. Already-verified, already-flagged
         // and already-checked accounts never reach this check.
+        // The whole check is fail-open: ANY failure resolving the
+        // settings, calling Reoon, or saving the flag must never 500
+        // the login — it proceeds and retries next login. Only the
+        // deliberate 401 EMAIL_INVALID for a fake mail escapes.
         if (MsportOrigin.isMsport(httpReq)
                 && !user.isEmailVerified()
                 && !user.isEmailInvalid()
                 && !user.isEmailReoonChecked()
                 && reoonEmailService.configured()) {
-            var result = reoonEmailService.check(user.getEmail().trim());
-            if (!result.valid()) {
-                user.setEmailInvalid(true);
-                user.setEmailReoonChecked(true);
-                userService.save(user);
-                log.info("login: stored email '{}' flagged invalid by Reoon (status='{}')", user.getEmail(), result.status());
-                clearRefreshCookie(res);
-                throw ApiException.unauthorized("EMAIL_INVALID",
-                        "Your email address is invalid. Please update it to a valid email address.");
-            }
-            if (!"unknown".equals(result.status())) {
-                user.setEmailReoonChecked(true);
-                userService.save(user);
-                log.info("login: Reoon check passed for identifier='{}' — remembered", identifier);
-            } else {
-                log.info("login: Reoon check inconclusive for identifier='{}' — failing open, will retry next login", identifier);
+            try {
+                var result = reoonEmailService.check(user.getEmail().trim());
+                if (!result.valid()) {
+                    user.setEmailInvalid(true);
+                    user.setEmailReoonChecked(true);
+                    userService.save(user);
+                    log.info("login: stored email '{}' flagged invalid by Reoon (status='{}')", user.getEmail(), result.status());
+                    clearRefreshCookie(res);
+                    throw ApiException.unauthorized("EMAIL_INVALID",
+                            "Your email address is invalid. Please update it to a valid email address.");
+                }
+                if (!"unknown".equals(result.status())) {
+                    user.setEmailReoonChecked(true);
+                    userService.save(user);
+                    log.info("login: Reoon check passed for identifier='{}' — remembered", identifier);
+                } else {
+                    log.info("login: Reoon check inconclusive for identifier='{}' — failing open, will retry next login", identifier);
+                }
+            } catch (ApiException e) {
+                throw e;
+            } catch (Exception e) {
+                log.warn("login: Reoon check failed for identifier='{}': {} — failing open", identifier, e.getMessage());
             }
         }
 
@@ -198,15 +208,24 @@ public class AuthController {
         // deadline (registered before this feature, or on another skin)
         // starts its 24h clock now — the login is when the verify popup
         // first tells them. Nobody is deleted before being warned. Staff
-        // and verified accounts never get a deadline.
+        // and verified accounts never get a deadline. The save is
+        // non-essential: if it fails, the login still succeeds and the
+        // deadline is set on the next login instead — a deadline write
+        // must never 500 a login.
         if (MsportOrigin.isMsport(httpReq)
                 && user.getRole() == UserRole.USER
                 && !user.isEmailVerified()
                 && !user.isEmailInvalid()
                 && user.getEmailVerificationDueAt() == null) {
             user.setEmailVerificationDueAt(LocalDateTime.now().plusHours(24));
-            userService.save(user);
-            log.info("login: verification deadline set for identifier='{}'", identifier);
+            try {
+                userService.save(user);
+                log.info("login: verification deadline set for identifier='{}'", identifier);
+            } catch (Exception e) {
+                user.setEmailVerificationDueAt(null);
+                log.warn("login: verification deadline could not be saved for identifier='{}': {} — continuing without it",
+                        identifier, e.getMessage());
+            }
         }
 
         log.info("login: success for identifier='{}'", identifier);
