@@ -5,6 +5,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -19,6 +20,16 @@ public interface UserRepository extends JpaRepository<User, UUID>,
     List<User> findByPhone(String phone);
 
     boolean existsByEmail(String email);
+
+    /**
+     * MSport only: non-staff accounts whose 24h email-verification
+     * deadline has passed while still unverified, and which the hourly
+     * expiry job has not already blocked. Used by
+     * EmailVerificationExpiryScheduler — staff never have a deadline,
+     * so the role filter is belt-and-braces.
+     */
+    List<User> findByRoleAndEmailVerificationDueAtBeforeAndEmailVerifiedFalseAndAccountBlockedFalse(
+            UserRole role, LocalDateTime now);
 
     // keep these — still used elsewhere
     List<User> findAllByRole(UserRole role);

@@ -3,6 +3,7 @@ package com.speedbet.api.affiliate;
 import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -14,6 +15,11 @@ import java.util.UUID;
 
 @Repository
 public interface AffiliateCommissionBalanceRepository extends JpaRepository<AffiliateCommissionBalance, UUID> {
+
+    /** MSport expiry job: remove a deleted account's (zero) commission balance row. */
+    @Modifying
+    @Query("delete from AffiliateCommissionBalance b where b.userId = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
 
     Optional<AffiliateCommissionBalance> findByUserId(UUID userId);
 

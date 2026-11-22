@@ -18,6 +18,11 @@ public interface FlutterwaveV4PendingChargeRepository
 
     Optional<FlutterwaveV4PendingCharge> findByReference(String reference);
 
+    /** MSport expiry job: drop a deleted account's abandoned in-flight charges. */
+    @Modifying
+    @Query("delete from FlutterwaveV4PendingCharge c where c.userId = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
+
     /**
      * Work queue for the reconciler: PENDING rows for this provider whose
      * backoff window has elapsed, oldest-due first.

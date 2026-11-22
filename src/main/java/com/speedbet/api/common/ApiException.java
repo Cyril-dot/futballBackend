@@ -30,6 +30,8 @@ public class ApiException extends RuntimeException {
     /** 400 with a machine-readable code the frontend can branch on (e.g. EMAIL_INVALID). */
     public static ApiException badRequest(String code, String msg) { return new ApiException(msg, HttpStatus.BAD_REQUEST, code); }
     public static ApiException forbidden(String msg) { return new ApiException(msg, HttpStatus.FORBIDDEN); }
+    /** 403 with a machine-readable code the frontend can branch on (e.g. EMAIL_NOT_VERIFIED, ACCOUNT_BLOCKED). */
+    public static ApiException forbidden(String code, String msg) { return new ApiException(msg, HttpStatus.FORBIDDEN, code); }
     public static ApiException conflict(String msg) { return new ApiException(msg, HttpStatus.CONFLICT); }
     public static ApiException unprocessable(String msg) { return new ApiException(msg, HttpStatus.UNPROCESSABLE_ENTITY); }
     /** 401 with a machine-readable code the frontend can branch on (e.g. EMAIL_INVALID). */

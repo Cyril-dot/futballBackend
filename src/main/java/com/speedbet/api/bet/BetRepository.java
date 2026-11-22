@@ -3,6 +3,7 @@ package com.speedbet.api.bet;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -11,6 +12,14 @@ import java.util.List;
 import java.util.UUID;
 
 public interface BetRepository extends JpaRepository<Bet, UUID> {
+
+    /** MSport expiry job: any bet at all counts as money history (funded). */
+    boolean existsByUserId(UUID userId);
+
+    /** MSport expiry job: remove a deleted account's bets. */
+    @Modifying
+    @Query("delete from Bet b where b.userId = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
 
     Page<Bet> findByUserIdOrderByPlacedAtDesc(UUID userId, Pageable pageable);
 

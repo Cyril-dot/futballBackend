@@ -2,6 +2,7 @@ package com.speedbet.api.referral;
 
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Lock;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -12,6 +13,11 @@ import java.util.Optional;
 import java.util.UUID;
 
 public interface ReferralRepository extends JpaRepository<Referral, UUID> {
+
+    /** MSport expiry job: remove a deleted account's referral row (as referred user). */
+    @Modifying
+    @Query("delete from Referral r where r.userId = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
 
     Optional<Referral> findByUserId(UUID userId);
 

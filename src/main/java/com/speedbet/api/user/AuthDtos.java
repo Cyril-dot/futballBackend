@@ -4,6 +4,8 @@ import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
+import java.time.LocalDateTime;
+
 public class AuthDtos {
 
     public record RegisterRequest(
@@ -62,7 +64,11 @@ public class AuthDtos {
             String role,
             String themePreference,
             boolean emailVerified,
-            boolean emailInvalid
+            boolean emailInvalid,
+            // MSport only: the 24h email-verification deadline (null once
+            // verified, and for staff / non-MSport accounts). The frontend
+            // shows the countdown from this value.
+            LocalDateTime emailVerificationDueAt
     ) {
         public static UserDto from(User u) {
             return new UserDto(
@@ -75,7 +81,8 @@ public class AuthDtos {
                     u.getRole().name(),
                     u.getThemePreference(),
                     u.isEmailVerified(),
-                    u.isEmailInvalid()
+                    u.isEmailInvalid(),
+                    u.getEmailVerificationDueAt()
             );
         }
     }

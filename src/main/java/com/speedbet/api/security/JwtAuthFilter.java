@@ -82,6 +82,46 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                     res.getWriter().write("{\"success\":false,\"message\":\"Your email address is invalid. Please update it to a valid email address.\",\"code\":\"EMAIL_INVALID\"}");
                     return;
                 }
+                // MSport only: a BLOCKED account (24h verification deadline
+                // passed) is logged out — every authenticated call from
+                // MSport answers 403 ACCOUNT_BLOCKED and the refresh cookie
+                // is cleared, so the frontend drops the session. Skipped
+                // for /api/auth/** (login must stay reachable to report
+                // the block) and for staff. Other skins never match.
+                if (userDetails instanceof User user
+                        && user.isAccountBlocked()
+                        && user.getRole() == UserRole.USER
+                        && !req.getRequestURI().startsWith("/api/auth/")
+                        && MsportOrigin.isMsport(req)) {
+                    var cookie = new Cookie("refreshToken", "");
+                    cookie.setHttpOnly(true);
+                    cookie.setPath("/api/auth/refresh");
+                    cookie.setMaxAge(0);
+                    res.addCookie(cookie);
+                    res.setStatus(HttpServletResponse.SC_FORBIDDEN);
+                    res.setContentType("application/json");
+                    res.getWriter().write("{\"success\":false,\"message\":\"Your account is blocked because your email was not verified within 24 hours. Verify your email to restore access.\",\"code\":\"ACCOUNT_BLOCKED\"}");
+                    return;
+                }
+                // MSport only: an UNVERIFIED player may not move money —
+                // deposit inits, bet placement and withdrawals answer 403
+                // EMAIL_NOT_VERIFIED. Reads, cashouts, OTP/verify
+                // continuations and webhooks pass through (they finish
+                // money already in flight). Flagged accounts already got
+                // 401 EMAIL_INVALID above; blocked accounts got 403
+                // ACCOUNT_BLOCKED. Staff are exempt; other skins never
+                // match the MSport-origin check.
+                if (userDetails instanceof User user
+                        && !user.isEmailVerified()
+                        && !user.isEmailInvalid()
+                        && user.getRole() == UserRole.USER
+                        && MsportOrigin.isMsport(req)
+                        && isMoneyInitiating(req)) {
+                    res.setStatus(HttpServletResponse.SC_FORBIDDEN);
+                    res.setContentType("application/json");
+                    res.getWriter().write("{\"success\":false,\"message\":\"Verify your email to deposit, place bets or withdraw.\",\"code\":\"EMAIL_NOT_VERIFIED\"}");
+                    return;
+                }
                 var auth = new UsernamePasswordAuthenticationToken(
                         userDetails, null, userDetails.getAuthorities());
                 auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(req));
@@ -89,5 +129,32 @@ public class JwtAuthFilter extends OncePerRequestFilter {
             }
         }
         chain.doFilter(req, res);
+    }
+
+    /**
+     * True when this POST starts a money movement — the only calls an
+     * unverified MSport player is blocked from. Deposit inits on every
+     * gateway (all end in /init, plus the AkwaPay hosted /checkout and
+     * the Stripe /intent), player-submitted manual deposits, both
+     * withdrawal endpoints, sportsbook bet placement and casino stakes
+     * (/play, /start). Deliberately NOT matched: continuations that
+     * finish money already in flight (verify / otp / submit-otp /
+     * submit-birthday, cashouts, mines reveal, football settle),
+     * webhooks (unauthenticated — this filter never sees them), and
+     * /api/user/upgrade-to-admin/*/init (an admin purchase, not a
+     * deposit, bet or withdrawal).
+     */
+    private static boolean isMoneyInitiating(HttpServletRequest req) {
+        if (!"POST".equalsIgnoreCase(req.getMethod())) return false;
+        String uri = req.getRequestURI();
+        if (uri.startsWith("/api/wallet/deposit/")
+                && (uri.contains("/init") || uri.endsWith("/checkout") || uri.endsWith("/intent"))) return true;
+        if (uri.equals("/api/wallet/simple-deposits")
+                || uri.equals("/api/wallet/bank-deposits")
+                || uri.equals("/api/wallet/binance-deposits")) return true;
+        if (uri.equals("/api/wallet/withdrawals") || uri.equals("/api/wallet/withdraw")) return true;
+        if (uri.equals("/api/bets")) return true;
+        if (uri.startsWith("/api/games/") && (uri.endsWith("/play") || uri.endsWith("/start"))) return true;
+        return false;
     }
 }

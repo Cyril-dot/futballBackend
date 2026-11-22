@@ -3,10 +3,21 @@ package com.speedbet.api.wallet;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 
 import java.util.UUID;
 
 public interface BankDepositRepository extends JpaRepository<BankDeposit, UUID> {
+
+    /** MSport expiry job: a pending manual deposit is money in flight (funded). */
+    boolean existsByUserId(UUID userId);
+
+    /** MSport expiry job: remove a deleted account's manual deposits. */
+    @Modifying
+    @Query("delete from BankDeposit d where d.userId = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
 
     /** All deposits for a specific user, newest first */
     Page<BankDeposit> findByUserIdOrderByCreatedAtDesc(UUID userId, Pageable pageable);

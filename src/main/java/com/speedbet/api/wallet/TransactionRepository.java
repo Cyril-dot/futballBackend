@@ -4,6 +4,7 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -20,6 +21,11 @@ public interface TransactionRepository
     // ── Existing (unchanged) ──────────────────────────────────────────────────
 
     Page<Transaction> findByWalletIdOrderByCreatedAtDesc(UUID walletId, Pageable pageable);
+
+    /** MSport expiry job: drop a deleted account's ledger rows with its wallet. */
+    @Modifying
+    @Query("delete from Transaction t where t.walletId = :walletId")
+    void deleteByWalletId(@Param("walletId") UUID walletId);
 
     @Query("SELECT COALESCE(SUM(t.amount), 0) FROM Transaction t " +
             "WHERE t.walletId = :walletId AND t.kind = :kind AND t.createdAt >= :since")

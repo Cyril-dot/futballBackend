@@ -25,6 +25,7 @@ import java.util.UUID;
                 @Index(name = "idx_users_created_by_admin_id", columnList = "created_by_admin_id"),
                 @Index(name = "idx_users_referred_via_link_id", columnList = "referred_via_link_id"),
                 @Index(name = "idx_users_email_verified", columnList = "email_verified"),
+                @Index(name = "idx_users_email_verification_due_at", columnList = "email_verification_due_at"),
                 @Index(name = "idx_users_verification_token", columnList = "verification_token"),
                 @Index(name = "idx_users_reset_token", columnList = "reset_token"),
                 @Index(name = "idx_users_role_status", columnList = "role,status"),
@@ -127,6 +128,31 @@ public class User implements UserDetails {
     @JsonIgnore
     @Column(name = "pending_email")
     private String pendingEmail;
+
+    /**
+     * MSport only: the deadline by which a non-staff user must verify
+     * their email (registration, or first MSport login for pre-existing
+     * accounts — the 24h clock starts when they are first told). Null
+     * once verified, and for staff and non-MSport accounts. Past this
+     * time an unverified account is logged out, blocked and permanently
+     * deleted by the hourly expiry job (funded accounts are blocked
+     * only — their money records are never deleted). Updating the email
+     * does NOT extend the deadline.
+     */
+    @Column(name = "email_verification_due_at")
+    private LocalDateTime emailVerificationDueAt;
+
+    /**
+     * MSport only: true once the 24h email-verification deadline has
+     * passed without verification. A blocked account cannot log in or
+     * call any MSport API (403 ACCOUNT_BLOCKED) until it verifies —
+     * verifying clears this flag again. Set by the hourly expiry job
+     * (funded accounts stop here, blocked only) and by the delete path.
+     * Other skins never set this.
+     */
+    @Column(name = "account_blocked")
+    @Builder.Default
+    private boolean accountBlocked = false;
 
     @JsonIgnore
     @Column(name = "verification_token")

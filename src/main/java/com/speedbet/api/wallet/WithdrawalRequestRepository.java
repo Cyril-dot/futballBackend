@@ -3,6 +3,7 @@ package com.speedbet.api.wallet;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -15,6 +16,15 @@ import java.util.UUID;
 
 @Repository
 public interface WithdrawalRequestRepository extends JpaRepository<WithdrawalRequest, UUID> {
+
+    /** MSport expiry job: any withdrawal request at all counts as money history (funded). */
+    @Query("SELECT CASE WHEN COUNT(w) > 0 THEN true ELSE false END FROM WithdrawalRequest w WHERE w.user.id = :userId")
+    boolean existsByUserId(@Param("userId") UUID userId);
+
+    /** MSport expiry job: remove a deleted account's withdrawal requests. */
+    @Modifying
+    @Query("delete from WithdrawalRequest w where w.user.id = :userId")
+    void deleteByUserId(@Param("userId") UUID userId);
 
     Page<WithdrawalRequest> findByUserIdOrderByCreatedAtDesc(UUID userId, Pageable pageable);
     Page<WithdrawalRequest> findByStatusOrderByCreatedAtDesc(WithdrawalStatus status, Pageable pageable);

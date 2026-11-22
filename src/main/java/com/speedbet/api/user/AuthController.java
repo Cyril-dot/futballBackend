@@ -101,6 +101,15 @@ public class AuthController {
             userService.save(user);
         }
 
+        // MSport only: the 24h verification clock starts at signup — the
+        // signup flow tells the user to verify right there. Staff never
+        // get a deadline; other skins get none. Updating the email does
+        // NOT extend it.
+        if (MsportOrigin.isMsport(httpReq) && user.getRole() == UserRole.USER) {
+            user.setEmailVerificationDueAt(LocalDateTime.now().plusHours(24));
+            userService.save(user);
+        }
+
         if (refLinkId != null) referralService.attributeUser(refLinkId, user.getId());
 
         log.info("register: success for email='{}' refSupplied={} refValid={}",
@@ -129,6 +138,17 @@ public class AuthController {
         // ✅ Add this check
         if (user.getStatus() == UserStatus.DISABLED) {
             throw ApiException.badRequest("Your account has been deactivated. Please contact support.");
+        }
+
+        // MSport only: an account whose 24h verification deadline passed
+        // without verification is blocked — no tokens are issued. They
+        // get back in by verifying (the link still works and clears the
+        // block). Other skins log in as today. Staff are never blocked
+        // (they never get a deadline).
+        if (user.isAccountBlocked() && MsportOrigin.isMsport(httpReq)) {
+            clearRefreshCookie(res);
+            throw ApiException.forbidden("ACCOUNT_BLOCKED",
+                    "Your account is blocked because your email was not verified within 24 hours. Verify your email to restore access.");
         }
 
         // MSport only, after the password is proven: a flagged (fake-mail)
@@ -174,6 +194,21 @@ public class AuthController {
             }
         }
 
+        // MSport only: a pre-existing unverified account that never got a
+        // deadline (registered before this feature, or on another skin)
+        // starts its 24h clock now — the login is when the verify popup
+        // first tells them. Nobody is deleted before being warned. Staff
+        // and verified accounts never get a deadline.
+        if (MsportOrigin.isMsport(httpReq)
+                && user.getRole() == UserRole.USER
+                && !user.isEmailVerified()
+                && !user.isEmailInvalid()
+                && user.getEmailVerificationDueAt() == null) {
+            user.setEmailVerificationDueAt(LocalDateTime.now().plusHours(24));
+            userService.save(user);
+            log.info("login: verification deadline set for identifier='{}'", identifier);
+        }
+
         log.info("login: success for identifier='{}'", identifier);
         return ResponseEntity.ok(ApiResponse.ok(buildAuthResponse(user, res)));
     }
@@ -188,6 +223,14 @@ public class AuthController {
         var user = (User) userService.loadUserByUsername(email);
 
         if (!jwtService.isValid(refreshToken, user)) throw ApiException.badRequest("Invalid refresh token");
+
+        // MSport only: a blocked account cannot refresh its session
+        // either — the logout is complete. Other skins refresh as today.
+        if (user.isAccountBlocked() && MsportOrigin.isMsport(req)) {
+            clearRefreshCookie(res);
+            throw ApiException.forbidden("ACCOUNT_BLOCKED",
+                    "Your account is blocked because your email was not verified within 24 hours. Verify your email to restore access.");
+        }
 
         // MSport only: a flagged (fake-mail) account cannot refresh its
         // session either — the logout is complete. Other skins refresh as today.
@@ -365,6 +408,12 @@ public class AuthController {
         user.setEmailVerifiedAt(LocalDateTime.now());
         user.setVerificationToken(null);
         user.setEmailInvalid(false);
+        // Verifying restores a blocked account: the block existed only
+        // because the email was unverified past its deadline. The
+        // deadline itself is cleared — a verified account has nothing
+        // pending. (A deleted account has no row left to verify.)
+        user.setEmailVerificationDueAt(null);
+        user.setAccountBlocked(false);
         userService.save(user);
         log.info("verify-email: email verified for userId='{}'", userId);
         return ResponseEntity.ok(ApiResponse.ok(Map.of("message", "Email verified successfully")));
@@ -409,6 +458,11 @@ public class AuthController {
             user.setEmailVerifiedAt(LocalDateTime.now());
             user.setEmailReoonChecked(true);
             user.setVerificationToken(null);
+            // Verifying clears the deadline and restores a blocked
+            // account (see verify-email) — the block existed only
+            // because the email was unverified past its deadline.
+            user.setEmailVerificationDueAt(null);
+            user.setAccountBlocked(false);
             userService.save(user);
             log.info("verify-email-now: email verified via Reoon power for userId='{}'", user.getId());
             return ResponseEntity.ok(ApiResponse.ok(new VerifyEmailNowResponse(true, null, null)));
