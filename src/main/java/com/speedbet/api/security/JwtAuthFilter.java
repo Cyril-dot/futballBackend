@@ -1,6 +1,7 @@
 package com.speedbet.api.security;
 
 import com.speedbet.api.common.MsportOrigin;
+import com.speedbet.api.user.ReoonEmailService;
 import com.speedbet.api.user.User;
 import com.speedbet.api.user.UserRole;
 import io.jsonwebtoken.ExpiredJwtException;
@@ -27,6 +28,7 @@ public class JwtAuthFilter extends OncePerRequestFilter {
 
     private final JwtService jwtService;
     private final UserDetailsService userDetailsService;
+    private final ReoonEmailService reoonEmailService;
 
     @Override
     protected void doFilterInternal(@NonNull HttpServletRequest req,
@@ -58,6 +60,19 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
             var userDetails = userDetailsService.loadUserByUsername(username);
             if (jwtService.isValid(token, userDetails)) {
+                // The whole verification system is dormant when Reoon is
+                // off (switch off or no key): flagged, blocked and
+                // unverified accounts are not enforced at all — they use
+                // the site as normal, and enforcement resumes the moment
+                // the switch goes back on. configured() never throws, but
+                // any failure reading the setting fails OPEN (dormant) —
+                // it must never 500 a request.
+                boolean verificationOn;
+                try {
+                    verificationOn = reoonEmailService.configured();
+                } catch (Exception e) {
+                    verificationOn = false;
+                }
                 // MSport only: a player account flagged with a fake email is
                 // logged out — every authenticated call from MSport answers
                 // 401 EMAIL_INVALID and the refresh cookie is cleared, so
@@ -66,8 +81,9 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                 // must stay reachable) and for staff (an admin must never
                 // be locked out of the panel by a flag). Other skins never
                 // match the MSport-origin check, so they pass through
-                // untouched.
-                if (userDetails instanceof User user
+                // untouched. Skipped entirely while verification is off.
+                if (verificationOn
+                        && userDetails instanceof User user
                         && user.isEmailInvalid()
                         && user.getRole() == UserRole.USER
                         && !req.getRequestURI().startsWith("/api/auth/")
@@ -88,7 +104,9 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                 // is cleared, so the frontend drops the session. Skipped
                 // for /api/auth/** (login must stay reachable to report
                 // the block) and for staff. Other skins never match.
-                if (userDetails instanceof User user
+                // Skipped entirely while verification is off.
+                if (verificationOn
+                        && userDetails instanceof User user
                         && user.isAccountBlocked()
                         && user.getRole() == UserRole.USER
                         && !req.getRequestURI().startsWith("/api/auth/")
@@ -110,8 +128,11 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                 // money already in flight). Flagged accounts already got
                 // 401 EMAIL_INVALID above; blocked accounts got 403
                 // ACCOUNT_BLOCKED. Staff are exempt; other skins never
-                // match the MSport-origin check.
-                if (userDetails instanceof User user
+                // match the MSport-origin check. Skipped entirely while
+                // verification is off — unverified players can deposit,
+                // bet and withdraw while off.
+                if (verificationOn
+                        && userDetails instanceof User user
                         && !user.isEmailVerified()
                         && !user.isEmailInvalid()
                         && user.getRole() == UserRole.USER

@@ -31,6 +31,15 @@ public interface UserRepository extends JpaRepository<User, UUID>,
     List<User> findByRoleAndEmailVerificationDueAtBeforeAndEmailVerifiedFalseAndAccountBlockedFalse(
             UserRole role, LocalDateTime now);
 
+    /**
+     * MSport only: unverified accounts, newest first — the super-admin
+     * manual-verify tab (SuperAdminEmailVerificationController). The
+     * list spans all skins (User carries no skin marker); the tab is
+     * where the super admin finds an unverified account and verifies
+     * it by hand.
+     */
+    Page<User> findByEmailVerifiedFalse(Pageable pageable);
+
     // keep these — still used elsewhere
     List<User> findAllByRole(UserRole role);
     long countByRole(UserRole role);

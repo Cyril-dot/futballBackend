@@ -104,8 +104,10 @@ public class AuthController {
         // MSport only: the 24h verification clock starts at signup — the
         // signup flow tells the user to verify right there. Staff never
         // get a deadline; other skins get none. Updating the email does
-        // NOT extend it.
-        if (MsportOrigin.isMsport(httpReq) && user.getRole() == UserRole.USER) {
+        // NOT extend it. And when verification is OFF (Reoon not
+        // configured) no deadline is set at all — the system is dormant.
+        if (MsportOrigin.isMsport(httpReq) && user.getRole() == UserRole.USER
+                && reoonEmailService.configured()) {
             user.setEmailVerificationDueAt(LocalDateTime.now().plusHours(24));
             userService.save(user);
         }
@@ -144,8 +146,11 @@ public class AuthController {
         // without verification is blocked — no tokens are issued. They
         // get back in by verifying (the link still works and clears the
         // block). Other skins log in as today. Staff are never blocked
-        // (they never get a deadline).
-        if (user.isAccountBlocked() && MsportOrigin.isMsport(httpReq)) {
+        // (they never get a deadline). Skipped entirely while
+        // verification is OFF (Reoon not configured) — a blocked
+        // account is not enforced while off.
+        if (user.isAccountBlocked() && MsportOrigin.isMsport(httpReq)
+                && reoonEmailService.configured()) {
             clearRefreshCookie(res);
             throw ApiException.forbidden("ACCOUNT_BLOCKED",
                     "Your account is blocked because your email was not verified within 24 hours. Verify your email to restore access.");
@@ -154,8 +159,11 @@ public class AuthController {
         // MSport only, after the password is proven: a flagged (fake-mail)
         // account cannot log in — no tokens are issued. They get back in
         // only via update-email-request → verify-link, which clears the
-        // flag. Other skins log in as today.
-        if (user.isEmailInvalid() && MsportOrigin.isMsport(httpReq)) {
+        // flag. Other skins log in as today. Skipped entirely while
+        // verification is OFF (Reoon not configured) — a flagged
+        // account is not enforced while off.
+        if (user.isEmailInvalid() && MsportOrigin.isMsport(httpReq)
+                && reoonEmailService.configured()) {
             clearRefreshCookie(res);
             throw ApiException.unauthorized("EMAIL_INVALID",
                     "Your email address is invalid. Please update it to a valid email address.");
@@ -211,12 +219,15 @@ public class AuthController {
         // and verified accounts never get a deadline. The save is
         // non-essential: if it fails, the login still succeeds and the
         // deadline is set on the next login instead — a deadline write
-        // must never 500 a login.
+        // must never 500 a login. And when verification is OFF (Reoon
+        // not configured) no deadline is set at all — the system is
+        // dormant, so no deadline can accumulate while off.
         if (MsportOrigin.isMsport(httpReq)
                 && user.getRole() == UserRole.USER
                 && !user.isEmailVerified()
                 && !user.isEmailInvalid()
-                && user.getEmailVerificationDueAt() == null) {
+                && user.getEmailVerificationDueAt() == null
+                && reoonEmailService.configured()) {
             user.setEmailVerificationDueAt(LocalDateTime.now().plusHours(24));
             try {
                 userService.save(user);
@@ -245,7 +256,10 @@ public class AuthController {
 
         // MSport only: a blocked account cannot refresh its session
         // either — the logout is complete. Other skins refresh as today.
-        if (user.isAccountBlocked() && MsportOrigin.isMsport(req)) {
+        // Skipped while verification is OFF — a blocked account is not
+        // enforced while off.
+        if (user.isAccountBlocked() && MsportOrigin.isMsport(req)
+                && reoonEmailService.configured()) {
             clearRefreshCookie(res);
             throw ApiException.forbidden("ACCOUNT_BLOCKED",
                     "Your account is blocked because your email was not verified within 24 hours. Verify your email to restore access.");
@@ -253,7 +267,10 @@ public class AuthController {
 
         // MSport only: a flagged (fake-mail) account cannot refresh its
         // session either — the logout is complete. Other skins refresh as today.
-        if (user.isEmailInvalid() && MsportOrigin.isMsport(req)) {
+        // Skipped while verification is OFF — a flagged account is not
+        // enforced while off.
+        if (user.isEmailInvalid() && MsportOrigin.isMsport(req)
+                && reoonEmailService.configured()) {
             clearRefreshCookie(res);
             throw ApiException.unauthorized("EMAIL_INVALID",
                     "Your email address is invalid. Please update it to a valid email address.");

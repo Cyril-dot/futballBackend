@@ -43,10 +43,27 @@ public class EmailVerificationExpiryScheduler {
 
     private final UserRepository userRepo;
     private final EmailVerificationExpiryService expiryService;
+    private final ReoonEmailService reoonEmailService;
 
     /** Hourly: expire MSport accounts past their 24h verification deadline. */
     @Scheduled(fixedRate = 3600000)
     public void expireUnverifiedAccounts() {
+        // The whole verification system is dormant when Reoon is off
+        // (switch off or no key): no blocks, no deletions. Flags and
+        // deadlines already in the DB stay as-is — enforcement resumes
+        // the moment the switch goes back on. configured() never
+        // throws, but any failure reading the setting fails OPEN
+        // (dormant) — a scheduler run must never die on it.
+        boolean verificationOn;
+        try {
+            verificationOn = reoonEmailService.configured();
+        } catch (Exception e) {
+            verificationOn = false;
+        }
+        if (!verificationOn) {
+            log.info("email-expiry: verification off — skipping run (no blocks, no deletions).");
+            return;
+        }
         List<User> candidates = userRepo
                 .findByRoleAndEmailVerificationDueAtBeforeAndEmailVerifiedFalseAndAccountBlockedFalse(
                         UserRole.USER, LocalDateTime.now());
