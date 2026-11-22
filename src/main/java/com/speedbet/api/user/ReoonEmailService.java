@@ -147,7 +147,7 @@ public class ReoonEmailService {
                     "The verification service didn't respond — please try again or use the verification link instead.");
         }
         String base = baseUrl == null || baseUrl.isBlank()
-                ? "https://emailverifier.reoon.com/api/v1" : baseUrl.replaceAll("/+$\", \"\");
+                ? "https://emailverifier.reoon.com/api/v1" : baseUrl.replaceAll("/+$", "");
         try {
             String url = base + "/verify?email="
                     + URLEncoder.encode(email, StandardCharsets.UTF_8)
