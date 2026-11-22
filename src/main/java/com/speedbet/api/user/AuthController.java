@@ -158,10 +158,10 @@ public class AuthController {
 
         // MSport only, after the password is proven: a flagged (fake-mail)
         // account cannot log in — no tokens are issued. They get back in
-        // only via update-email-request → verify-link, which clears the
-        // flag. Other skins log in as today. Skipped entirely while
-        // verification is OFF (Reoon not configured) — a flagged
-        // account is not enforced while off.
+        // only via update-email-request, which verifies the new address
+        // with Reoon and clears the flag. Other skins log in as today.
+        // Skipped entirely while verification is OFF (Reoon not
+        // configured) — a flagged account is not enforced while off.
         if (user.isEmailInvalid() && MsportOrigin.isMsport(httpReq)
                 && reoonEmailService.configured()) {
             clearRefreshCookie(res);
@@ -369,13 +369,19 @@ public class AuthController {
      * POST /api/auth/update-email-request {email, newEmail} — public, the
      * recovery step for a flagged (fake-mail) account after the backend
      * logged it out of MSport. Only flagged accounts may use it, so the
-     * endpoint cannot be used to change a healthy account's email. The
-     * new address is Reoon-checked when configured, stored as
-     * pendingEmail, and a verification mail goes to the NEW address —
-     * the account email only changes when that link is verified.
+     * endpoint cannot be used to change a healthy account's email. NO
+     * MAIL IS SENT — the new address is verified with Reoon instead: a
+     * QUICK check first (invalid/disposable → 400 EMAIL_INVALID; any
+     * other outcome fails open to the power step), then a POWER check,
+     * which proves the individual inbox exists. Only "safe" applies the
+     * new address, and it applies immediately — emailVerified is set on
+     * the spot and the flag, deadline and block are cleared. One QUICK
+     * credit + one POWER credit per call. When Reoon is not configured
+     * the endpoint refuses (400 "Reoon is not configured") rather than
+     * marking a mail verified with no check at all.
      */
     @PostMapping("/update-email-request")
-    public ResponseEntity<ApiResponse<Map<String, String>>> updateEmailRequest(
+    public ResponseEntity<ApiResponse<VerifyEmailNowResponse>> updateEmailRequest(
             @RequestBody Map<String, String> req) {
         var email = req.get("email");
         var newEmail = req.get("newEmail");
@@ -398,22 +404,50 @@ public class AuthController {
         if (userService.existsByEmail(newEmail)) {
             throw ApiException.conflict("Email already registered");
         }
-        if (reoonEmailService.configured()) {
-            var result = reoonEmailService.check(newEmail);
-            if (!result.valid()) {
-                throw ApiException.badRequest("EMAIL_INVALID",
-                        result.reason() != null ? result.reason() : "Please enter a valid email address.");
-            }
+        if (!reoonEmailService.configured()) {
+            throw ApiException.badRequest("Reoon is not configured");
         }
 
-        var token = UUID.randomUUID().toString();
-        user.setPendingEmail(newEmail);
-        user.setVerificationToken(token);
-        userService.save(user);
+        // QUICK first: cheap reject of fake/disposable addresses. Any
+        // other outcome (spamtrap, outage, timeout) fails open — the
+        // power step decides, never a third-party blip.
+        var quick = reoonEmailService.check(newEmail);
+        if (!quick.valid()) {
+            throw ApiException.badRequest("EMAIL_INVALID",
+                    quick.reason() != null ? quick.reason() : "Please enter a valid email address.");
+        }
 
-        emailService.sendVerificationEmail(newEmail, user.getFirstName(), user.getId(), token);
-        log.info("update-email-request: verification mail sent to new email for userId='{}'", user.getId());
-        return ResponseEntity.ok(ApiResponse.ok(Map.of("message", "Verification email sent to your new address")));
+        var power = reoonEmailService.checkPower(newEmail);
+        if (power.outcome() == ReoonEmailService.PowerResult.Outcome.SAFE) {
+            // The new address may have been taken since the conflict
+            // check above — re-check before applying, the same guard
+            // the old link flow applied when the link was clicked.
+            if (!newEmail.equalsIgnoreCase(user.getEmail()) && userService.existsByEmail(newEmail)) {
+                throw ApiException.conflict("That email address is already registered.");
+            }
+            user.setEmail(newEmail);
+            user.setPendingEmail(null);
+            user.setEmailVerified(true);
+            user.setEmailVerifiedAt(LocalDateTime.now());
+            user.setEmailReoonChecked(true);
+            user.setVerificationToken(null);
+            user.setEmailInvalid(false);
+            user.setEmailVerificationDueAt(null);
+            user.setAccountBlocked(false);
+            userService.save(user);
+            log.info("update-email-request: email updated + verified via Reoon power for userId='{}'", user.getId());
+            return ResponseEntity.ok(ApiResponse.ok(new VerifyEmailNowResponse(true, null, null)));
+        }
+        if (power.outcome() == ReoonEmailService.PowerResult.Outcome.INVALID) {
+            // Flag stays; the old email is untouched.
+            log.info("update-email-request: new email '{}' flagged invalid by Reoon power (status='{}')", newEmail, power.status());
+            throw ApiException.badRequest("EMAIL_INVALID",
+                    power.reason() != null ? power.reason() : "Please enter a valid email address.");
+        }
+        // INCONCLUSIVE — no state change; the caller can retry.
+        log.info("update-email-request: Reoon power inconclusive for new email '{}' (status='{}')", newEmail, power.status());
+        return ResponseEntity.ok(ApiResponse.ok(
+                new VerifyEmailNowResponse(false, true, power.reason())));
     }
 
     @PostMapping("/verify-email")
@@ -464,7 +498,7 @@ public class AuthController {
      * proves the mailbox exists — which is what "verified with no link
      * sent" requires. Power can take a few seconds to over a minute; a
      * timeout or outage is INCONCLUSIVE, never an error — the frontend
-     * offers the link fallback. Non-MSport requests get 404, same as
+     * offers a retry. Non-MSport requests get 404, same as
      * demo-login. No body — the caller's stored email is checked.
      */
     @PostMapping("/verify-email-now")
@@ -512,7 +546,7 @@ public class AuthController {
             throw ApiException.badRequest("EMAIL_INVALID",
                     result.reason() != null ? result.reason() : "Your email address is invalid. Please update it to a valid email address.");
         }
-        // INCONCLUSIVE — no state change; the frontend offers the link fallback.
+        // INCONCLUSIVE — no state change; the frontend offers a retry.
         log.info("verify-email-now: Reoon power inconclusive for userId='{}' (status='{}')", user.getId(), result.status());
         return ResponseEntity.ok(ApiResponse.ok(
                 new VerifyEmailNowResponse(false, true, result.reason())));
