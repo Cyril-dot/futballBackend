@@ -111,7 +111,9 @@ public class User implements UserDetails {
      */
     @Column(name = "email_invalid")
     @Builder.Default
-    private boolean emailInvalid = false;
+    @Getter(AccessLevel.NONE)
+    @Setter(AccessLevel.NONE)
+    private Boolean emailInvalid = false;
 
     /**
      * MSport only: true once Reoon has checked this account's stored
@@ -122,7 +124,9 @@ public class User implements UserDetails {
      */
     @Column(name = "email_reoon_checked")
     @Builder.Default
-    private boolean emailReoonChecked = false;
+    @Getter(AccessLevel.NONE)
+    @Setter(AccessLevel.NONE)
+    private Boolean emailReoonChecked = false;
 
     /** MSport only: the new email awaiting verification (see /api/auth/update-email-request). Null normally. */
     @JsonIgnore
@@ -152,7 +156,9 @@ public class User implements UserDetails {
      */
     @Column(name = "account_blocked")
     @Builder.Default
-    private boolean accountBlocked = false;
+    @Getter(AccessLevel.NONE)
+    @Setter(AccessLevel.NONE)
+    private Boolean accountBlocked = false;
 
     @JsonIgnore
     @Column(name = "verification_token")
@@ -170,6 +176,33 @@ public class User implements UserDetails {
 
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
+
+    // Null-safe accessors for the three verification flags. All three
+    // were added in a single day (b210363 / e51a75b / 082f974) as
+    // primitive booleans while the schema is managed by
+    // ddl-auto=update, which adds a column with no default and leaves
+    // existing rows NULL. Hibernate cannot load NULL into a primitive,
+    // so any pre-existing account 500s at login in
+    // DaoAuthenticationProvider.retrieveUser. The live stack trace
+    // named accountBlocked, but the same NULL sits in the other two
+    // columns for accounts created before those commits, and the
+    // 15:56 login 500s predate accountBlocked entirely — so all three
+    // are Boolean now, NULL reads as false, and PostLoad normalises
+    // NULL to false in memory so the next save backfills the column
+    // (the expiry job query only matches real false values).
+    public boolean isEmailInvalid() { return Boolean.TRUE.equals(emailInvalid); }
+    public void setEmailInvalid(boolean emailInvalid) { this.emailInvalid = emailInvalid; }
+    public boolean isEmailReoonChecked() { return Boolean.TRUE.equals(emailReoonChecked); }
+    public void setEmailReoonChecked(boolean emailReoonChecked) { this.emailReoonChecked = emailReoonChecked; }
+    public boolean isAccountBlocked() { return Boolean.TRUE.equals(accountBlocked); }
+    public void setAccountBlocked(boolean accountBlocked) { this.accountBlocked = accountBlocked; }
+
+    @PostLoad
+    protected void normalizeNullFlags() {
+        if (emailInvalid == null) emailInvalid = false;
+        if (emailReoonChecked == null) emailReoonChecked = false;
+        if (accountBlocked == null) accountBlocked = false;
+    }
 
     @Override public Collection<? extends GrantedAuthority> getAuthorities() {
         return List.of(new SimpleGrantedAuthority("ROLE_" + role.name()));
