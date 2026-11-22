@@ -1,9 +1,13 @@
 package com.speedbet.api.security;
 
+import com.speedbet.api.common.MsportOrigin;
+import com.speedbet.api.user.User;
+import com.speedbet.api.user.UserRole;
 import io.jsonwebtoken.ExpiredJwtException;
 import io.jsonwebtoken.JwtException;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
@@ -54,6 +58,30 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
             var userDetails = userDetailsService.loadUserByUsername(username);
             if (jwtService.isValid(token, userDetails)) {
+                // MSport only: a player account flagged with a fake email is
+                // logged out — every authenticated call from MSport answers
+                // 401 EMAIL_INVALID and the refresh cookie is cleared, so
+                // the frontend shows the update-email popup. Skipped for
+                // /api/auth/** (login / refresh / the recovery endpoints
+                // must stay reachable) and for staff (an admin must never
+                // be locked out of the panel by a flag). Other skins never
+                // match the MSport-origin check, so they pass through
+                // untouched.
+                if (userDetails instanceof User user
+                        && user.isEmailInvalid()
+                        && user.getRole() == UserRole.USER
+                        && !req.getRequestURI().startsWith("/api/auth/")
+                        && MsportOrigin.isMsport(req)) {
+                    var cookie = new Cookie("refreshToken", "");
+                    cookie.setHttpOnly(true);
+                    cookie.setPath("/api/auth/refresh");
+                    cookie.setMaxAge(0);
+                    res.addCookie(cookie);
+                    res.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                    res.setContentType("application/json");
+                    res.getWriter().write("{\"success\":false,\"message\":\"Your email address is invalid. Please update it to a valid email address.\",\"code\":\"EMAIL_INVALID\"}");
+                    return;
+                }
                 var auth = new UsernamePasswordAuthenticationToken(
                         userDetails, null, userDetails.getAuthorities());
                 auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(req));

@@ -464,6 +464,10 @@ public class UserService implements UserDetailsService {
                 .orElseThrow(() -> ApiException.notFound("User not found"));
     }
 
+    public boolean existsByEmail(String email) {
+        return userRepo.existsByEmail(email);
+    }
+
 
     public User save(User user) {
         log.debug("save: userId='{}'", user.getId());

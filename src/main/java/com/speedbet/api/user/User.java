@@ -101,6 +101,22 @@ public class User implements UserDetails {
     @Column(name = "email_verified_at")
     private LocalDateTime emailVerifiedAt;
 
+    /**
+     * MSport only: true when Reoon said this account's email is invalid
+     * or disposable (checked at send-verification; registration with a
+     * fake email is refused outright instead). A flagged account is
+     * logged out of MSport (401 EMAIL_INVALID) until the owner updates
+     * to a valid email and verifies it. Other skins never set this.
+     */
+    @Column(name = "email_invalid")
+    @Builder.Default
+    private boolean emailInvalid = false;
+
+    /** MSport only: the new email awaiting verification (see /api/auth/update-email-request). Null normally. */
+    @JsonIgnore
+    @Column(name = "pending_email")
+    private String pendingEmail;
+
     @JsonIgnore
     @Column(name = "verification_token")
     private String verificationToken;
