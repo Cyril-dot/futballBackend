@@ -73,12 +73,31 @@ public class AuthController {
         // MSport only: refuse fake/disposable emails at signup — no account
         // is created. Other skins keep today's behaviour (no Reoon call).
         // When Reoon is not configured the check is skipped entirely.
+        // QUICK first (fast fail for obviously-bad mails — saves a POWER
+        // credit and time), then POWER: QUICK does NOT check whether the
+        // individual inbox exists, so a fake mail on a good domain reads
+        // "valid" in quick mode and would otherwise get an account. Only
+        // POWER "safe" proves the mailbox. Power can take up to ~90s —
+        // the frontend gives register a long timeout for exactly this.
+        boolean powerProved = false;
         if (MsportOrigin.isMsport(httpReq) && reoonEmailService.configured()) {
             var result = reoonEmailService.check(req.email().trim().toLowerCase());
             if (!result.valid()) {
                 throw ApiException.badRequest("EMAIL_INVALID",
                         result.reason() != null ? result.reason() : "Please use a valid email address.");
             }
+            var power = reoonEmailService.checkPower(req.email().trim().toLowerCase());
+            if (power.outcome() == ReoonEmailService.PowerResult.Outcome.INVALID) {
+                throw ApiException.badRequest("EMAIL_INVALID",
+                        power.reason() != null ? power.reason() : "Your email address is invalid. Please update it to a valid email address.");
+            }
+            if (power.outcome() == ReoonEmailService.PowerResult.Outcome.SAFE) {
+                powerProved = true;
+            }
+            // INCONCLUSIVE (catch_all / role / spamtrap / unknown / timeout /
+            // outage): creation goes through — fail open. The verify popup
+            // + 24h deadline handle it later, and the login-time check
+            // retries next login (checked is deliberately NOT marked).
         }
 
         // A bad referral code never blocks registration: it resolves to no
@@ -93,10 +112,12 @@ public class AuthController {
                 req.lastName(), req.phone(), req.country(), refLinkId
         );
 
-        // MSport only: the signup Reoon check already passed, so remember
-        // it — a later MSport login must not burn another credit
-        // re-checking the same address.
-        if (MsportOrigin.isMsport(httpReq) && reoonEmailService.configured()) {
+        // MSport only: the signup POWER check proved the mailbox, so
+        // remember it — a later MSport login must not burn another credit
+        // re-checking the same address. An inconclusive POWER result is
+        // deliberately NOT remembered, so the login-time check retries
+        // next login.
+        if (powerProved) {
             user.setEmailReoonChecked(true);
             userService.save(user);
         }

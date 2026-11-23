@@ -45,11 +45,12 @@ import java.time.Duration;
  * POWER mode ({@code checkPower}) is the deep check: it verifies the
  * individual inbox actually exists, which quick mode does not (the
  * docs say non-existing inboxes from a good domain read "valid" in
- * quick mode). It is used only by POST /api/auth/verify-email-now,
- * where the mail is verified with NO link sent — only "safe" proves
- * the mailbox. Power can take a few seconds to over a minute, so its
- * timeout is ~90s; an outage, timeout or non-200 is INCONCLUSIVE,
- * never an error, and changes no state.
+ * quick mode). It is used by POST /api/auth/verify-email-now,
+ * POST /api/auth/update-email-request and register, where the mail is
+ * verified with NO link sent — only "safe" proves the mailbox. Power
+ * can take a few seconds to over a minute, so its timeout is ~90s; an
+ * outage, timeout or non-200 is INCONCLUSIVE, never an error, and
+ * changes no state.
  */
 @Service
 @RequiredArgsConstructor
